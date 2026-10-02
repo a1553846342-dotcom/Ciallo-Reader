@@ -137,11 +137,14 @@ Android 端小说 / 漫画阅读器，内置多书源在线聚合搜索与下载
 
 ## 截图
 
-README 展示使用 `promo/` 中的新品牌封面与实机界面素材。
+以下 12 张均为本项目实际界面截图，完整展示书源管理、书库、书架、阅读、详情、统计与设置。
 
-| 新手引导 | 阅读书签 | 小说排版 |
-| --- | --- | --- |
-| <img src="./promo/captures/real-device/roxy-onboarding.png" width="230" alt="Roxy 新手引导界面"/> | <img src="./promo/experience/assets/native-bookmark.webp" width="230" alt="阅读书签提示"/> | <img src="./promo/experience/assets/native-novel-layout.webp" width="230" alt="小说排版设置"/> |
+<table>
+<tr><td align="center"><strong>书源管理</strong><br><img src="./promo/readme-screenshots/01-source-management.jpg" width="180" alt="书源管理截图"/></td><td align="center"><strong>书库搜索</strong><br><img src="./promo/readme-screenshots/02-library-search.jpg" width="180" alt="书库搜索截图"/></td><td align="center"><strong>主题与屏幕方向</strong><br><img src="./promo/readme-screenshots/03-theme-and-display.jpg" width="180" alt="主题与屏幕方向截图"/></td></tr>
+<tr><td align="center"><strong>阅读日历与趋势</strong><br><img src="./promo/readme-screenshots/04-reading-calendar.jpg" width="180" alt="阅读日历与趋势截图"/></td><td align="center"><strong>阅读统计与排行榜</strong><br><img src="./promo/readme-screenshots/05-reading-insights.jpg" width="180" alt="阅读统计与排行榜截图"/></td><td align="center"><strong>书架与继续阅读</strong><br><img src="./promo/readme-screenshots/06-bookshelf.jpg" width="180" alt="书架与继续阅读截图"/></td></tr>
+<tr><td align="center"><strong>漫画仿真翻页</strong><br><img src="./promo/readme-screenshots/07-comic-page-turn.jpg" width="180" alt="漫画仿真翻页截图"/></td><td align="center"><strong>小说仿真翻页</strong><br><img src="./promo/readme-screenshots/08-novel-page-turn.jpg" width="180" alt="小说仿真翻页截图"/></td><td align="center"><strong>漫画详情与标签</strong><br><img src="./promo/readme-screenshots/09-comic-details.jpg" width="180" alt="漫画详情与标签截图"/></td></tr>
+<tr><td align="center"><strong>章节、神回与书签</strong><br><img src="./promo/readme-screenshots/10-chapters-bookmarks.jpg" width="180" alt="章节、神回与书签截图"/></td><td align="center"><strong>神回排行榜</strong><br><img src="./promo/readme-screenshots/11-god-chapter-ranking.jpg" width="180" alt="神回排行榜截图"/></td><td align="center"><strong>阅读器设置</strong><br><img src="./promo/readme-screenshots/12-reader-settings.jpg" width="180" alt="阅读器设置截图"/></td></tr>
+</table>
 
 ***
 
@@ -166,7 +169,7 @@ echo "sdk.dir=/你的/Android/Sdk/路径" > local.properties
 
 **添加书源**：底部 Tab「书库」顶部切换书源；更多漫画源在设置 → 书源管理 →「更新 Venera 源」；自定义规则走导入入口（支持 Legado JSON 格式）。
 
-**开启成人漫画源**：进入「设置」标签页，连点六下「主色按钮实时联动效果」，找到「高级内容」，打开「带你登大郎~~~」。等待 Venera 源列表更新后，返回「书库」，在漫画书源选择器中选择对应来源。关闭该开关会隐藏成人源。
+**开启成人漫画源**：进入「设置」标签页，找到「高级内容」，打开「带你登大郎~~~」。等待 Venera 源列表更新后，返回「书库」，在漫画书源选择器中选择对应来源。关闭该开关会隐藏成人源。
 
 **导入本地书**：书架页「+ 导入新书」，支持 TXT / EPUB / MOBI / AZW3 / CBZ。
 
