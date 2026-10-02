@@ -943,7 +943,9 @@ class BookRepository(
         if (guideBook != null) {
             val existingChapters = bookDao.getChaptersListForBook(guideBook.id)
             val newChapterTitle = "第七章：在线书库、成人源与漫画标签"
-            if (existingChapters.none { it.title == newChapterTitle }) {
+            val newChapterContent = "【在线书库与小说来源】\n在「书库」页顶部选择来源，按书名或作者搜索。可使用小说聚合搜索、已启用的在线书源和漫画源；来源列表可在设置的书源管理中更新或导入 Legado / JSON 书源。支持的在线来源与站点可用性会随网络和上游站点变化。\n\n【开启成人漫画源】\n1. 打开底部「设置」标签页。\n2. 连续点击六次「主色按钮实时联动效果」，显示「高级内容」。\n3. 打开「高级内容」中的「带你登大郎~~~」。\n4. 等待 Venera 漫画源列表更新完成，返回「书库」，在漫画书源选择器中选择需要的来源。\n关闭该开关后，成人源会从书库来源列表中隐藏。\n\n【漫画详情、书签与神回】\n漫画详情页可查看作品标签和章节；阅读时可为章节添加书签。作品详情提供神回入口，神回排行榜可查看热门章节。在线阅读会优先加载当前页并逐步载入后续图片；需要离线阅读时，可从章节列表下载章节。\n\n【下载与更新】\n小说支持整本下载与离线阅读；整本更新会保留原有阅读位置、书签和笔记。书库下载面板可查看任务进度，漫画下载支持暂停后继续。\n\n来源内容由第三方站点提供，请按当地法律和来源站点规则使用。"
+            val existingChapter = existingChapters.firstOrNull { it.title == newChapterTitle }
+            if (existingChapter == null) {
                 val nextOrder = (existingChapters.maxOfOrNull { it.chapterOrder } ?: -1) + 1
                 bookDao.insertChapters(
                     listOf(
@@ -951,10 +953,13 @@ class BookRepository(
                             bookId = guideBook.id,
                             chapterOrder = nextOrder,
                             title = newChapterTitle,
-                            content = "【在线书库与小说来源】\n在「书库」页顶部选择来源，按书名或作者搜索。可使用小说聚合搜索、已启用的在线书源和漫画源；来源列表可在设置的书源管理中更新或导入 Legado / JSON 书源。支持的在线来源与站点可用性会随网络和上游站点变化。\n\n【开启成人漫画源】\n1. 打开底部「设置」标签页。\n2. 找到「高级内容」，开启「带你登大郎~~~」。\n3. 等待 Venera 漫画源列表更新完成，返回「书库」，在漫画书源选择器中选择需要的来源。\n关闭该开关后，成人源会从书库来源列表中隐藏。\n\n【漫画详情、书签与神回】\n漫画详情页可查看作品标签和章节；阅读时可为章节添加书签。作品详情提供神回入口，神回排行榜可查看热门章节。在线阅读会优先加载当前页并逐步载入后续图片；需要离线阅读时，可从章节列表下载章节。\n\n【下载与更新】\n小说支持整本下载与离线阅读；整本更新会保留原有阅读位置、书签和笔记。书库下载面板可查看任务进度，漫画下载支持暂停后继续。\n\n来源内容由第三方站点提供，请按当地法律和来源站点规则使用。"
+                            content = newChapterContent
                         )
                     )
                 )
+            } else if (existingChapter.content != newChapterContent) {
+                // Refresh the seeded guide chapter without resetting the user's reading progress or bookmarks.
+                bookDao.insertChapters(listOf(existingChapter.copy(content = newChapterContent)))
             }
             val chapterCount = bookDao.getChaptersListForBook(guideBook.id).size
             if (guideBook.totalChapters < chapterCount) {
