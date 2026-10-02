@@ -40,6 +40,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -97,11 +99,18 @@ fun PageCurlReaderContainer(
      * 而且它不跟随阅读主题，夜间模式下依然是米黄色纸。
      */
     paperColor: Color = Color(0xFFE8E4DC),
+    // 点击位置命中正文插图时回调（返回 true=已打开全屏，宿主跳过翻页分派）。
+    // Initial-pass（父先于子）下"子层消费检测"不可用，必须按屏幕矩形几何命中。
+    onImageTapAt: ((androidx.compose.ui.geometry.Offset) -> Boolean)? = null,
     modifier: Modifier = Modifier
 ) {
     val state = rememberPageCurlState(initialCurrent = 1)
     val scope = rememberCoroutineScope()
     val haptic = LocalHapticFeedback.current
+    var containerOffsetInWindow by androidx.compose.runtime.remember {
+        androidx.compose.runtime.mutableStateOf(androidx.compose.ui.geometry.Offset.Zero)
+    }
+    val latestOnImageTapAt by androidx.compose.runtime.rememberUpdatedState(onImageTapAt)
 
     // 纸面色由阅读主题推导，夜里自动变深，不再出现米黄纸。
     val paper = rememberPaperPalette(paperColor)
@@ -189,6 +198,7 @@ fun PageCurlReaderContainer(
             modifier = Modifier
                 .fillMaxSize()
                 .graphicsLayer { translationY = pullValue }
+                .onGloballyPositioned { containerOffsetInWindow = it.positionInWindow() }
                 .pointerInput(Unit) {
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
@@ -199,6 +209,7 @@ fun PageCurlReaderContainer(
                         var activeMode = 0 // 0=未定 1=水平翻页 2=下拉书签
                         var fired = false
                         var longPressFired = false
+                        var tapOnImage = false
                         // 长按触发区扩展到整个页面：任意位置静置 1s 均可唤出串珠快速翻页
                         var longPressArmed = true
                         var lastUptime = down.uptimeMillis
@@ -232,7 +243,16 @@ fun PageCurlReaderContainer(
 
                             lastUptime = maxOf(lastUptime, ev.changes.maxOf { it.uptimeMillis })
                             val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
-                            if (!ch.pressed) break
+                            if (!ch.pressed) {
+                                // 纯点按且命中正文插图（屏幕矩形注册表）：Initial pass 消费 up，
+                                // 子 clickable（Main pass）与 pagecurl 都不会再触发 → 不翻页
+                                if (!isDrag && !longPressFired && !latestMenuVisible) {
+                                    tapOnImage = latestOnImageTapAt
+                                        ?.invoke(down.position + containerOffsetInWindow) == true
+                                    if (tapOnImage) ch.consume()
+                                }
+                                break
+                            }
                             val delta = ch.positionChange()
                             totalX += delta.x
                             totalY += delta.y
@@ -277,8 +297,9 @@ fun PageCurlReaderContainer(
                             }
                         }
 
-                        // 纯点按（未越过 touchSlop）：左右三分之一分区翻页（与 onCustomTap 中间三分之一互补）
-                        if (!isDrag && !longPressFired && !latestMenuVisible) {
+                        // 纯点按（未越过 touchSlop）：命中插图已在 up 时消费（tapOnImage），
+                        // 此处只做左右三分之一分区翻页（与 onCustomTap 中间三分之一互补）
+                        if (!isDrag && !longPressFired && !latestMenuVisible && !tapOnImage) {
                             val x = down.position.x
                             val w = size.width.toFloat()
                             when {

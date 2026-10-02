@@ -33,7 +33,7 @@ import java.util.concurrent.TimeUnit
  */
 class RemoteEndpointProvider(private val context: Context) {
     private val prefs: SharedPreferences = context.getSharedPreferences("zlib_remote_config", Context.MODE_PRIVATE)
-    private val okHttpClient = OkHttpClient.Builder()
+    private val okHttpClient = com.example.source.SharedHttpTransport.builder()
         .connectTimeout(6, TimeUnit.SECONDS)
         .readTimeout(8, TimeUnit.SECONDS)
         .build()

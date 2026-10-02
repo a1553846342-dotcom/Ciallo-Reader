@@ -23,11 +23,45 @@ class JsSourceEngine(
     context: Context,
     insecureTls: Boolean = false
 ) {
-    private val handler = JsMessageHandler(context, sourceKey, insecureTls)
-    private val quickJs = QuickJs.create(Dispatchers.IO)
+    private val app = context.applicationContext
+    private val handler = JsMessageHandler(app, sourceKey, insecureTls)
+    @Volatile private var executionDeadline = 0L
+    @Volatile private var executionJob: kotlinx.coroutines.Job? = null
+    private var initializing = false
+    private suspend fun beginBudget() {
+        executionJob = kotlinx.coroutines.currentCoroutineContext()[kotlinx.coroutines.Job]
+        executionDeadline = android.os.SystemClock.elapsedRealtime() + 45_000
+        handler.requestJob = executionJob
+    }
+    private fun checkBudget() {
+        if (!initializing && executionJob?.isActive == false) throw kotlinx.coroutines.CancellationException("JS request cancelled")
+        check(android.os.SystemClock.elapsedRealtime() <= executionDeadline) { "书源脚本执行超过 45 秒" }
+    }
+    private suspend fun instrument(code:String):String = quickJs.evaluate<String>(
+        "__cialloInstrument(${JSONObject.quote(code)})",filename="instrument_source.js") ?: error("JS instrumentation failed")
+
+    init {
+        // 注册前台 Activity 跟踪：UI.showInputDialog 需要在 Activity 上弹对话框
+        JsActivityTracker.register(context)
+    }
+
+    private val quickJs = QuickJs.create(Dispatchers.IO).apply {
+        memoryLimit = 32L * 1024 * 1024
+        maxStackSize = 512L * 1024
+    }
     private val mutex = Mutex()
     private var ready = false
     private var className = ""
+
+    private suspend fun <T> withRuntime(block: suspend () -> T): T = mutex.withLock {
+        // Preserve the caller's Job for guard/HTTP cancellation. Let alpha13 finish
+        // consuming its native promises before another request can use this context.
+        beginBudget()
+        withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+            try { block() }
+            finally { QuickJsAsyncLifecycle.settle(quickJs) }
+        }
+    }
 
     fun setLoggedIn(logged: Boolean) {
         handler.setLoggedIn(logged)
@@ -38,11 +72,11 @@ class JsSourceEngine(
     /** 用 Cronet 直接下载图片字节（H@H 等 OkHttp 握手失败的图床）。 */
     suspend fun fetchImageBytes(url: String, headers: Map<String, String>): ByteArray? =
         withContext(Dispatchers.IO) {
-            handler.fetchImageBytes(url, headers)
+            handler.fetchImageBytes(url, headers, kotlinx.coroutines.currentCoroutineContext()[kotlinx.coroutines.Job])
         }
 
     /** 执行一段以 src 为实例的 JS 表达式，返回 JSON 字符串 {ok, data|error}。 */
-    suspend fun call(jsCall: String): String? = mutex.withLock {
+    suspend fun call(jsCall: String): String? = withRuntime {
         ensureReadyLocked()
         val code = """
             await (async () => {
@@ -65,7 +99,11 @@ class JsSourceEngine(
                     return out;
                 };
                 const __normalize = (value) => {
-                    if (value instanceof Map) return __flattenChapters(value);
+                    if (value instanceof Map) {
+                        const out = {};
+                        for (const [key, item] of value.entries()) out[String(key)] = __normalize(item);
+                        return out;
+                    }
                     if (Array.isArray(value)) return value.map(__normalize);
                     if (value && typeof value === 'object') {
                         const out = {};
@@ -89,29 +127,32 @@ class JsSourceEngine(
                 } catch (e) {
                     return JSON.stringify({
                         ok: false,
-                        error: String(e && e.stack ? e.stack : e),
+                        error: [e && e.message ? String(e.message) : '', String(e && e.stack ? e.stack : e)]
+                            .filter(Boolean).join('\n'),
                         message: e && e.message ? String(e.message) : ''
                     });
                 }
             })();
         """.trimIndent()
         try {
-            val raw = quickJs.evaluate<String?>(code, filename = "call.js")
+            val raw = quickJs.evaluate<String?>(instrument(code), filename = "call.js")
             if (raw?.contains("\"ok\":false") == true) {
                 Log.w("JsEngine[$sourceKey]", "js error: ${raw.take(400)}")
             }
             raw
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             val message = e.message ?: e.javaClass.simpleName
             "{\"ok\":false,\"error\":${org.json.JSONObject.quote(message)}}"
         }
     }
 
     /** 运行脚本返回的 modifyImage 代码，对图片字节做像素级重排（如禁漫天堂分块乱序）。 */
-    suspend fun transformImage(jsCode: String, input: ByteArray): ByteArray? = mutex.withLock {
+    suspend fun transformImage(jsCode: String, input: ByteArray): ByteArray? = withRuntime {
         ensureReadyLocked()
-        val key = handler.createImage(input) ?: return@withLock null
+        val previousImages=handler.beginImageSession()
         try {
+            val key = handler.createImage(input) ?: return@withRuntime null
             val code = """
                 (() => {
                     const __img = new Image($key);
@@ -121,14 +162,15 @@ class JsSourceEngine(
                     return __outKey;
                 })()
             """.trimIndent()
-            val raw = quickJs.evaluate<String?>(code, filename = "modify_image.js")
+            val raw = quickJs.evaluate<String?>(instrument(code), filename = "modify_image.js")
             val outKey = raw?.trim()?.toIntOrNull()
             if (outKey == null) null else handler.exportImageBytes(outKey)
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             Log.w("JsEngine[$sourceKey]", "modifyImage failed", e)
             null
         } finally {
-            handler.disposeImage(key)
+            handler.endImageSession(previousImages)
         }
     }
 
@@ -138,22 +180,95 @@ class JsSourceEngine(
 
     private suspend fun ensureReadyLocked() {
         if (ready) return
+        // Bootstrap installs non-configurable guards. Finish that one-time setup
+        // even if its first caller cancels; HTTP still observes the caller's Job.
+        initializing = true
+        try { initializeLocked() } finally { initializing = false }
+    }
+
+    private suspend fun initializeLocked() {
+        quickJs.function("__cialloTick") { checkBudget(); null }
+        quickJs.function("__boundedRegex") { args ->
+            checkBudget()
+            val pattern=args[0].toString()
+            val flags=args[1].toString()
+            val input=args[2].toString()
+            val start=(args[3] as? Number)?.toInt() ?: 0
+            require(pattern.length<=4096 && input.length<=2*1024*1024)
+            val options=(if('i' in flags) java.util.regex.Pattern.CASE_INSENSITIVE or java.util.regex.Pattern.UNICODE_CASE else 0) or
+                (if('m' in flags) java.util.regex.Pattern.MULTILINE else 0) or (if('s' in flags) java.util.regex.Pattern.DOTALL else 0)
+            try {
+            val matcher=java.util.regex.Pattern.compile(pattern,options).matcher(com.example.source.parser.RuleBudget.text(input,500))
+            val matched=if('y' in flags) {
+                if(start !in 0..input.length) false else { matcher.region(start,input.length); matcher.lookingAt() }
+            } else if(start !in 0..input.length) false else matcher.find(start)
+            if(!matched) "null" else {
+                val groups=org.json.JSONArray()
+                for(i in 0..matcher.groupCount()) groups.put(matcher.group(i) ?: JSONObject.NULL)
+                JSONObject().put("index",matcher.start()).put("end",matcher.end()).put("groups",groups).toString()
+            }
+            } catch(e: StackOverflowError) { throw IllegalArgumentException("书源正则回溯过深",e) }
+        }
+        quickJs.function("__boundedRegexBatch") { args ->
+            checkBudget()
+            val pattern = args[0].toString()
+            val flags = args[1].toString()
+            val input = args[2].toString()
+            val start = (args[3] as? Number)?.toInt() ?: 0
+            require(pattern.length <= 4096 && input.length <= 2 * 1024 * 1024)
+            val options = (if ('i' in flags) java.util.regex.Pattern.CASE_INSENSITIVE or java.util.regex.Pattern.UNICODE_CASE else 0) or
+                (if ('m' in flags) java.util.regex.Pattern.MULTILINE else 0) or (if ('s' in flags) java.util.regex.Pattern.DOTALL else 0)
+            val out = org.json.JSONArray()
+            if (start in 0..input.length) try {
+                val matcher = java.util.regex.Pattern.compile(pattern, options).matcher(com.example.source.parser.RuleBudget.text(input, 500))
+                var position = start
+                var captured = 0
+                while (out.length() < 128) {
+                    val matched = if ('y' in flags) { matcher.region(position, input.length); matcher.lookingAt() }
+                        else if (out.length() == 0) matcher.find(start) else matcher.find()
+                    if (!matched) break
+                    val groups = org.json.JSONArray()
+                    for (i in 0..matcher.groupCount()) groups.put(matcher.group(i)?.also { captured += it.length } ?: JSONObject.NULL)
+                    out.put(JSONObject().put("index", matcher.start()).put("end", matcher.end()).put("groups", groups))
+                    position = matcher.end()
+                    if (matcher.start() == matcher.end() || captured >= 65536 || 'g' !in flags && 'y' !in flags) break
+                }
+            } catch (e: StackOverflowError) { throw IllegalArgumentException("书源正则回溯过深", e) }
+            out.toString()
+        }
+        // defineProperty returns globalThis. Do not send the global object (including
+        // native bindings and Symbols) through QuickJS's JS-to-Kotlin value converter.
+        quickJs.evaluate<Any?>(
+            """
+                Object.defineProperty(globalThis, '__cialloTick', {writable:false,configurable:false});
+                Object.defineProperty(globalThis, '__boundedRegex', {writable:false,configurable:false});
+                Object.defineProperty(globalThis, '__boundedRegexBatch', {writable:false,configurable:false});
+                void 0;
+            """.trimIndent(),
+            filename = "runtime_guards.js"
+        )
+        quickJs.evaluate<Any?>(app.assets.open("js_safety/acorn.js").bufferedReader().use { it.readText() },filename="acorn.js")
+        quickJs.evaluate<Any?>(app.assets.open("js_safety/instrument.js").bufferedReader().use { it.readText() },filename="instrument.js")
         // 同步桥：Convert/Html/Storage/uuid/random 等要求同步返回值
         quickJs.function("sendMessageSync") { args ->
+            checkBudget()
             handler.handle(args.firstOrNull())
         }
-        // 异步桥：Network/setTimeout/UI 等 await 或 .then 使用
+        // 异步桥：Network/setTimeout/UI 等 await 或 .then 使用。
+        // 挂起实现：UI.showInputDialog 需等待用户输入，故走 handleAsync。
         quickJs.asyncFunction("sendMessage") { args ->
-            handler.handle(args.firstOrNull())
+            checkBudget()
+            handler.handleAsync(args.firstOrNull())
         }
         // Venera App 注入的全局变量（appVersion 等）
         quickJs.evaluate<Any?>("globalThis.appVersion = '1.7.0';", filename = "globals.js")
         quickJs.evaluate<Any?>(runtimeJs, filename = "venera_runtime.js")
         // Venera 的 sendMessage 混合同步/异步语义；这里用同步桥覆盖同步消费方
         quickJs.evaluate<Any?>(SYNC_OVERRIDE, filename = "sync_override.js")
+        quickJs.evaluate<Any?>(app.assets.open("venera/comic_metadata.js").bufferedReader().use { it.readText() }, filename = "comic_metadata.js")
         // Venera App 在引擎初始化时注入的模型类（ComicDetails/Chapter 等）
         quickJs.evaluate<Any?>(PREAMBLE, filename = "models.js")
-        quickJs.evaluate<Any?>(sourceJs, filename = "source.js")
+        quickJs.evaluate<Any?>(instrument(sourceJs), filename = "source.js")
         className = Regex("""class\s+([A-Za-z_$][\w$]*)\s+extends\s+ComicSource""")
             .find(sourceJs)
             ?.groupValues
@@ -222,8 +337,11 @@ class JsSourceEngine(
             obj.keys().forEach { k -> defaults[k] = obj.optString(k) }
             handler.setSettingDefaults(defaults)
         } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
             // 忽略设置解析失败
         }
+        // Defaults and bindings are reusable even if the optional init is cancelled.
+        ready = true
         // 默认值注入完成后，再执行 init()（错误不致命，源继续用默认配置工作）
         quickJs.evaluate<Any?>(
             """
@@ -237,7 +355,6 @@ class JsSourceEngine(
             """.trimIndent(),
             filename = "instantiate.js"
         )
-        ready = true
     }
 
     companion object {
@@ -298,6 +415,13 @@ class JsSourceEngine(
                     result.body = Convert.decodeBase64(result.body);
                 }
                 return result;
+            };
+            Network.getCookies = async function (url) {
+                const result = await sendMessage({method:'cookie',function:'get',url:url});
+                return typeof result === 'string' ? JSON.parse(result) : result;
+            };
+            Network.setCookies = function (url, cookies) {
+                return sendMessageSync({method:'cookie',function:'set',url:url,cookies:cookies});
             };
 
             // ---- 工具函数（同步） ----

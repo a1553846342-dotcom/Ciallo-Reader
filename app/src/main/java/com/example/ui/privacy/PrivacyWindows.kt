@@ -190,8 +190,8 @@ enum class PinEntryMode { SETUP, CONFIRM, VERIFY, CHANGE_OLD, CHANGE_NEW }
 @Composable
 fun PrivacyPinOverlay(
     mode: PinEntryMode,
-    onPinSet: (String) -> Unit,       // SETUP/CONFIRM 全流程完成（新 PIN 生效）
-    onPinVerified: (String) -> Boolean, // VERIFY / CHANGE_OLD：返回校验结果
+    onPinSet: suspend (String) -> Unit,       // SETUP/CONFIRM 全流程完成（新 PIN 生效）
+    onPinVerified: suspend (String) -> Boolean, // VERIFY / CHANGE_OLD：返回校验结果
     onDismiss: () -> Unit,
 ) {
     var entered by remember { mutableStateOf("") }

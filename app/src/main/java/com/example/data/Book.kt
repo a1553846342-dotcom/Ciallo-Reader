@@ -105,5 +105,9 @@ data class ReadingRecord(
 data class SearchResultItem(
     val chapterIndex: Int,
     val chapterTitle: String,
-    val snippet: String
+    val snippet: String,
+    /** 关键词是合并后逻辑章正文中的第几处出现（0 起）。
+     *  不用字符偏移：ChapterMerger 的物理→逻辑偏移表基于空 content 的 metadata，不可信；
+     *  "第 N 处出现"在渲染文本上直接数，天然免疫缩进/清洗造成的偏移漂移。 */
+    val occurrence: Int = 0
 )

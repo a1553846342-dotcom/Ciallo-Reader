@@ -7,5 +7,7 @@ data class DownloadRequest(
     val sourceId: String,
     val downloadUrl: String,
     val format: String,
-    val coverUrl: String? = null
+    val coverUrl: String? = null,
+    val novelSnapshot: com.example.source.SearchBook? = null,
+    val replaceExistingNovel: Boolean = false
 )

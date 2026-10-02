@@ -1,464 +1,290 @@
 package com.example.download
 
+import androidx.room.withTransaction
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.Context
+import android.content.pm.ServiceInfo
 import android.net.Uri
-import android.util.Log
+import android.os.Build
+import androidx.core.app.NotificationCompat
 import androidx.work.CoroutineWorker
+import androidx.work.ForegroundInfo
 import androidx.work.WorkerParameters
 import com.example.data.AppDatabase
 import com.example.data.BookRepository
+import com.example.source.executeCancellable
 import com.example.source.zlibrary.DiamWallInterceptor
 import com.example.source.zlibrary.EncryptedCookieJar
 import com.example.source.zlibrary.ZLibraryCredentialStorage
 import com.example.source.zlibrary.network.SystemProxyResolver
 import com.example.source.zlibrary.network.ZLibraryDns
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.TimeUnit
 
-class DownloadWorker(
-    private val context: Context,
-    params: WorkerParameters
-) : CoroutineWorker(context, params) {
-
+class DownloadWorker(private val context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     companion object {
-        private const val TAG = "DownloadWorker"
+        private val slots = Semaphore(2)
+        private val taskLocks = Array(32) { kotlinx.coroutines.sync.Mutex() }
+        private const val CHANNEL = "book_downloads"
+
+        internal suspend fun <T> withTaskLock(taskId: String, block: suspend () -> T): T {
+            val lock = taskLocks[(taskId.hashCode() and Int.MAX_VALUE) % taskLocks.size]
+            lock.lock()
+            return try { block() } finally { lock.unlock() }
+        }
     }
 
-    private val client = run {
-        val credentialStorage = ZLibraryCredentialStorage(applicationContext)
-        val cookieJar = EncryptedCookieJar(credentialStorage)
-        val builder = OkHttpClient.Builder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            // 大文件/CDN 末端偶发慢速传输，给足读超时避免 99% 处被误杀
-            .readTimeout(120, TimeUnit.SECONDS)
-            .dns(ZLibraryDns.INSTANCE)
-            .cookieJar(cookieJar)
-            // 下载文件同样会触发 DiamWall PoW，带上求解器 + Cookie 存储，
-            // 否则文件请求会被 503 挑战直接拦下。
-            .addInterceptor(DiamWallInterceptor(cookieJar))
-        // Downloads must follow the same network path as the rest of the app (system proxy)
-        SystemProxyResolver.resolve(applicationContext)?.let { builder.proxy(it) }
-        builder.build()
+    private val client by lazy {
+        val jar = EncryptedCookieJar(ZLibraryCredentialStorage(applicationContext))
+        com.example.source.SharedHttpTransport.builder().connectTimeout(30, TimeUnit.SECONDS).readTimeout(120, TimeUnit.SECONDS)
+            .dns(ZLibraryDns.INSTANCE).cookieJar(jar).addInterceptor(DiamWallInterceptor(jar))
+            .apply { SystemProxyResolver.resolve(applicationContext)?.let { proxy(it) } }.build()
+    }
+
+    private val publicClient by lazy {
+        com.example.source.SharedHttpTransport.builder()
+            .connectTimeout(30, TimeUnit.SECONDS).readTimeout(120, TimeUnit.SECONDS)
+            .cookieJar(okhttp3.CookieJar.NO_COOKIES)
+            .apply { SystemProxyResolver.resolve(applicationContext)?.let { proxy(it) } }.build()
+    }
+
+    override suspend fun getForegroundInfo(): ForegroundInfo {
+        if (Build.VERSION.SDK_INT >= 26) {
+            context.getSystemService(NotificationManager::class.java).createNotificationChannel(
+                NotificationChannel(CHANNEL, "书籍下载", NotificationManager.IMPORTANCE_LOW))
+        }
+        val notification = NotificationCompat.Builder(context, CHANNEL)
+            .setSmallIcon(android.R.drawable.stat_sys_download).setContentTitle("正在下载书籍")
+            .setContentText(inputData.getString("title") ?: "书籍下载").setOngoing(true)
+            .setProgress(0, 0, true).build()
+        val notificationId = id.hashCode() and Int.MAX_VALUE
+        return if (Build.VERSION.SDK_INT >= 29) ForegroundInfo(notificationId, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            else ForegroundInfo(notificationId, notification)
     }
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
-        val bookId = inputData.getString("book_id") ?: return@withContext Result.failure()
-        val url = inputData.getString("url") ?: return@withContext Result.failure()
-        val format = inputData.getString("format") ?: "epub"
-        val title = inputData.getString("title") ?: "Unknown"
+        val taskId = inputData.getString("book_id") ?: return@withContext Result.failure()
+        withTaskLock(taskId) { performTask() }
+    }
 
-        Log.d(TAG, "Starting download task: bookId=$bookId, url=$url, title=$title")
-
+    private suspend fun performTask(): Result = withContext(Dispatchers.IO) {
+        val taskId = inputData.getString("book_id") ?: return@withContext Result.failure()
         val db = AppDatabase.getDatabase(context)
-        val taskDao = db.downloadTaskDao()
-        val repository = BookRepository(context, db.bookDao())
-
-        val downloadsDir = File(context.filesDir, "downloads")
-        if (!downloadsDir.exists()) {
-            downloadsDir.mkdirs()
-        }
-
-        val safeBookId = com.example.download.DownloadManager.sanitizeFileName(bookId)
-        val tempFile = File(downloadsDir, "$safeBookId.tmp")
-        val finalFile = File(downloadsDir, "$safeBookId.$format")
-
-        var existingLength = if (tempFile.exists()) tempFile.length() else 0L
-        Log.d(TAG, "Check existing temp file for bookId=$bookId: bytes=$existingLength")
-
-        // Update DB and Memory state to DOWNLOADING
-        val task = taskDao.getTaskById(bookId)
-        if (task != null) {
-            taskDao.updateProgressAndStatus(
-                id = bookId,
-                status = DownloadStatus.DOWNLOADING,
-                downloadedBytes = existingLength,
-                totalBytes = task.totalBytes,
-                errorMessage = null
-            )
-        }
-
+        val dao = db.downloadTaskDao()
+        val task = dao.getTaskById(taskId) ?: return@withContext Result.failure()
+        if (task.status == DownloadStatus.PAUSED || task.status == DownloadStatus.CANCELLED) return@withContext Result.success()
+        val downloads = File(context.filesDir, "downloads").apply { mkdirs() }
+        val format = task.format.lowercase().trim()
+        if (!format.matches(Regex("[a-z0-9]{1,10}"))) return@withContext Result.failure()
+        val finalFile = File(task.filePath)
+        if (finalFile.canonicalFile.parentFile != downloads.canonicalFile) return@withContext Result.failure()
+        val temp = File(downloads, "${finalFile.nameWithoutExtension}.tmp")
+        val resume = File(downloads, "${finalFile.nameWithoutExtension}.resume")
+        var total = task.totalBytes
         try {
-            val requestBuilder = Request.Builder().url(url)
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-
-            val referer = inputData.getString("referer")
-            if (!referer.isNullOrBlank()) {
-                requestBuilder.header("Referer", referer)
-            }
-
-            val cookie = inputData.getString("cookie")
-            val requestHost = runCatching { requestBuilder.build().url.host }.getOrNull()?.lowercase() ?: ""
-            val isCdnHost = requestHost.contains("ncdn") ||
-                requestHost.contains("cdn-zlib") ||
-                requestHost.contains("s3proxy") ||
-                requestHost.contains("dln")
-            if (!cookie.isNullOrBlank() && !isCdnHost) {
-                // eapi 直链是带签名授权的 CDN 链接，不需要 zlib 会话 Cookie；
-                // 把 zlib Cookie 发给 CDN 会被部分 CDN 拒绝并返回 HTML 错误页。
-                requestBuilder.header("Cookie", cookie)
-            } else if (cookie.isNullOrBlank().not()) {
-                Log.i(TAG, "Skipping zlib Cookie header for CDN host $requestHost")
-            }
-
-            if (existingLength > 0) {
-                Log.i(TAG, "Requesting Range for breakpoint download: bytes=$existingLength- for bookId=$bookId")
-                requestBuilder.header("Range", "bytes=$existingLength-")
-            }
-            val request = requestBuilder.build()
-
-            var response = executeWithRetry(client, request)
-
-            // —— HTML 错误页/挑战页提前拦截（修复：进度条走满后才报“HTML 错误页”）——
-            // 真实电子书（epub/mobi/txt/pdf/cbz…）的响应不可能是 text/html；
-            // 一旦响应是 HTML，说明是 DiamWall 验证页或 CDN 错误页。
-            // 提前识别、不写文件，重试一次（重新走 DiamWall PoW），仍失败再报明确错误。
-            var htmlRetry = 0
-            while (isHtmlErrorResponse(response) && htmlRetry < 2) {
-                Log.w(TAG, "Download got HTML page (challenge/error) for bookId=$bookId, retry #${htmlRetry + 1}")
-                response.close()
-                htmlRetry++
-                Thread.sleep(1500)
-                response = executeWithRetry(client, request)
-            }
-            if (isHtmlErrorResponse(response)) {
-                val reason = htmlResponseReason(response, url)
-                response.close()
-                val errorMsg = "文件校验失败：$reason"
-                Log.e(TAG, "Download blocked by HTML page for bookId=$bookId: $reason")
-                taskDao.updateProgressAndStatus(bookId, DownloadStatus.FAILED, 0L, 0L, errorMsg)
-                DownloadProgressBroadcaster.updateState(bookId, DownloadState.Error(errorMsg))
-                return@withContext Result.failure()
-            }
-
-            Log.i(TAG, "HTTP Response Code: ${response.code} for bookId=$bookId")
-
-            if (!response.isSuccessful && response.code != 416) {
-                val errMsg = "HTTP Error: ${response.code}"
-                Log.e(TAG, "Download failed with HTTP error: ${response.code} for bookId=$bookId")
-                taskDao.updateProgressAndStatus(bookId, DownloadStatus.FAILED, existingLength, 0L, errMsg)
-                DownloadProgressBroadcaster.updateState(bookId, DownloadState.Error(errMsg))
-                return@withContext Result.failure()
-            }
-
-            var append = false
-            var totalBytes = 0L
-
-            if (response.code == 206) { // Partial content
-                append = true
-                val body = response.body ?: throw Exception("Empty response body")
-                val contentLength = body.contentLength()
-                totalBytes = if (contentLength > 0) existingLength + contentLength else task?.totalBytes ?: 0L
-                Log.i(TAG, "HTTP 206 Partial Content confirmed. existingBytes=$existingLength, remainingBytes=$contentLength, totalBytes=$totalBytes")
-            } else if (response.code == 200) { // Full content
-                append = false
-                existingLength = 0L
-                val body = response.body ?: throw Exception("Empty response body")
-                totalBytes = body.contentLength()
-                Log.i(TAG, "HTTP 200 Full Content. totalBytes=$totalBytes")
-            } else if (response.code == 416) { // Range Not Satisfiable
-                Log.w(TAG, "HTTP 416 Range Not Satisfiable for bookId=$bookId. Testing local file completeness.")
-                if (tempFile.exists() && tempFile.length() > 0) {
-                    val integrity = DownloadFileValidator.validateFileIntegrity(tempFile, format)
-                    if (!integrity.valid) {
-                        tempFile.delete()
-                        val reason = if (integrity.isHtmlErrorPage) {
-                            integrity.htmlErrorHint ?: cdnHtmlReason(url) ?: "服务器返回了 HTML 错误页"
-                        } else {
-                            "非有效的 ${format.uppercase()} 电子书格式"
+            val secrets=com.example.data.EncryptedSecretStore(applicationContext)
+            val savedHeaders=secrets.read("download:$taskId")?.let { JSONObject(it) } ?: JSONObject()
+            // Existing jobs may still contain the pre-upgrade header fields.
+            inputData.getString("referer")?.takeIf { it.isNotBlank() }?.let { if(!savedHeaders.has("Referer")) savedHeaders.put("Referer",it) }
+            inputData.getString("cookie")?.takeIf { it.isNotBlank() }?.let { if(!savedHeaders.has("Cookie")) savedHeaders.put("Cookie",it) }
+            val requestHeaders=savedHeaders.keys().asSequence().associateWith { savedHeaders.getString(it) }
+            setForeground(getForegroundInfo())
+            slots.withPermit {
+                currentCoroutineContext().ensureActive()
+                dao.updateProgressAndStatus(taskId, DownloadStatus.DOWNLOADING, temp.length(), total, null)
+                // Failed imports can be retried from the completed file without consuming another download.
+                val metadata = runCatching { JSONObject(resume.readText()) }.getOrNull()
+                if (!(finalFile.isFile && metadata?.optString("url") == task.downloadUrl && metadata.optBoolean("complete"))) {
+                    var offset = temp.takeIf { it.isFile }?.length() ?: 0L
+                    val validator = metadata?.optString("validator")?.takeIf { it.isNotBlank() }
+                    if (metadata?.optString("url") != task.downloadUrl || validator == null) offset = 0L
+                    val builder = Request.Builder().url(task.downloadUrl).header("Accept-Encoding", "identity")
+                        .header("User-Agent", "Mozilla/5.0 (Linux; Android) CialloReader/1.1")
+                    requestHeaders.filterKeys { !it.equals("Cookie",true) && !it.equals("Range",true) && !it.equals("If-Range",true) && !it.equals("Accept-Encoding",true) }.forEach { (key,value) -> builder.header(key,value) }
+                    val host = builder.build().url.host
+                    val cookie = requestHeaders.entries.firstOrNull { it.key.equals("Cookie",true) }?.value
+                    if (!cookie.isNullOrBlank() && listOf("ncdn", "cdn-zlib", "s3proxy", "dln").none { it in host }) builder.header("Cookie", cookie)
+                    if (offset > 0) builder.header("Range", "bytes=$offset-").header("If-Range", validator!!)
+                    var request = builder.build()
+                    var rangeRestarted = false
+                    while (true) {
+                        val restart = withResponse(request, task.sourceId) { response ->
+                            // A 416 is not proof of file completeness. Restart safely once.
+                            if (response.code == 416 && offset > 0 && !rangeRestarted) return@withResponse true
+                            require(response.isSuccessful) { when (response.code) {
+                                401, 403 -> "下载授权已失效，请重新登录或重新获取链接（HTTP ${response.code}）"
+                                429 -> "请求过于频繁，请稍后重试（HTTP 429）"
+                                else -> "下载失败（HTTP ${response.code}）"
+                            } }
+                            require(!isHtmlError(response, format)) { "服务器返回了验证或错误页，下载链接可能已过期，请重新获取链接" }
+                            val body = response.body ?: error("下载响应为空")
+                            val append = response.code == 206 && offset > 0
+                            if (response.code == 206) {
+                                require(append) { "服务器意外返回部分文件" }
+                                total = DownloadTransferPolicy.validateTail(response.header("Content-Range"), offset, body.contentLength())
+                                val returned = DownloadTransferPolicy.validator(response.header("ETag"), response.header("Last-Modified"))
+                                require(returned == null || returned == validator) { "续传文件版本发生变化，请重新下载" }
+                                val previousTotal = metadata?.optLong("total", 0L) ?: 0L
+                                require(previousTotal <= 0 || previousTotal == total) { "续传文件大小发生变化" }
+                            } else {
+                                require(response.code == 200) { "服务器未返回完整文件" }
+                                offset = 0L
+                                total = body.contentLength()
+                            }
+                            require(total <= 0 || downloads.usableSpace >= total - offset + 16L * 1024 * 1024) { "存储空间不足，请清理后重试" }
+                            // Truncate before replacing metadata: a crash cannot pair an old prefix with a new validator.
+                            FileOutputStream(temp, append).use { out ->
+                                val nextValidator = DownloadTransferPolicy.validator(response.header("ETag"), response.header("Last-Modified"))
+                                resume.writeText(JSONObject().put("url", task.downloadUrl).put("validator", nextValidator ?: "")
+                                    .put("total", total).put("complete", false).toString())
+                                var downloaded = offset
+                                var lastUi = 0L
+                                var lastDb = 0L
+                                body.byteStream().use { input ->
+                                    val buffer = ByteArray(64 * 1024)
+                                    while (true) {
+                                        currentCoroutineContext().ensureActive()
+                                        val read = input.read(buffer)
+                                        if (read < 0) break
+                                        out.write(buffer, 0, read)
+                                        downloaded += read
+                                        require(total <= 0 || downloaded <= total) { "下载数据超过声明长度" }
+                                        val now = android.os.SystemClock.elapsedRealtime()
+                                        if (now - lastUi >= 300) {
+                                            lastUi = now
+                                            DownloadProgressBroadcaster.updateState(taskId, DownloadState.Downloading(downloaded, total,
+                                                if (total > 0) (downloaded.toFloat() / total).coerceIn(0f, 1f) else 0f))
+                                        }
+                                        if (now - lastDb >= 2000) {
+                                            lastDb = now
+                                            dao.updateProgressAndStatus(taskId, DownloadStatus.DOWNLOADING, downloaded, total, null)
+                                        }
+                                    }
+                                }
+                                out.flush()
+                                require(total <= 0 || downloaded == total) { "文件下载不完整，请恢复下载" }
+                            }
+                            false
                         }
-                        val errorMsg = "文件校验失败：$reason"
-                        taskDao.updateProgressAndStatus(bookId, DownloadStatus.FAILED, 0L, 0L, errorMsg)
-                        DownloadProgressBroadcaster.updateState(bookId, DownloadState.Error(errorMsg))
-                        return@withContext Result.failure()
+                        if (!restart) break
+                        rangeRestarted = true
+                        offset = 0L
+                        request = request.newBuilder().removeHeader("Range").removeHeader("If-Range").build()
                     }
-                    val actualFormat = integrity.actualFormat ?: format.lowercase()
-                    val completedFile = if (actualFormat.equals(format, ignoreCase = true)) {
-                        finalFile
-                    } else {
-                        File(downloadsDir, "$safeBookId.$actualFormat")
-                    }
-                    if (completedFile.exists()) {
-                        completedFile.delete()
-                    }
-                    tempFile.renameTo(completedFile)
-                    if (!actualFormat.equals(format, ignoreCase = true)) {
-                        task?.let { t ->
-                            taskDao.insertOrUpdate(
-                                t.copy(format = actualFormat, filePath = completedFile.absolutePath)
-                            )
+                    if (task.sourceId == "ixdzs8" && format == "txt") {
+                        val text = NovelTextArchive.prepare(temp) ?: error("网文源未返回 TXT 打包文件，请重试")
+                        text.let {
+                            try {
+                                // The text bytes cannot resume against the archive's validator.
+                                resume.writeText(JSONObject().put("url", task.downloadUrl).put("complete", false).toString())
+                                check(temp.delete() && text.renameTo(temp)) { "无法保存小说文本" }
+                            } finally { text.delete() }
                         }
                     }
-                    taskDao.updateProgressAndStatus(
-                        bookId,
-                        DownloadStatus.COMPLETED,
-                        completedFile.length(),
-                        completedFile.length(),
-                        null
-                    )
-                    val importResult = repository.importBookFromUri(
-                        Uri.fromFile(completedFile),
-                        "$title.$actualFormat"
-                    )
-                    // TXT 全文已完整落入数据库，原始下载文件是纯冗余，删掉省空间；
-                    // EPUB/漫画目前仍可能按需读原文件，不做处理。
-                    if (importResult.isSuccess && actualFormat.equals("txt", ignoreCase = true)) {
-                        runCatching { completedFile.delete() }
-                        Log.i(TAG, "TXT import succeeded via 416 recovery, removed raw file: ${completedFile.absolutePath}")
-                    }
-                    DownloadProgressBroadcaster.updateState(bookId, DownloadState.Success(completedFile.absolutePath))
-                    Log.i(TAG, "File completed locally via 416 recovery: path=${completedFile.absolutePath}")
-                    return@withContext Result.success()
-                } else {
-                    taskDao.updateProgressAndStatus(bookId, DownloadStatus.FAILED, 0L, 0L, "Invalid Range")
-                    DownloadProgressBroadcaster.updateState(bookId, DownloadState.Error("Invalid Range"))
-                    return@withContext Result.failure()
+                    val integrity = DownloadFileValidator.validateFileIntegrity(temp, format)
+                    require(integrity.valid) { integrity.htmlErrorHint ?: "下载文件格式校验失败" }
+                    val actualFormat = integrity.actualFormat ?: format
+                    val actualFile = File(downloads, "${finalFile.nameWithoutExtension}.$actualFormat")
+                    check(!actualFile.exists() || actualFile.delete()) { "无法替换旧下载文件" }
+                    check(temp.renameTo(actualFile)) { "无法保存下载文件" }
+                    dao.insertOrUpdate(task.copy(status = DownloadStatus.DOWNLOADING, format = actualFormat,
+                        filePath = actualFile.absolutePath, downloadedBytes = actualFile.length(), totalBytes = actualFile.length()))
+                    val completeMetadata = runCatching { JSONObject(resume.readText()) }.getOrDefault(JSONObject())
+                    resume.writeText(completeMetadata.put("complete", true).toString())
                 }
-            }
-
-            val body = response.body ?: throw Exception("Empty body")
-            var downloaded = existingLength
-            val buffer = ByteArray(8 * 1024)
-            var read: Int
-            var lastLogTime = System.currentTimeMillis()
-            var lastProgressTime = System.currentTimeMillis()
-            var lastReportedProgress = -1f
-
-            body.byteStream().use { inputStream ->
-                FileOutputStream(tempFile, append).use { outputStream ->
-                    while (inputStream.read(buffer).also { read = it } != -1) {
-                        if (isStopped) {
-                            outputStream.flush()
-                            val currentDownloaded = tempFile.length()
-                            Log.i(TAG, "Download worker stopped/paused for bookId=$bookId at bytes=$currentDownloaded")
-                            taskDao.updateProgressAndStatus(
-                                id = bookId,
-                                status = DownloadStatus.PAUSED,
-                                downloadedBytes = currentDownloaded,
-                                totalBytes = totalBytes,
-                                errorMessage = null
-                            )
-                            DownloadProgressBroadcaster.updateState(
-                                bookId,
-                                DownloadState.Paused(currentDownloaded, totalBytes)
-                            )
-                            return@withContext Result.success()
+                var latest = dao.getTaskById(taskId) ?: error("下载任务已取消")
+                val file = File(latest.filePath)
+                val integrity = DownloadFileValidator.validateFileIntegrity(file, latest.format)
+                require(integrity.valid) { "下载文件损坏，请重新下载" }
+                latest = latest.copy(format = integrity.actualFormat ?: latest.format)
+                val novelStore = NovelDownloadStore(context)
+                val novel = novelStore.pending(taskId)?.takeIf {
+                    com.example.source.WholeBookNovelSources.contains(task.sourceId) && it.book.sourceId == task.sourceId &&
+                        it.book.id == DownloadManager.originalBookId(task.id, task.sourceId)
+                }
+                val repository = BookRepository(context, db.bookDao(), db)
+                if (novel != null) {
+                    val baseline = novelStore.baseline(novel.book.sourceId, novel.book.id)?.novelInfo
+                    val old = db.bookDao().getBookBySourceResource(novel.book.sourceId, novel.book.id)
+                    if (novel.replace && old != null && baseline?.hasRevision == true &&
+                        novel.book.novelInfo?.hasRevision == true && baseline.revision != novel.book.novelInfo.revision) {
+                        val oldFile = File(old.filePath.removePrefix("file://"))
+                        fun fingerprint(input: File): ByteArray {
+                            val digest = java.security.MessageDigest.getInstance("SHA-256")
+                            input.inputStream().buffered().use { stream ->
+                                val buffer = ByteArray(64 * 1024)
+                                while (true) { val count = stream.read(buffer); if (count < 0) break; digest.update(buffer, 0, count) }
+                            }
+                            return digest.digest()
                         }
-
-                        outputStream.write(buffer, 0, read)
-                        downloaded += read
-
-                        val now = System.currentTimeMillis()
-                        if (now - lastLogTime > 2000) { // Log progress every 2s
-                            Log.d(TAG, "Downloading bookId=$bookId progress: $downloaded / $totalBytes bytes")
-                            lastLogTime = now
-                        }
-
-                        val progress = if (totalBytes > 0) downloaded.toFloat() / totalBytes.toFloat() else 0f
-                        // 进度节流：≥300ms 或进度变化 ≥1% 才推送一次，
-                        // 避免每 8KB 更新一次导致整个书库列表持续重组。
-                        if (now - lastProgressTime >= 300 || progress - lastReportedProgress >= 0.01f) {
-                            lastProgressTime = now
-                            lastReportedProgress = progress
-                            DownloadProgressBroadcaster.updateState(
-                                bookId,
-                                DownloadState.Downloading(downloaded, totalBytes, progress)
-                            )
+                        require(!oldFile.isFile || !fingerprint(oldFile).contentEquals(fingerprint(file))) {
+                            "源站整本下载包尚未更新，已保留本地版本；请稍后重试"
                         }
                     }
-                    outputStream.flush()
+                    repository.importDownloadedNovel(Uri.fromFile(file), novel.book.copy(format = latest.format), novel.replace).getOrThrow()
+                }
+                else repository.importBookFromUri(Uri.fromFile(file), "${task.title}.${latest.format}", task.sourceId,
+                    DownloadManager.originalBookId(task.id, task.sourceId)).getOrThrow()
+                // Once import commits, finish bookkeeping even if pause arrives at that boundary.
+                withContext(NonCancellable) {
+                    if (novel != null) novelStore.imported(taskId)
+                    db.withTransaction {
+                        dao.insertOrUpdate(latest.copy(status = DownloadStatus.COMPLETED, errorMessage = null,
+                            downloadedBytes = file.length(), totalBytes = file.length()))
+                    }
+                    secrets.remove("download:$taskId")
+                    DownloadProgressBroadcaster.updateState(taskId, DownloadState.Success(file.absolutePath))
+                }
+                Result.success()
+            }
+        } catch (e: CancellationException) {
+            withContext(NonCancellable) {
+                // Explicit cancel deleted the row; never recreate or rebroadcast it.
+                val latest = dao.getTaskById(taskId)
+                if (latest != null && latest.status in setOf(DownloadStatus.DOWNLOADING, DownloadStatus.PAUSED)) {
+                    dao.updateProgressAndStatus(taskId, DownloadStatus.PAUSED, temp.length(), total, null)
+                    DownloadProgressBroadcaster.updateState(taskId, DownloadState.Paused(temp.length(), total))
                 }
             }
-
-            // Finished reading
-            var actualFormat = format.lowercase()
-            var actualFinalFile = finalFile
-            if (tempFile.exists()) {
-                val integrity = DownloadFileValidator.validateFileIntegrity(tempFile, format)
-                if (!integrity.valid) {
-                    // 诊断：打印“HTML 错误页”文件的实际大小与开头内容，便于区分
-                    // 小体积错误页 / 书内容单文件 HTML / 其它情况
-                    runCatching {
-                        val headBytes = tempFile.inputStream().use { input ->
-                            val buf = ByteArray(2048)
-                            val n = input.read(buf)
-                            if (n > 0) buf.copyOf(n) else ByteArray(0)
-                        }
-                        Log.e(
-                            TAG,
-                            "HTML-ish file diagnostic: size=${tempFile.length()}, head=${headBytes.decodeToString().take(1500).replace("\n", "\\n")}"
-                        )
-                    }
-                    tempFile.delete()
-                    val reason = if (integrity.isHtmlErrorPage) {
-                        integrity.htmlErrorHint ?: cdnHtmlReason(url) ?: "服务器返回了 HTML 错误页"
-                    } else {
-                        "非有效的 ${format.uppercase()} 电子书格式"
-                    }
-                    val errorMsg = "文件校验失败：$reason"
-                    Log.e(TAG, "File integrity check failed for bookId=$bookId: $reason")
-                    taskDao.updateProgressAndStatus(bookId, DownloadStatus.FAILED, 0L, 0L, errorMsg)
-                    DownloadProgressBroadcaster.updateState(bookId, DownloadState.Error(errorMsg))
-                    return@withContext Result.failure()
-                }
-
-                actualFormat = integrity.actualFormat ?: format.lowercase()
-                actualFinalFile = if (actualFormat.equals(format, ignoreCase = true)) {
-                    finalFile
-                } else {
-                    File(downloadsDir, "$safeBookId.$actualFormat")
-                }
-                if (actualFinalFile.exists()) {
-                    actualFinalFile.delete()
-                }
-                tempFile.renameTo(actualFinalFile)
-
-                // 检测出的真实格式与任务记录不一致时，同步更新任务，保证下载中心/书架路径一致
-                if (!actualFormat.equals(format, ignoreCase = true)) {
-                    task?.let { t ->
-                        taskDao.insertOrUpdate(
-                            t.copy(format = actualFormat, filePath = actualFinalFile.absolutePath)
-                        )
-                    }
-                }
-            }
-
-            val finalLength = actualFinalFile.length()
-            val md5Hash = calculateMD5(actualFinalFile)
-            Log.i(
-                TAG,
-                "Download finished successfully for bookId=$bookId. Final length=$finalLength bytes, format=$actualFormat, MD5=$md5Hash. Importing into repository..."
-            )
-            taskDao.updateProgressAndStatus(
-                id = bookId,
-                status = DownloadStatus.COMPLETED,
-                downloadedBytes = finalLength,
-                totalBytes = finalLength,
-                errorMessage = null
-            )
-
-            // Import into local Book database automatically
-            val importFileName = "$title.$actualFormat"
-            val importResult = repository.importBookFromUri(
-                Uri.fromFile(actualFinalFile),
-                importFileName
-            )
-
-            // TXT 全文已完整落入数据库，原始下载文件是纯冗余，删掉省空间；
-            // 导入失败时保留文件，方便用户重试或排查问题；EPUB/漫画不动。
-            if (importResult.isSuccess && actualFormat.equals("txt", ignoreCase = true)) {
-                runCatching { actualFinalFile.delete() }
-                Log.i(TAG, "TXT import succeeded, removed raw downloaded file to save space: ${actualFinalFile.absolutePath}")
-            } else if (!importResult.isSuccess) {
-                Log.w(TAG, "Import failed, keeping raw downloaded file for retry: ${actualFinalFile.absolutePath}")
-            }
-
-            DownloadProgressBroadcaster.updateState(bookId, DownloadState.Success(actualFinalFile.absolutePath))
-            Log.i(TAG, "Successfully imported bookId=$bookId into BookRepository.")
-            Result.success()
-
+            throw e
         } catch (e: Exception) {
-            if (isStopped) {
-                val currentLength = if (tempFile.exists()) tempFile.length() else 0L
-                Log.i(TAG, "Download caught stopped/paused exception for bookId=$bookId. Bytes saved=$currentLength")
-                taskDao.updateProgressAndStatus(bookId, DownloadStatus.PAUSED, currentLength, 0L, null)
-                DownloadProgressBroadcaster.updateState(bookId, DownloadState.Paused(currentLength, 0L))
-                return@withContext Result.success()
+            val message = if (e.message?.contains("ENOSPC", true) == true) "存储空间不足，请清理后重试" else e.message ?: "下载或入库失败"
+            if (dao.getTaskById(taskId) != null) {
+                dao.updateProgressAndStatus(taskId, DownloadStatus.FAILED, temp.length(), total, message)
+                DownloadProgressBroadcaster.updateState(taskId, DownloadState.Error(message))
             }
-            val currentLength = if (tempFile.exists()) tempFile.length() else 0L
-            val errorMsg = e.message ?: "Download failed"
-            Log.e(TAG, "Download failed with exception for bookId=$bookId: $errorMsg", e)
-            taskDao.updateProgressAndStatus(bookId, DownloadStatus.FAILED, currentLength, 0L, errorMsg)
-            DownloadProgressBroadcaster.updateState(bookId, DownloadState.Error(errorMsg))
             Result.failure()
         }
     }
 
-    private fun calculateMD5(file: File): String {
-        return try {
-            val digest = java.security.MessageDigest.getInstance("MD5")
-            file.inputStream().use { inputStream ->
-                val buffer = ByteArray(8192)
-                var bytesRead: Int
-                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                    digest.update(buffer, 0, bytesRead)
-                }
-            }
-            digest.digest().joinToString("") { "%02x".format(it) }
-        } catch (e: Exception) {
-            "unknown_md5"
-        }
+    /** Cancellation closes the active socket even during a blocking body read. */
+    private suspend fun <T> withResponse(request: Request, sourceId: String, block: suspend (Response) -> T): T {
+        val origin=request.url
+        val guarded=(if (sourceId == "zlibrary") client else publicClient).newBuilder().addNetworkInterceptor { chain ->
+            val next=chain.request()
+            val safe=if(next.url.host!=origin.host || next.url.scheme!=origin.scheme) next.newBuilder()
+                .removeHeader("Cookie").removeHeader("Authorization").removeHeader("Proxy-Authorization").removeHeader("X-Api-Key").build() else next
+            chain.proceed(safe)
+        }.build()
+        return guarded.newCall(request).executeCancellable().use { block(it) }
     }
 
-    /** 判断响应是否是 HTML 错误页/挑战页（真实电子书响应不可能是 text/html）。 */
-    private fun isHtmlErrorResponse(response: Response): Boolean {
-        val contentType = response.header("Content-Type")?.lowercase() ?: ""
-        if (contentType.contains("text/html")) return true
-        return try {
-            val sniff = response.peekBody(2048).string().lowercase()
-            sniff.startsWith("<!doctype html") || sniff.startsWith("<html")
-        } catch (e: Exception) {
-            false
-        }
-    }
-
-    /** 从 HTML 响应中提取可读原因（与 DownloadFileValidator 提示逻辑一致）。 */
-    private fun htmlResponseReason(response: Response, url: String?): String {
-        val sample = try {
-            response.peekBody(64 * 1024).string().lowercase()
-        } catch (e: Exception) {
-            ""
-        }
-        return when {
-            sample.contains("daily limit") || sample.contains("downloads_today") ||
-                sample.contains("downloads_limit") || sample.contains("already reached") ->
-                "今日下载次数已达上限（未登录 IP 限额 5 次/天，登录账号 10 次/天；请登录或等待额度重置）"
-            sample.contains("page not found") || sample.contains("not found, try again") ->
-                "页面不存在或下载链接已失效"
-            sample.contains("checking your browser") || sample.contains("diamwall") ||
-                sample.contains("verifying your browser") || sample.contains("solve this captcha") ->
-                "站点返回了浏览器验证页（DiamWall 验证未通过，请稍后重试）"
-            cdnHtmlReason(url) != null -> cdnHtmlReason(url)!!
-            else -> "服务器返回了 HTML 错误页"
-        }
-    }
-
-    /** eapi CDN 直链（dln1.ncdn.ec/redirection）过期后服务器会返回 HTML 页，给出明确提示。 */
-    private fun cdnHtmlReason(url: String?): String? {
-        val lower = url?.lowercase() ?: return null
-        return if (lower.contains("ncdn") || lower.contains("redirection") || lower.contains("cdn-zlib")) {
-            "下载链接可能已过期（CDN 返回 HTML），请重新下载"
-        } else {
-            null
-        }
-    }
-
-    /** Retry transient 5xx (e.g. DiamWall 502) and IO errors up to 3 times. */
-    private fun executeWithRetry(client: OkHttpClient, request: Request): Response {
-        var lastError: Exception? = null
-        for (attempt in 1..3) {
-            try {
-                val r = client.newCall(request).execute()
-                if (r.code in 500..599 && attempt < 3) {
-                    Log.w(TAG, "HTTP ${r.code} on attempt $attempt, retrying")
-                    r.close()
-                    Thread.sleep(2000)
-                    continue
-                }
-                return r
-            } catch (e: Exception) {
-                lastError = e
-                if (attempt < 3) {
-                    Log.w(TAG, "Attempt $attempt failed: ${e.message}; retrying")
-                    Thread.sleep(2000)
-                }
-            }
-        }
-        throw lastError ?: Exception("download failed")
+    private fun isHtmlError(response: Response, format: String): Boolean {
+        val sample = response.peekBody(4096).string().trimStart().lowercase()
+        val html = response.header("Content-Type")?.contains("text/html", true) == true ||
+            sample.startsWith("<!doctype html") || sample.startsWith("<html")
+        if (!html) return false
+        if (format != "txt") return true
+        // Literal HTML in a TXT book is valid; only known challenge/error markers reject it.
+        return listOf("diamwall", "checking your browser", "verifying your browser", "daily limit", "page not found", "solve this captcha").any { it in sample }
     }
 }

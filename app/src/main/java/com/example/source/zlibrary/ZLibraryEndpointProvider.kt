@@ -6,9 +6,16 @@ import com.example.library.ZLibraryNodeManager
 import com.example.source.zlibrary.network.ZLibraryDns
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import com.example.source.executeCancellable
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.util.concurrent.TimeUnit
@@ -59,6 +66,7 @@ class ZLibraryEndpointProvider(
             "z-lib.my",
             "z-lib.ad"
         )
+        private val probeSlots = Semaphore(3)
         val FALLBACK_DOMAINS = PRESET_DOMAINS
     }
 
@@ -69,7 +77,7 @@ class ZLibraryEndpointProvider(
     // 已过滤 Meta 假 IP）、站点挂掉 → 探不通；而 DiamWall/Cloudflare 挑战码
     // （403/503/513）也算“活着”——挑战随后由 PoW 拦截器 / WebView 兜底自动过，
     // 不构成换节点的理由。结果带 60s TTL，常规搜索不额外付探测延迟。
-    private val quickCheckClient = OkHttpClient.Builder()
+    private val quickCheckClient = com.example.source.SharedHttpTransport.builder()
         .dns(ZLibraryDns.INSTANCE)
         .connectTimeout(PROBE_TIMEOUT_S, TimeUnit.SECONDS)
         .readTimeout(PROBE_TIMEOUT_S, TimeUnit.SECONDS)
@@ -79,16 +87,16 @@ class ZLibraryEndpointProvider(
     @Volatile
     private var lastProbe: Triple<String, Boolean, Long>? = null
 
-    private fun isNodeReachable(domain: String): Boolean {
+    private suspend fun isNodeReachable(domain: String): Boolean {
         if (domain.isBlank()) return false
         val now = System.currentTimeMillis()
         lastProbe?.let { (d, ok, at) ->
             if (d == domain && now - at < PROBE_TTL_MS) return ok
         }
-        val ok = runCatching {
+        val ok = try {
             val request = Request.Builder().url("https://$domain/").head().build()
-            quickCheckClient.newCall(request).execute().use { it.code > 0 }
-        }.getOrDefault(false)
+            quickCheckClient.newCall(request).executeCancellable().use { it.code > 0 }
+        } catch(e: Exception) { currentCoroutineContext().ensureActive(); false }
         lastProbe = Triple(domain, ok, now)
         return ok
     }
@@ -96,16 +104,16 @@ class ZLibraryEndpointProvider(
     /**
      * 扫描候选池选活节点：远程门户动态发现（官方披露域名，自动跟上站点归拢/
      * 迁移）∪ 节点管理候选（官网/备用入口/用户自加）∪ 预置域名。并行健康检查
-     * ——总耗时≈最慢单个节点；优先取“搜索可用”的节点（可达但搜索故障的只作
+     * ——最多 3 个并发，首个搜索可用节点立即返回，整轮最多 25 秒；优先取“搜索可用”的节点（可达但搜索故障的只作
      * 下载兜底，否则搜到的全是主页推荐书）。全挂返回 null。
      */
     private suspend fun scanForLiveNode(): String? {
-        val remoteDomains = runCatching {
-            remoteProvider.fetchLatestEndpoints()
+        val remoteDomains = try {
+            withTimeoutOrNull(4_000) { remoteProvider.fetchLatestEndpoints() }
                 ?.sortedByDescending { it.priority }
                 ?.map { it.url.trim().removePrefix("https://").removePrefix("http://").trimEnd('/') }
                 ?.filter { it.isNotBlank() }
-        }.getOrNull().orEmpty()
+        } catch(e: Exception) { currentCoroutineContext().ensureActive(); null }.orEmpty()
         val candidates = LinkedHashMap<String, Boolean>()
         remoteDomains.forEach { candidates.putIfAbsent(it, true) }
         runCatching { ZLibraryNodeManager.getScrapedNodes(context) }
@@ -115,14 +123,28 @@ class ZLibraryEndpointProvider(
             .getOrDefault(emptyList())
             .forEach { candidates.putIfAbsent(it, true) }
         PRESET_DOMAINS.forEach { candidates.putIfAbsent(it, false) }
-        val candidateList = candidates.keys.toList()
+        val candidateList = candidates.keys.take(32)
         if (candidateList.isEmpty()) return null
         return coroutineScope {
-            val results = candidateList.map { candidate ->
-                async { candidate to healthChecker.checkHealth(candidate) }
-            }.awaitAll()
-            (results.firstOrNull { it.second.isAvailable && it.second.searchAvailable }
-                ?: results.firstOrNull { it.second.isAvailable })?.first
+            val results = Channel<Pair<String, EndpointHealthResult>>(Channel.UNLIMITED)
+            val jobs = candidateList.map { candidate ->
+                launch(Dispatchers.IO) {
+                    val health = probeSlots.withPermit { healthChecker.checkHealth(candidate) }
+                    results.send(candidate to health)
+                }
+            }
+            var reachable: String? = null
+            try {
+                withTimeoutOrNull(25_000) {
+                    repeat(candidateList.size) {
+                        val (candidate, health) = results.receive()
+                        if (health.isAvailable && health.searchAvailable) return@withTimeoutOrNull candidate
+                        if (health.isAvailable && reachable == null) reachable = candidate
+                    }
+                    reachable
+                } ?: reachable
+            } finally { jobs.forEach { it.cancel() }; results.close() }
+
         }
     }
 

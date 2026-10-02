@@ -3,21 +3,18 @@ package com.example.download
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 
 object DownloadProgressBroadcaster {
     private val _states = MutableStateFlow<Map<String, DownloadState>>(emptyMap())
     val states: StateFlow<Map<String, DownloadState>> = _states.asStateFlow()
 
     fun updateState(bookId: String, state: DownloadState) {
-        val current = _states.value.toMutableMap()
-        current[bookId] = state
-        _states.value = current
+        _states.update { it + (bookId to state) }
     }
 
     fun removeState(bookId: String) {
-        val current = _states.value.toMutableMap()
-        current.remove(bookId)
-        _states.value = current
+        _states.update { it - bookId }
     }
 
     fun getState(bookId: String): DownloadState {

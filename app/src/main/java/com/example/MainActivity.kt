@@ -8,6 +8,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.compose.animation.*
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -66,6 +67,8 @@ import com.example.ui.theme.MintPrimary
 import com.example.ui.theme.MyApplicationTheme
 import com.example.ui.theme.luminance
 import coil.compose.rememberAsyncImagePainter
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.ui.components.AppToast
 
 @OptIn(ExperimentalSharedTransitionApi::class)
 val LocalSharedTransitionScope = compositionLocalOf<SharedTransitionScope?> { null }
@@ -101,7 +104,15 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // P2-1：安装系统启动窗口 —— 必须在 super.onCreate **之前**调用（官方要求：
+        // 早于窗口创建注册 delegate，否则 Android 12+ 上系统可能已经自行移除启动窗口，
+        // setKeepOnScreenCondition / 交接动画都会失效）。
+        // 冷启动时 Application/DB/书源引擎的初始化都在下面这些行里，Compose 首帧之前
+        // 窗口是空的；系统启动窗口由 SurfaceFlinger 画，点图标第一帧就有内容（见 themes.xml
+        // Theme.MyApplication.Splash，底色与开屏页一致，交接无色差）。
+        installSplashScreen()
         super.onCreate(savedInstanceState)
+        com.example.source.js.JsActivityTracker.register(this)
         // 启动看门狗：若"极致"画质在 20 秒内连续两次发生崩溃，自动降回"高"，
         // 防止实验性着色器效果导致"一崩就再也打不开"的死循环变砖。
         runCatching {
@@ -170,7 +181,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            val autoNightMode by viewModel.autoNightMode.collectAsState()
+            val autoNightMode by viewModel.autoNightMode.collectAsStateWithLifecycle()
 
             // ── A5 系统栏图标对比度跟随 App 自己的主题 ────────────────────
             // enableEdgeToEdge() 裸调用后，状态栏/导航栏图标颜色跟随**系统** uimode，
@@ -184,11 +195,12 @@ class MainActivity : ComponentActivity() {
                 controller.isAppearanceLightNavigationBars = !autoNightMode
                 onDispose {}
             }
-            val blueLightFilter by viewModel.blueLightFilter.collectAsState()
-            val blueLightAlpha by viewModel.blueLightAlpha.collectAsState()
-            val colorPrimaryIndex by viewModel.colorPrimaryIndex.collectAsState()
-            val colorSecondaryIndex by viewModel.colorSecondaryIndex.collectAsState()
-            val orientationLock by viewModel.screenOrientationLock.collectAsState()
+            val blueLightFilter by viewModel.blueLightFilter.collectAsStateWithLifecycle()
+            val blueLightAlpha by viewModel.blueLightAlpha.collectAsStateWithLifecycle()
+            val colorPrimaryIndex by viewModel.colorPrimaryIndex.collectAsStateWithLifecycle()
+            val colorSecondaryIndex by viewModel.colorSecondaryIndex.collectAsStateWithLifecycle()
+            val orientationLock by viewModel.screenOrientationLock.collectAsStateWithLifecycle()
+            val hapticsEnabled by viewModel.hapticsEnabled.collectAsStateWithLifecycle()
 
             // 卡片微调：设置页「自定义卡片参数」实时写入的共享状态，注入所有 GlassCard
             // （v2 默认档迁移已在 onCreate 中完成）
@@ -251,11 +263,11 @@ class MainActivity : ComponentActivity() {
                         },
                         color = MaterialTheme.colorScheme.background
                     ) {
-                        val bgConfig by AppBackgroundController.config.collectAsState()
+                        val bgConfig by AppBackgroundController.config.collectAsStateWithLifecycle()
                         val bgActive = bgConfig.mode == 1 && !bgConfig.uri.isNullOrBlank()
                         // 渲染画质档位：设置页可调，主要影响玻璃效果强度与动效数量。
                         // "高"为默认，与历史版本视觉完全一致；低于"高"不挂 backdrop 捕获层。
-                        val renderQualityIdx by viewModel.renderQuality.collectAsState()
+                        val renderQualityIdx by viewModel.renderQuality.collectAsStateWithLifecycle()
                         val renderQuality = com.example.ui.components.RenderQuality.of(renderQualityIdx)
                         val glassEnabled = renderQuality.realtimeGlass
                         // 滚动惯性倾斜帧循环：仅 MAX 档挂载（该档本就常驻极光等无限动效；
@@ -316,6 +328,11 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
                             }
+                            // 触觉总开关同步到非组合环境：漫画翻页 / 图片裁切等直接调
+                            // View.performHapticFeedback 的地方读不到 CompositionLocal，只能靠这个镜像。
+                            androidx.compose.runtime.SideEffect {
+                                com.example.ui.feedback.HapticsGate.enabled = hapticsEnabled
+                            }
                             CompositionLocalProvider(
                                 LocalAppBackgroundActive provides bgActive,
                                 LocalAppBottomInset provides (navBarBottom + 92.dp + 8.dp),
@@ -328,7 +345,13 @@ class MainActivity : ComponentActivity() {
                                 LocalCardTweaks provides cardTweaks.value,
                                 // 「我喜欢的」交互：动效与触觉统一开关（系统"减少动态效果"自动降级）
                                 com.example.ui.feedback.LocalReduceMotion provides com.example.ui.feedback.systemReduceMotion(),
-                                com.example.ui.feedback.LocalHapticsEnabled provides true,
+                                com.example.ui.feedback.LocalHapticsEnabled provides hapticsEnabled,
+                                // 关掉开关 → 把 Compose 侧的震动实现整体换成空实现：
+                                // 底栏切换、卡片波纹、滑块、开关等 10+ 处 LocalHapticFeedback.current
+                                // 一次性全部静音，无需逐个加分支。
+                                androidx.compose.ui.platform.LocalHapticFeedback provides
+                                    (if (hapticsEnabled) androidx.compose.ui.platform.LocalHapticFeedback.current
+                                    else com.example.ui.feedback.MutingHapticFeedback),
                             ) {
                         val navController = rememberNavController()
                         // 启动时用持久化配置初始化背景（设置页改动会通过 AppBackgroundController 实时更新）
@@ -349,11 +372,11 @@ class MainActivity : ComponentActivity() {
                         onDispose {}
                     }
 
-                    val importMessage by viewModel.importStatusMessage.collectAsState()
+                    val importMessage by viewModel.importStatusMessage.collectAsStateWithLifecycle()
 
                     LaunchedEffect(importMessage) {
                         importMessage?.let {
-                            Toast.makeText(this@MainActivity, it, Toast.LENGTH_LONG).show()
+                            AppToast.makeText(this@MainActivity, it, Toast.LENGTH_LONG).show()
                             viewModel.clearImportMessage()
                         }
                     }
@@ -391,6 +414,23 @@ class MainActivity : ComponentActivity() {
                     }
 
                     var selectedTab by rememberSaveable { mutableIntStateOf(1) }
+                    val favoriteAddRequest by viewModel.favoriteAddRequest.collectAsStateWithLifecycle()
+                    val favoriteActionMessage by viewModel.favoriteActionMessage.collectAsStateWithLifecycle()
+                    val favoriteSourceNames by libraryViewModel.availableSources.collectAsStateWithLifecycle()
+                    LaunchedEffect(favoriteActionMessage) {
+                        favoriteActionMessage?.let { message ->
+                            AppToast.makeText(this@MainActivity, message, Toast.LENGTH_LONG).show()
+                            viewModel.clearFavoriteActionMessage()
+                        }
+                    }
+                    favoriteAddRequest?.let { request ->
+                        com.example.ui.favorite.DuplicateComicSheet(
+                            request = request,
+                            sourceName = { sourceId -> favoriteSourceNames.firstOrNull { it.id == sourceId }?.name ?: sourceId },
+                            onDismiss = viewModel::dismissFavoriteAdd,
+                            onConfirm = viewModel::confirmFavoriteAdd,
+                        )
+                    }
                     /* 书架当前分类：必须放在**这层**（HomeScreen 之外）。
                        打开书籍是 navigate 到另一个目的地，HomeScreen 会整体离开组合，
                        状态放它里面就会被重置成「默认」——用户看到的就是
@@ -409,6 +449,9 @@ class MainActivity : ComponentActivity() {
                             SplashScreen(
                                 prefs = viewModel.prefs,
                                 onSplashFinished = {
+                                    // 冷启动 TTFD：真正进入可用界面的这一刻才上报 fully drawn，
+                                    // 这样系统启动窗口 / 开屏海报的耗时不会被算进「启动完成」之前。
+                                    runCatching { reportFullyDrawn() }
                                     val nextDest = if (viewModel.prefs.hasSeenOnboarding) "home" else "onboarding"
                                     navController.navigate(nextDest) {
                                         popUpTo("splash") { inclusive = true }
@@ -429,10 +472,14 @@ class MainActivity : ComponentActivity() {
                         }
 
                         composable("home") { CompositionLocalProvider(LocalNavAnimatedVisibilityScope provides this) {
-                            val books by viewModel.allBooks.collectAsState()
-                            val categories by viewModel.allCategories.collectAsState()
-                            val readingRecords by viewModel.allReadingRecords.collectAsState()
-                            val readingSessions by viewModel.allReadingSessions.collectAsState()
+                            val books by viewModel.allBooks.collectAsStateWithLifecycle()
+                            val categories by viewModel.allCategories.collectAsStateWithLifecycle()
+                            val readingRecords by viewModel.allReadingRecords.collectAsStateWithLifecycle()
+                            val readingSessions by viewModel.allReadingSessions.collectAsStateWithLifecycle()
+                            /* 神回的三个订阅**刻意不放这里**：统计页/设置页才需要，
+                               放到 home 顶部会让冷启动就去读 DataStore + 查库 ——
+                               一旦神回侧有任何问题，表现就是"一打开就闪退"。
+                               挪进各 Tab 内部后，默认 Tab（书架）完全不碰神回。 */
                             val tabBarCollapseState = rememberTabBarCollapseState()
                             // Tab 栏专用背景采样（书源选择弹窗同款手法）：
                             // layerBackdrop 捕获页面真实内容，Tab 栏 drawBackdrop 模糊它。
@@ -457,9 +504,11 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
 
-                            val libraryErrorMessage by libraryViewModel.errorMessage.collectAsState()
-                            val mainImportMessage by viewModel.importStatusMessage.collectAsState()
+                            val libraryErrorMessage by libraryViewModel.errorMessage.collectAsStateWithLifecycle()
+                            val mainImportMessage by viewModel.importStatusMessage.collectAsStateWithLifecycle()
                             val snackbarHostState = remember { SnackbarHostState() }
+                            // 登记为全局提示宿主：主页在场时，全站 Toast 统一走 App 自己的 snackbar 皮肤
+                            com.example.ui.components.BindAppToastHost(snackbarHostState)
 
                             /* ── 「我喜欢的」：书源注入 + 收藏数据 ── */
                             LaunchedEffect(Unit) {
@@ -468,9 +517,9 @@ class MainActivity : ComponentActivity() {
                                         .firstOrNull { it.id == id } as? com.example.source.ComicSource
                                 }
                             }
-                            val favoriteItems by viewModel.favoriteItems.collectAsState()
-                            val favoriteKeys by viewModel.favoriteKeys.collectAsState()
-                            val favoriteCategoryEntities by viewModel.favoriteCategories.collectAsState()
+                            val favoriteItems by viewModel.favoriteItems.collectAsStateWithLifecycle()
+                            val favoriteKeys by viewModel.favoriteKeys.collectAsStateWithLifecycle()
+                            val favoriteCategoryEntities by viewModel.favoriteCategories.collectAsStateWithLifecycle()
                             val favoriteCategories = remember(favoriteCategoryEntities) {
                                 favoriteCategoryEntities.map { it.name }
                             }
@@ -500,6 +549,14 @@ class MainActivity : ComponentActivity() {
                                     )
                                     if (result == SnackbarResult.ActionPerformed) undo()
                                 }
+                            }
+
+                            fun formatShelfBytes(bytes: Long): String = when {
+                                bytes >= 1L shl 30 -> "%.2f GB".format(bytes / 1024f / 1024f / 1024f)
+                                bytes >= 1L shl 20 -> "%.1f MB".format(bytes / 1024f / 1024f)
+                                bytes >= 1L shl 10 -> "%.1f KB".format(bytes / 1024f)
+                                bytes > 0 -> "$bytes B"
+                                else -> "0 KB"
                             }
 
                             LaunchedEffect(libraryErrorMessage) {
@@ -612,6 +669,7 @@ class MainActivity : ComponentActivity() {
                                                         libraryViewModel.openComic(book)
                                                         navController.navigate("comic_chapters")
                                                     },
+                                                    onOpenLocalNovel = { book -> viewModel.selectBook(book); navController.navigate("reader") },
                                                     extraBottomPadding = LocalAppBottomInset.current
                                                 )
                                             1 -> HomeScreen(
@@ -660,9 +718,9 @@ class MainActivity : ComponentActivity() {
                                                     viewModel.deleteCategory(category) { onResult(it) }
                                                 },
                                                 /* ── 隐私模式（第七轮第 6 条）── */
-                                                privacyModeEnabled = viewModel.privacyModeEnabled.collectAsState().value,
-                                                protectedCategoryNames = viewModel.protectedCategoryNames.collectAsState().value,
-                                                unlockedCategoryIds = viewModel.unlockedCategoryIds.collectAsState().value,
+                                                privacyModeEnabled = viewModel.privacyModeEnabled.collectAsStateWithLifecycle().value,
+                                                protectedCategoryNames = viewModel.protectedCategoryNames.collectAsStateWithLifecycle().value,
+                                                unlockedCategoryIds = viewModel.unlockedCategoryIds.collectAsStateWithLifecycle().value,
                                                 onUnlockCategory = { cat, pin -> viewModel.unlockCategory(cat.id, pin) },
                                                 onToggleCategoryProtected = { cat, protected ->
                                                     viewModel.setCategoryProtected(cat.id, protected)
@@ -725,21 +783,25 @@ class MainActivity : ComponentActivity() {
                                                      withSource.size to (selected.size - withSource.size)
                                                  },
                                                 onDeleteDownloads = { list ->
-                                                    val bytes = list.sumOf {
-                                                        runCatching { java.io.File(it.filePath).length() }.getOrDefault(0L)
-                                                    }
-                                                    val mb = bytes / 1024f / 1024f
-                                                    pendingDeleteBooks = list
-                                                    homeScope.launch {
-                                                        kotlinx.coroutines.delay(8000)
-                                                        if (pendingDeleteBooks == list) {
-                                                            list.forEach { viewModel.deleteBook(it) }
-                                                            pendingDeleteBooks = emptyList()
+                                                    val token = java.util.UUID.randomUUID().toString()
+                                                    // 多批次并存：每批独立撤销/提交，后一批不能覆盖前一批
+                                                    pendingDeleteBooks = pendingDeleteBooks + list
+                                                    viewModel.scheduleBooksDeletion(list, token) {
+                                                        pendingDeleteBooks = pendingDeleteBooks.filter { b ->
+                                                            list.none { it.id == b.id }
                                                         }
                                                     }
-                                                    showUndo(
-                                                        "已删除 ${list.size} 本，释放 %.1f MB（阅读进度保留）".format(mb)
-                                                    ) { pendingDeleteBooks = emptyList() }
+                                                    homeScope.launch {
+                                                        val bytes = viewModel.booksDiskBytes(list)
+                                                        showUndo(
+                                                            "已删除 ${list.size} 本，释放 ${formatShelfBytes(bytes)}（阅读进度保留）"
+                                                        ) {
+                                                            viewModel.cancelBooksDeletion(token)
+                                                            pendingDeleteBooks = pendingDeleteBooks.filter { b ->
+                                                                list.none { it.id == b.id }
+                                                            }
+                                                        }
+                                                    }
                                                 },
                                                 onShowUndo = { message, undo -> showUndo(message, undo) },
                                                 onMarkFinished = { book ->
@@ -748,7 +810,7 @@ class MainActivity : ComponentActivity() {
                                                 /* 「我喜欢的」的分类：与书架分类完全独立 */
                                                 favoriteCategories = favoriteCategories,
                                                 /* 隐私：与受保护分类同一套 PIN */
-                                                favoritesProtected = viewModel.favoritesProtected.collectAsState().value,
+                                                favoritesProtected = viewModel.favoritesProtected.collectAsStateWithLifecycle().value,
                                                 onVerifyPrivacyPin = { pin -> viewModel.verifyPrivacyPin(pin) },
                                                 onAddFavoriteCategory = { viewModel.addFavoriteCategory(it) },
                                                 onRenameFavoriteCategory = { old, new ->
@@ -758,6 +820,12 @@ class MainActivity : ComponentActivity() {
                                             )
                                             2 -> {
                                                 var dailyGoalState by remember { mutableIntStateOf(viewModel.prefs.dailyGoalMinutes) }
+                                                /* 神回订阅只在这一 Tab 内：切到统计页才读 DataStore / 查库 */
+                                                val godMoments by viewModel.godMoments.collectAsStateWithLifecycle()
+                                                val godStyle by viewModel.godSettings.rankingStyle
+                                                    .collectAsStateWithLifecycle(initialValue = com.example.god.GodRankingStyle.PODIUM)
+                                                val godGyro by viewModel.godSettings.gyroParallaxEnabled
+                                                    .collectAsStateWithLifecycle(initialValue = true)
                                                 StatisticsScreen(
                                                     books = books,
                                                     totalReadTimeSecondsFlow = viewModel.totalReadTimeSeconds,
@@ -770,8 +838,10 @@ class MainActivity : ComponentActivity() {
                                                     },
                                                 onGoToShelf = { selectedTab = 1 },
                                                 onDeleteRecord = { viewModel.deleteReadingRecord(it.id) },
-                                                recordCovers = libraryViewModel.recordCovers.collectAsState().value,
-                                                recordBooks = libraryViewModel.recordBooks.collectAsState().value,
+                                                recordCovers = libraryViewModel.recordCovers.collectAsStateWithLifecycle().value,
+                                                recordBooks = libraryViewModel.recordBooks.collectAsStateWithLifecycle().value,
+                                                recordCoverHeaders = libraryViewModel.recordCoverHeaders.collectAsStateWithLifecycle().value,
+                                                onResolveRecordCoverHeaders = libraryViewModel::resolveRecordCoverHeaders,
                                                 onResolveRecordCovers = { libraryViewModel.resolveMissingRecordCovers(it) },
                                                 onOpenRecordDetail = { book ->
                                                     libraryViewModel.openComic(book)
@@ -784,6 +854,52 @@ class MainActivity : ComponentActivity() {
                                                     } else {
                                                         navController.navigate("reader")
                                                     }
+                                                },
+                                                /* ── 神回排行榜 ── */
+                                                godMoments = godMoments,
+                                                godStyle = godStyle,
+                                                godGyroEnabled = godGyro,
+                                                onOpenGodRanking = { navController.navigate("god_ranking") },
+                                                onGodMomentClick = { m ->
+                                                    // 排行榜条目 → 漫画主页（自动定位到该话 + 金色高亮）。
+                                                    // ⚠️ 漫画主页的头部横幅直接吃这里传入的 SearchBook：
+                                                    // 只给 id 的话封面、模糊背景、作者全空，还会把原始
+                                                    // "#mdapi:…" id 当作者显示出来（用户报"从排行榜进
+                                                    // 详情丢了封面"）。收藏表里有这本书的快照
+                                                    // （title/author/coverUrl），按 key 取出来补齐。
+                                                    val parts = m.bookId.split("::")
+                                                    val sid = parts.getOrNull(0).orEmpty()
+                                                    val cid = parts.getOrNull(1).orEmpty()
+                                                    if (sid.isNotBlank() && cid.isNotBlank()) {
+                                                        com.example.god.GodMomentJumpState.chapterId = m.chapterId
+                                                        val fav = viewModel.favoriteItems.value.firstOrNull {
+                                                            it.favorite.sourceId == sid && it.favorite.comicId == cid
+                                                        }?.favorite
+                                                        libraryViewModel.openComic(
+                                                            com.example.source.SearchBook(
+                                                                id = cid,
+                                                                sourceId = sid,
+                                                                title = m.bookTitle,
+                                                                author = fav?.author.orEmpty(),
+                                                                cover = fav?.coverUrl,
+                                                                comicId = cid,
+                                                                format = "comic",
+                                                            )
+                                                        )
+                                                        navController.navigate("comic_chapters")
+                                                    } else {
+                                                        android.widget.Toast.makeText(
+                                                            this@MainActivity, "这本书已不在书库中",
+                                                            android.widget.Toast.LENGTH_SHORT,
+                                                        ).show()
+                                                    }
+                                                },
+                                                onEditGodMoment = { m ->
+                                                    com.example.god.GodMomentEditTarget.entity = m
+                                                    navController.navigate("god_editor")
+                                                },
+                                                onDeleteGodMoment = { m ->
+                                                    viewModel.deleteGodMoment(m)
                                                 }
                                                 )
                                             }
@@ -810,13 +926,15 @@ class MainActivity : ComponentActivity() {
                                                 onColorThemeChange = { p, s -> viewModel.updateColorTheme(p, s) },
                                                 orientationLockVal = orientationLock,
                                                 onOrientationLockChange = { viewModel.updateScreenOrientationLock(it) },
+                                                hapticsEnabledVal = hapticsEnabled,
+                                                onHapticsChange = { viewModel.updateHapticsEnabled(it) },
                                                 renderQualityVal = renderQualityIdx,
                                                 onRenderQualityChange = { viewModel.updateRenderQuality(it) },
                                                 cardTweaksState = cardTweaks,
                                                 /* ── 隐私模式（第七轮第 6.4 条；第八轮审查修复：
                                                     底部 Tab 的设置页此前漏传隐私参数，全部落到默认
                                                     { false }——隐私模式在 Tab 设置页永远无法开启） ── */
-                                                privacyModeEnabled = viewModel.privacyModeEnabled.collectAsState().value,
+                                                privacyModeEnabled = viewModel.privacyModeEnabled.collectAsStateWithLifecycle().value,
                                                 onEnablePrivacyMode = { pin -> viewModel.enablePrivacyMode(pin) },
                                                 onDisablePrivacyMode = { pin -> viewModel.disablePrivacyMode(pin) },
                                                 onVerifyPrivacyPin = { pin -> viewModel.verifyPrivacyPin(pin) },
@@ -824,12 +942,15 @@ class MainActivity : ComponentActivity() {
                                                 onToggleCategoryProtected = { cat, protected ->
                                                     viewModel.setCategoryProtected(cat.id, protected)
                                                 },
-                                                incognitoBrowsingEnabled = viewModel.incognitoBrowsingEnabled.collectAsState().value,
+                                                incognitoBrowsingEnabled = viewModel.incognitoBrowsingEnabled.collectAsStateWithLifecycle().value,
 
                                                 onSetIncognitoBrowsing = { viewModel.setIncognitoBrowsing(it) },
 
-                                                favoritesProtected = viewModel.favoritesProtected.collectAsState().value,
+                                                favoritesProtected = viewModel.favoritesProtected.collectAsStateWithLifecycle().value,
                                                 onSetFavoritesProtected = { viewModel.setFavoritesProtected(it) },
+                                                /* ── 神回设置分组 ── */
+                                                godSettings = viewModel.godSettings,
+                                                onOpenGodRanking = { navController.navigate("god_ranking") },
                                             )
                                         }
                                     }
@@ -837,7 +958,7 @@ class MainActivity : ComponentActivity() {
                             }
                             }
                             // 底部 Tab 栏：多选态下被悬浮操作栏"替换"（弹簧滑出）
-                            val tabBarVisible by com.example.ui.shelf.ShelfChrome.tabBarVisible.collectAsState()
+                            val tabBarVisible by com.example.ui.shelf.ShelfChrome.tabBarVisible.collectAsStateWithLifecycle()
                             androidx.compose.animation.AnimatedVisibility(
                                 visible = tabBarVisible,
                                 enter = androidx.compose.animation.slideInVertically(initialOffsetY = { it }) +
@@ -858,8 +979,15 @@ class MainActivity : ComponentActivity() {
                         }
  }
                         composable("settings") {
-                            val categories by viewModel.allCategories.collectAsState()
+                            val categories by viewModel.allCategories.collectAsStateWithLifecycle()
+                            // 排行榜陈列方式按钮的跳转信标：读一次即清空
+                            val focusGodSettings = remember {
+                                com.example.god.GodStyleSettingsJump.pending.also {
+                                    com.example.god.GodStyleSettingsJump.pending = false
+                                }
+                            }
                             SettingsTabScreen(
+                                focusGodSettings = focusGodSettings,
                                 onOpenSourceManager = {
                                     navController.navigate("source_management")
                                 },
@@ -884,11 +1012,13 @@ class MainActivity : ComponentActivity() {
                                 onColorThemeChange = { p, s -> viewModel.updateColorTheme(p, s) },
                                 orientationLockVal = orientationLock,
                                 onOrientationLockChange = { viewModel.updateScreenOrientationLock(it) },
+                                hapticsEnabledVal = hapticsEnabled,
+                                onHapticsChange = { viewModel.updateHapticsEnabled(it) },
                                 renderQualityVal = renderQualityIdx,
                                 onRenderQualityChange = { viewModel.updateRenderQuality(it) },
                                 cardTweaksState = cardTweaks,
                                 /* ── 隐私模式（第七轮第 6.4 条） ── */
-                                privacyModeEnabled = viewModel.privacyModeEnabled.collectAsState().value,
+                                privacyModeEnabled = viewModel.privacyModeEnabled.collectAsStateWithLifecycle().value,
                                 onEnablePrivacyMode = { pin -> viewModel.enablePrivacyMode(pin) },
                                 onDisablePrivacyMode = { pin -> viewModel.disablePrivacyMode(pin) },
                                 onVerifyPrivacyPin = { pin -> viewModel.verifyPrivacyPin(pin) },
@@ -896,13 +1026,85 @@ class MainActivity : ComponentActivity() {
                                 onToggleCategoryProtected = { cat, protected ->
                                     viewModel.setCategoryProtected(cat.id, protected)
                                 },
-                                incognitoBrowsingEnabled = viewModel.incognitoBrowsingEnabled.collectAsState().value,
+                                incognitoBrowsingEnabled = viewModel.incognitoBrowsingEnabled.collectAsStateWithLifecycle().value,
 
                                 onSetIncognitoBrowsing = { viewModel.setIncognitoBrowsing(it) },
 
-                                favoritesProtected = viewModel.favoritesProtected.collectAsState().value,
+                                favoritesProtected = viewModel.favoritesProtected.collectAsStateWithLifecycle().value,
                                 onSetFavoritesProtected = { viewModel.setFavoritesProtected(it) },
+                                /* ── 神回设置分组 ── */
+                                godSettings = viewModel.godSettings,
+                                onOpenGodRanking = { navController.navigate("god_ranking") },
                             )
+                        }
+
+                        /* ── 神回排行榜（全屏完整版） ── */
+                        composable("god_ranking") {
+                            com.example.god.GodRankingScreen(
+                                moments = viewModel.godMoments.collectAsStateWithLifecycle().value,
+                                style = viewModel.godSettings.rankingStyle
+                                    .collectAsStateWithLifecycle(initialValue = com.example.god.GodRankingStyle.PODIUM).value,
+                                gyroEnabled = viewModel.godSettings.gyroParallaxEnabled
+                                    .collectAsStateWithLifecycle(initialValue = true).value,
+                                onBack = { navController.popBackStack() },
+                                onItemClick = { m ->
+                                    val parts = m.bookId.split("::")
+                                    val sid = parts.getOrNull(0).orEmpty()
+                                    val cid = parts.getOrNull(1).orEmpty()
+                                    if (sid.isNotBlank() && cid.isNotBlank()) {
+                                        com.example.god.GodMomentJumpState.chapterId = m.chapterId
+                                        // 同统计页入口：从收藏快照补齐 author/cover，
+                                        // 否则漫画主页头部丢封面还把原始 id 当作者
+                                        val fav = viewModel.favoriteItems.value.firstOrNull {
+                                            it.favorite.sourceId == sid && it.favorite.comicId == cid
+                                        }?.favorite
+                                        libraryViewModel.openComic(
+                                            com.example.source.SearchBook(
+                                                id = cid, sourceId = sid, title = m.bookTitle,
+                                                author = fav?.author.orEmpty(),
+                                                cover = fav?.coverUrl,
+                                                comicId = cid, format = "comic",
+                                            )
+                                        )
+                                        navController.popBackStack()
+                                        navController.navigate("comic_chapters")
+                                    }
+                                },
+                                onEdit = { m ->
+                                    com.example.god.GodMomentEditTarget.entity = m
+                                    navController.navigate("god_editor")
+                                },
+                                onDelete = { m -> viewModel.deleteGodMoment(m) },
+                                onOpenStyleSettings = {
+                                    // 置位跳转信标：设置页打开后动画滚动到神回设置分区
+                                    com.example.god.GodStyleSettingsJump.pending = true
+                                    navController.navigate("settings")
+                                },
+                            )
+                        }
+
+                        /* ── 神回编辑窗口（从排行榜 / 设置进入的独立路由） ── */
+                        composable("god_editor") {
+                            val binding = com.example.god.rememberGodEditBinding()
+                            var started by remember { mutableStateOf(false) }
+                            LaunchedEffect(Unit) {
+                                val e = com.example.god.GodMomentEditTarget.entity
+                                if (e == null) {
+                                    navController.popBackStack()
+                                } else {
+                                    binding.openEdit(e)
+                                    started = true
+                                }
+                            }
+                            LaunchedEffect(binding.request) {
+                                // 窗口关闭（保存或取消）→ 退回上一个界面
+                                if (started && binding.request == null) {
+                                    com.example.god.GodMomentEditTarget.entity = null
+                                    navController.popBackStack()
+                                }
+                            }
+                            androidx.activity.compose.BackHandler { binding.request = null }
+                            com.example.god.GodMomentEditHost(binding = binding, onSaved = { })
                         }
 
                         composable(
@@ -929,17 +1131,32 @@ class MainActivity : ComponentActivity() {
                                     )
                             }
                         ) { CompositionLocalProvider(LocalNavAnimatedVisibilityScope provides this) {
-                            val selectedBook by viewModel.selectedBook.collectAsState()
-                            val chapters by viewModel.chapters.collectAsState()
-                            val bookmarks by viewModel.bookmarks.collectAsState()
-                            val highlights by viewModel.highlights.collectAsState()
-                            val searchResults by viewModel.searchResults.collectAsState()
-                            val isSearching by viewModel.isSearching.collectAsState()
+                            val selectedBook by viewModel.selectedBook.collectAsStateWithLifecycle()
+                            val chapters by viewModel.chapters.collectAsStateWithLifecycle()
+                            val readerLoading by viewModel.readerLoading.collectAsStateWithLifecycle()
+                            val loadedChapterIndices by viewModel.loadedChapterIndices.collectAsStateWithLifecycle()
+                            val readerLoadError by viewModel.readerLoadError.collectAsStateWithLifecycle()
+                            val bookmarks by viewModel.bookmarks.collectAsStateWithLifecycle()
+                            val highlights by viewModel.highlights.collectAsStateWithLifecycle()
+                            val searchResults by viewModel.searchResults.collectAsStateWithLifecycle()
+                            val isSearching by viewModel.isSearching.collectAsStateWithLifecycle()
+
+                            val currentShelf by viewModel.allBooks.collectAsStateWithLifecycle()
+                            val revisedBook = currentShelf.firstOrNull { it.id == selectedBook?.id }
+                            LaunchedEffect(revisedBook?.filePath) {
+                                if (selectedBook != null && com.example.source.WholeBookNovelSources.contains(selectedBook?.sourceId) &&
+                                    revisedBook != null && revisedBook.filePath != selectedBook?.filePath) viewModel.retrySelectedBook()
+                            }
 
                             ReaderScreen(
                                 book = selectedBook,
                                 bookTitle = selectedBook?.title ?: "本地阅读",
                                 chapters = chapters,
+                                readerLoading = readerLoading,
+                                loadedChapterIndices = loadedChapterIndices,
+                                readerLoadError = readerLoadError,
+                                onRetryLoad = viewModel::retrySelectedBook,
+                                onEnsureChapterLoaded = viewModel::ensureActiveChapter,
                                 onBack = { navController.popBackStack() },
                                 onUpdateProgress = { id, chapterIdx, offset, isFinished ->
                                     viewModel.updateProgress(id, chapterIdx, offset, isFinished)
@@ -972,7 +1189,11 @@ class MainActivity : ComponentActivity() {
                                 onSessionEnd = { session ->
                                     viewModel.addReadingSession(session)
                                 },
+                                onCheckNovelUpdate = if (com.example.source.WholeBookNovelSources.contains(selectedBook?.sourceId)) ({
+                                    selectedBook?.let(libraryViewModel::checkNovelUpdate)
+                                }) else null,
                             )
+                            com.example.library.NovelUpdatePanel(libraryViewModel, selectedBook)
                         }
  }
                         composable(
@@ -1000,9 +1221,9 @@ class MainActivity : ComponentActivity() {
                                     )
                             }
                         ) { CompositionLocalProvider(LocalNavAnimatedVisibilityScope provides this) {
-                            val selectedBook by viewModel.selectedBook.collectAsState()
-                            val chapters by viewModel.chapters.collectAsState()
-                            val libraryBooks by viewModel.allBooks.collectAsState()
+                            val selectedBook by viewModel.selectedBook.collectAsStateWithLifecycle()
+                            val chapters by viewModel.chapters.collectAsStateWithLifecycle()
+                            val libraryBooks by viewModel.allBooks.collectAsStateWithLifecycle()
 
                             ComicReaderScreen(
                                 book = selectedBook,
@@ -1021,7 +1242,22 @@ class MainActivity : ComponentActivity() {
                                 },
                                 onSessionEnd = { session ->
                                     viewModel.addReadingSession(session)
-                                }
+                                },
+                                // 本地漫画没有"话"的概念（一章 = 一页），整本视为一话
+                                godContext = selectedBook?.takeIf { it.isComic }?.let { b ->
+                                    com.example.god.GodMomentContext(
+                                        bookId = "local_${b.id}",
+                                        chapterId = b.id.toString(),
+                                        bookTitle = b.title,
+                                        chapterTitle = b.title,
+                                        chapterNumber = 1,
+                                    )
+                                },
+                                onGodMomentSaved = {
+                                    android.widget.Toast.makeText(
+                                        this@MainActivity, "已加入神回排行榜 ✦", android.widget.Toast.LENGTH_SHORT,
+                                    ).show()
+                                },
                             )
                         } }
 
@@ -1034,15 +1270,15 @@ class MainActivity : ComponentActivity() {
                             popEnterTransition = { fadeIn(tween(260)) },
                             popExitTransition = { fadeOut(tween(200)) }
                         ) { CompositionLocalProvider(LocalNavAnimatedVisibilityScope provides this) {
-                            val comicBook by libraryViewModel.comicBook.collectAsState()
-                            val comicChapters by libraryViewModel.comicChapters.collectAsState()
-                            val comicChaptersLoading by libraryViewModel.comicChaptersLoading.collectAsState()
-                            val comicChaptersError by libraryViewModel.comicChaptersError.collectAsState()
-                            val comicDownloading by libraryViewModel.comicDownloading.collectAsState()
-                            val comicDownloadProgress by libraryViewModel.comicDownloadProgress.collectAsState()
-                            val comicPaused by libraryViewModel.comicPaused.collectAsState()
-                            val comicMessage by libraryViewModel.comicMessage.collectAsState()
-                            val comicIsTextMode by libraryViewModel.comicIsTextMode.collectAsState()
+                            val comicBook by libraryViewModel.comicBook.collectAsStateWithLifecycle()
+                            val comicChapters by libraryViewModel.comicChapters.collectAsStateWithLifecycle()
+                            val comicChaptersLoading by libraryViewModel.comicChaptersLoading.collectAsStateWithLifecycle()
+                            val comicChaptersError by libraryViewModel.comicChaptersError.collectAsStateWithLifecycle()
+                            val comicDownloading by libraryViewModel.comicDownloading.collectAsStateWithLifecycle()
+                            val comicDownloadProgress by libraryViewModel.comicDownloadProgress.collectAsStateWithLifecycle()
+                            val comicPaused by libraryViewModel.comicPaused.collectAsStateWithLifecycle()
+                            val comicMessage by libraryViewModel.comicMessage.collectAsStateWithLifecycle()
+                            val comicIsTextMode by libraryViewModel.comicIsTextMode.collectAsStateWithLifecycle()
                             val comicContext = androidx.compose.ui.platform.LocalContext.current
 
                             /* ── 「我喜欢的」与阅读进度（与是否下载无关） ── */
@@ -1050,27 +1286,67 @@ class MainActivity : ComponentActivity() {
                             val comicId = comicBook?.id ?: ""
                             val chapterReadEntities by remember(comicSourceId, comicId) {
                                 viewModel.favoriteRepository.chapterStatesFlow(comicSourceId, comicId)
-                            }.collectAsState(emptyList())
+                            }.collectAsStateWithLifecycle(emptyList())
                             val chapterReadStates = remember(chapterReadEntities) {
                                 chapterReadEntities.associateBy { it.chapterId }
                             }
                             val comicProgress by remember(comicSourceId, comicId) {
                                 viewModel.favoriteRepository.progressFlow(comicSourceId, comicId)
-                            }.collectAsState(null)
-                            val comicFavoriteKeys by viewModel.favoriteKeys.collectAsState()
+                            }.collectAsStateWithLifecycle(null)
+                            val comicFavoriteKeys by viewModel.favoriteKeys.collectAsStateWithLifecycle()
                             val comicFavorite = comicFavoriteKeys.contains("$comicSourceId::$comicId")
-                            val comicCategories by viewModel.allCategories.collectAsState()
-                            val allBooksForChapters by viewModel.allBooks.collectAsState()
-                            // 已下载章节：本地书名形如 "《标题》 · 章节名"
+                            val comicFavoriteCategories by viewModel.favoriteCategories.collectAsStateWithLifecycle()
+                            val allBooksForChapters by viewModel.allBooks.collectAsStateWithLifecycle()
+                            // 已下载章节：本地章节书由 ComicLocalImporter 落库，
+                            // 书名 = "{漫画标题} · {章节名}"（经文件名非法字符清洗 + 120 字截断）。
+                            // 判定必须圈定同一部漫画：优先 sourceId+comicId 精确匹配；
+                            // 旧版本下载的书没记来源，回退到书名相等。此前的全库 contains
+                            // 模糊匹配会把别的书里同名的章节（"第1话"满地都是）误判成已下载。
                             val downloadedChapterIds = remember(comicBook, comicChapters, allBooksForChapters) {
-                                val localTitles = allBooksForChapters.filter { it.isComic }.map { it.title }.toSet()
+                                val comicTitle = comicBook?.title.orEmpty()
+                                fun sanitize(s: String) = s
+                                    .replace(Regex("[\\\\/:*?\"<>|]"), "_")
+                                    .trim()
+                                    .take(120)
                                 comicChapters.filter { ch ->
-                                    localTitles.any { it.contains("· ${ch.title}") }
+                                    if (comicTitle.isBlank()) return@filter false
+                                    val expected = sanitize("$comicTitle · ${ch.title}")
+                                    allBooksForChapters.any { b ->
+                                        b.isComic && b.title == expected && (
+                                            (b.sourceId == comicSourceId && b.comicId == comicId) ||
+                                                (b.sourceId.isNullOrBlank() && b.comicId.isNullOrBlank())
+                                            )
+                                    }
                                 }.map { it.id }.toSet()
                             }
                             /** 继续阅读 / 点击章节时的起始页 */
                             var startPage by rememberSaveable { mutableIntStateOf(0) }
                             var favoriteCategorySheet by remember { mutableStateOf(false) }
+
+                            /* ── 神回：本话是否被标记为神回 + 排行榜跳转定位 ── */
+                            // Room flow 首帧前 collectAsState 的初始值是空 map：这几百毫秒里
+                            // 神回话会先渲染成普通章节行（滑动书签手势活着），一滑就写库+弹
+                            // 提示，随后金卡顶替行——看起来"卡片没反应但弹了书签提示"。
+                            // 所以随 map 一起跟踪"已加载"，加载前不武装书签手势、写入回调也拦。
+                            val godMomentsState by produceState(
+                                initialValue = emptyMap<String, com.example.god.GodMomentEntity>() to false,
+                                key1 = comicSourceId, key2 = comicId,
+                            ) {
+                                if (comicSourceId.isBlank() || comicId.isBlank()) {
+                                    value = emptyMap<String, com.example.god.GodMomentEntity>() to true
+                                } else {
+                                    viewModel.godRepository.observeChapterMap("$comicSourceId::$comicId")
+                                        .collect { value = it to true }
+                                }
+                            }
+                            val godMomentsForBook = godMomentsState.first
+                            val godMomentsReady = godMomentsState.second
+                            // 信标读一次即清空（避免二次进入误触发定位）
+                            val godFocusChapterId = remember(comicSourceId, comicId) {
+                                val v = com.example.god.GodMomentJumpState.chapterId
+                                com.example.god.GodMomentJumpState.chapterId = null
+                                v
+                            }
 
                             /* ── 换源：候选来源 + 迁移确认 ── */
                             var migrateSheet by remember { mutableStateOf(false) }
@@ -1109,7 +1385,7 @@ class MainActivity : ComponentActivity() {
                                         }
                                         // 迁移后直接切到新源的这本（页面内刷新，不返回书库）
                                         libraryViewModel.openComic(target)
-                                        android.widget.Toast.makeText(
+                                        AppToast.makeText(
                                             comicContext, "已换到「${candidate.sourceName}」，进度已迁移",
                                             android.widget.Toast.LENGTH_LONG
                                         ).show()
@@ -1119,40 +1395,73 @@ class MainActivity : ComponentActivity() {
                             }
 
                             if (favoriteCategorySheet) {
-                                com.example.ui.shelf.CategoryPickerSheet(
-                                    categories = comicCategories.map { it.name },
-                                    title = "加到哪个分类？",
-                                    onPick = { name ->
-                                        comicBook?.let { b ->
-                                            viewModel.toggleFavorite(b, true, name, comicChapters)
+                                val putInFavoriteCategory: (String) -> Unit = { name ->
+                                    comicBook?.let { book ->
+                                        if (comicFavorite) {
+                                            viewModel.moveFavoritesToCategory(
+                                                listOf(com.example.data.favorite.favoriteKey(book.sourceId, book.id)), name,
+                                            )
+                                        } else {
+                                            viewModel.toggleFavorite(book, true, name, comicChapters)
                                         }
-                                        favoriteCategorySheet = false
-                                    },
+                                    }
+                                    favoriteCategorySheet = false
+                                }
+                                com.example.ui.shelf.CategoryPickerSheet(
+                                    categories = (listOf(com.example.data.favorite.FAV_DEFAULT_CATEGORY) +
+                                        comicFavoriteCategories.map { it.name }
+                                            .filter { it != com.example.data.favorite.ALL_FAV_CATEGORY_NAME }).distinct(),
+                                    title = "放入「我喜欢的」哪个分类？",
+                                    onPick = putInFavoriteCategory,
                                     onDismiss = { favoriteCategorySheet = false },
                                     onCreate = { name ->
-                                        viewModel.addCategory(name)
-                                        comicBook?.let { b -> viewModel.toggleFavorite(b, true, name, comicChapters) }
-                                        favoriteCategorySheet = false
+                                        viewModel.addFavoriteCategory(name)
+                                        putInFavoriteCategory(name)
                                     },
                                 )
                             }
 
                             LaunchedEffect(comicMessage) {
                                 comicMessage?.let {
-                                    android.widget.Toast.makeText(comicContext, it, android.widget.Toast.LENGTH_LONG).show()
+                                    AppToast.makeText(comicContext, it, android.widget.Toast.LENGTH_LONG).show()
                                     libraryViewModel.clearComicMessage()
                                 }
                             }
 
                             ComicChaptersScreen(
                                 book = comicBook,
+                                sourceName = favoriteSourceNames.firstOrNull { it.id == comicBook?.sourceId }?.name,
+                                onSearchText = { keyword ->
+                                    libraryViewModel.requestAggregateSearch(keyword, comicIsTextMode)
+                                    selectedTab = 0
+                                    if (!navController.popBackStack("home", false)) {
+                                        navController.navigate("home") { launchSingleTop = true }
+                                    }
+                                },
                                 chapters = comicChapters,
                                 loading = comicChaptersLoading,
                                 error = comicChaptersError,
+                                bookmarkedChapterIds = chapterReadEntities.filter { it.bookmarked }.map { it.chapterId }.toSet(),
+                                onSetChapterBookmark = { chapterId, chapterIndex, bookmarked ->
+                                    // 神回章节不可加书签（定稿）：写入回调这层兜底拦掉
+                                    // 神回 map 加载窗口期的滑动，不写库也不弹提示
+                                    if (godMomentsForBook[chapterId] == null) {
+                                        viewModel.setChapterBookmark(comicSourceId, comicId, chapterId, chapterIndex, bookmarked)
+                                        AppToast.makeText(
+                                            comicContext,
+                                            if (bookmarked) "已添加书签" else "已取消书签",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
+                                },
                                 downloadingChapters = comicDownloading,
                                 downloadProgress = comicDownloadProgress,
                                 pausedChapters = comicPaused,
                                 textMode = comicIsTextMode,
+                                onDownloadNovel = if (comicBook?.sourceId == "auto_novel") ({
+                                    comicBook?.let { libraryViewModel.startDownload(it, "epub") }
+                                    AppToast.makeText(comicContext, "已请求整本下载，可在下载管理查看进度", Toast.LENGTH_SHORT).show()
+                                }) else null,
                                 onBack = { navController.popBackStack() },
                                 onRetry = { comicBook?.let { libraryViewModel.openComic(it) } },
                                 onChapterClick = { chapter ->
@@ -1181,7 +1490,7 @@ class MainActivity : ComponentActivity() {
                                 },
                                 onFavoriteLongPress = { favoriteCategorySheet = true },
                                 onFavoriteDisabledClick = {
-                                    android.widget.Toast.makeText(
+                                    AppToast.makeText(
                                         comicContext, "这本书没有来源信息，无法加入「我喜欢的」",
                                         android.widget.Toast.LENGTH_SHORT
                                     ).show()
@@ -1210,7 +1519,7 @@ class MainActivity : ComponentActivity() {
                                     // 换源：先在各书源里找同一本书，确认后再按章节序号迁移进度
                                     val b = comicBook
                                     if (b == null || comicSourceId.isBlank()) {
-                                        android.widget.Toast.makeText(
+                                        AppToast.makeText(
                                             comicContext, "这本书没有来源信息，无法换源",
                                             android.widget.Toast.LENGTH_SHORT
                                         ).show()
@@ -1236,6 +1545,10 @@ class MainActivity : ComponentActivity() {
                                         viewModel.markComicSeen(comicSourceId, comicId, comicChapters)
                                     }
                                 },
+                                /* ── 神回态章节卡片 + 排行榜跳转定位 ── */
+                                godMoments = godMomentsForBook,
+                                godMomentsReady = godMomentsReady,
+                                godFocusChapterId = godFocusChapterId,
                                 onPauseDownload = { chapter ->
                                     libraryViewModel.pauseComicChapter(chapter.id)
                                 },
@@ -1261,13 +1574,13 @@ class MainActivity : ComponentActivity() {
                             popEnterTransition = { fadeIn(tween(280)) },
                             popExitTransition = { fadeOut(tween(220)) }
                         ) { CompositionLocalProvider(LocalNavAnimatedVisibilityScope provides this) {
-                            val comicBook by libraryViewModel.comicBook.collectAsState()
-                            val activeChapter by libraryViewModel.activeComicChapter.collectAsState()
-                            val images by libraryViewModel.comicChapterImages.collectAsState()
-                            val imageHeaders by libraryViewModel.comicChapterHeaders.collectAsState()
-                            val loading by libraryViewModel.comicChapterLoading.collectAsState()
-                            val error by libraryViewModel.comicChapterError.collectAsState()
-                            val comicChaptersList by libraryViewModel.comicChapters.collectAsState()
+                            val comicBook by libraryViewModel.comicBook.collectAsStateWithLifecycle()
+                            val activeChapter by libraryViewModel.activeComicChapter.collectAsStateWithLifecycle()
+                            val images by libraryViewModel.comicChapterImages.collectAsStateWithLifecycle()
+                            val imageHeaders by libraryViewModel.comicChapterHeaders.collectAsStateWithLifecycle()
+                            val loading by libraryViewModel.comicChapterLoading.collectAsStateWithLifecycle()
+                            val error by libraryViewModel.comicChapterError.collectAsStateWithLifecycle()
+                            val comicChaptersList by libraryViewModel.comicChapters.collectAsStateWithLifecycle()
 
                             val activeChapterIdx = comicChaptersList.indexOfFirst { it.id == activeChapter?.id }
                             val prevChapter = if (activeChapterIdx > 0) comicChaptersList[activeChapterIdx - 1] else null
@@ -1279,12 +1592,11 @@ class MainActivity : ComponentActivity() {
                                 imageUrls = images,
                                 loading = loading,
                                 error = error,
-                                referer = if (comicBook?.sourceId == "mangadex") "https://mangadex.live/" else null,
                                 imageHeaders = imageHeaders,
                                 resolveImage = { url -> libraryViewModel.resolveComicImage(url) },
                                 resolveImageHeaders = { url -> libraryViewModel.resolveComicImageHeaders(url) },
                                 onRecordTime = { seconds ->
-                                    viewModel.recordTime(seconds, comicBook?.title ?: activeChapter?.title)
+                                    viewModel.recordTime(seconds, comicBook?.title ?: activeChapter?.title, comicBook)
                                 },
                                 onSessionEnd = { session ->
                                     viewModel.addReadingSession(session)
@@ -1324,6 +1636,11 @@ class MainActivity : ComponentActivity() {
                                 onPageChanged = { page, total ->
                                     val ch = activeChapter ?: return@OnlineComicReaderScreen
                                     ComicJumpState.lastPage = page
+                                    // 读到章尾自动预取下一章（对齐 Mihon/Kotatsu）：
+                                    // 剩 3 页时开始拉下一章图片列表 + 预热前两页
+                                    if (total - page <= 3) {
+                                        nextChapter?.let { libraryViewModel.prefetchNextComicChapter(it) }
+                                    }
                                     val idx = comicChaptersList.indexOfFirst { it.id == ch.id }
                                     comicBook?.let { b ->
                                         viewModel.saveComicProgress(
@@ -1337,8 +1654,32 @@ class MainActivity : ComponentActivity() {
                                     }
                                 },
                                 initialPage = ComicJumpState.startPage,
-                                onPrevChapter = prevChapter?.let { ch -> { libraryViewModel.loadChapterImages(ch) } },
-                                onNextChapter = nextChapter?.let { ch -> { libraryViewModel.loadChapterImages(ch) } },
+                                onPrevChapter = prevChapter?.let { ch -> {
+                                    ComicJumpState.startPage = Int.MAX_VALUE // 回退进入上一章末页
+                                    libraryViewModel.loadChapterImages(ch)
+                                } },
+                                onNextChapter = nextChapter?.let { ch -> {
+                                    ComicJumpState.startPage = 0
+                                    libraryViewModel.loadChapterImages(ch)
+                                } },
+                                // 在线漫画：bookId = "sourceId::comicId"，chapterId = 源章节 id
+                                godContext = run {
+                                    val b = comicBook
+                                    val ch = activeChapter
+                                    if (b == null || ch == null || b.sourceId.isBlank()) null
+                                    else com.example.god.GodMomentContext(
+                                        bookId = "${b.sourceId}::${b.id}",
+                                        chapterId = ch.id,
+                                        bookTitle = b.title,
+                                        chapterTitle = ch.title,
+                                        chapterNumber = (activeChapterIdx + 1).coerceAtLeast(1),
+                                    )
+                                },
+                                onGodMomentSaved = {
+                                    android.widget.Toast.makeText(
+                                        this@MainActivity, "已加入神回排行榜 ✦", android.widget.Toast.LENGTH_SHORT,
+                                    ).show()
+                                },
                             )
                         } }
 
@@ -1349,12 +1690,12 @@ class MainActivity : ComponentActivity() {
                             },
                             exitTransition = { fadeOut(tween(200)) }
                         ) { CompositionLocalProvider(LocalNavAnimatedVisibilityScope provides this) {
-                            val comicBook by libraryViewModel.comicBook.collectAsState()
-                            val novelChapter by libraryViewModel.activeNovelChapter.collectAsState()
-                            val novelText by libraryViewModel.novelChapterText.collectAsState()
-                            val novelLoading by libraryViewModel.novelChapterLoading.collectAsState()
-                            val novelError by libraryViewModel.novelChapterError.collectAsState()
-                            val chapters by libraryViewModel.comicChapters.collectAsState()
+                            val comicBook by libraryViewModel.comicBook.collectAsStateWithLifecycle()
+                            val novelChapter by libraryViewModel.activeNovelChapter.collectAsStateWithLifecycle()
+                            val novelText by libraryViewModel.novelChapterText.collectAsStateWithLifecycle()
+                            val novelLoading by libraryViewModel.novelChapterLoading.collectAsStateWithLifecycle()
+                            val novelError by libraryViewModel.novelChapterError.collectAsStateWithLifecycle()
+                            val chapters by libraryViewModel.comicChapters.collectAsStateWithLifecycle()
                             val idx = chapters.indexOfFirst { it.id == novelChapter?.id }
 
                             com.example.ui.NovelReaderScreen(
@@ -1379,7 +1720,7 @@ class MainActivity : ComponentActivity() {
                                 },
                                 onRecordTime = { seconds ->
                                     // 阅读统计修复：传书名——此前在线小说阅读从不写阅读记录
-                                    viewModel.recordTime(seconds, comicBook?.title ?: novelChapter?.title)
+                                    viewModel.recordTime(seconds, comicBook?.title ?: novelChapter?.title, comicBook)
                                 },
                                 onSessionEnd = { session ->
                                     viewModel.addReadingSession(session)

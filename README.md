@@ -1,26 +1,24 @@
 <div align="center">
 
-<img src="./app/src/main/res/mipmap-xxxhdpi/ic_launcher_foreground.webp" width="110"/>
+<img src="./app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.webp" width="110" alt="Ciallo阅读新应用图标"/>
 
-# Ciallo阅读（EASYREADER）
+# Ciallo Reader（Ciallo阅读）
 
 **Android 阅读器 / 在线书库聚合下载器**
 
 Kotlin · Jetpack Compose (Material 3) · MVVM · 单 Activity
 
-<img src="./docs/demo-1.gif" width="270"/>
-<img src="./docs/demo-2.gif" width="270"/>
-<img src="./docs/demo-3.gif" width="270"/>
+<img src="./promo/output/Ciallo-promo-cover-v2.png" width="820" alt="Ciallo阅读 1.2.0 品牌封面"/>
 
-[下载 APK](https://github.com/a1553846342-dotcom/EASYREADER/releases) ·
+[下载 1.2.0 APK](https://github.com/a1553846342-dotcom/Ciallo-Reader/releases/download/v1.2.0/Ciallo-Reader-v1.2.0.apk) ·
 [功能](#功能) ·
 [安装](#安装) ·
 [使用说明](#使用说明) ·
 [FAQ](#faq) ·
-[提交 Issue](https://github.com/a1553846342-dotcom/EASYREADER/issues)
+[提交 Issue](https://github.com/a1553846342-dotcom/Ciallo-Reader/issues)
 
 ![Android](https://img.shields.io/badge/Android-API%2024%2B-green)
-![Release](https://img.shields.io/badge/Release-v1.1.0-orange)
+![Release](https://img.shields.io/badge/Release-v1.2.0-orange)
 ![Architecture](https://img.shields.io/badge/Architecture-MVVM-blue)
 ![UI](https://img.shields.io/badge/UI-Compose%20M3-8A2BE2)
 ![License](https://img.shields.io/badge/License-All%20Rights%20Reserved-lightgrey)
@@ -35,14 +33,14 @@ Android 端小说 / 漫画阅读器，内置多书源在线聚合搜索与下载
 
 | 项目                     | 内容                                                                  |
 | ---------------------- | ------------------------------------------------------------------- |
-| 当前版本                   | 1.1.0                                                               |
+| 当前版本                   | 1.2.0                                                               |
 | 开发状态                   | 个人项目 · 活跃开发中                                                        |
 | 最低系统                   | Android 7.0（API 24）                                                 |
 | compileSdk / targetSdk | 35                                                                  |
 | 技术栈                    | Kotlin 2.0 + Jetpack Compose（Material 3）+ MVVM + Room + WorkManager |
 | 架构                     | MVVM + StateFlow + Repository，单 Activity + Navigation Compose       |
-| 测试                     | 325+ 项（JVM / Robolectric）                                           |
-| APK 体积                 | 约 21.5MB（含 ONNX Runtime；OCR 模型按需下载）                                  |
+| 测试                     | 509 项（JVM / Robolectric）；95 项设备测试定义                                 |
+| APK 体积                 | 23,307,407 B（22.23 MiB；arm64-v8a，含 ONNX Runtime，OCR 模型按需下载）              |
 
 ***
 
@@ -53,7 +51,7 @@ Android 端小说 / 漫画阅读器，内置多书源在线聚合搜索与下载
 | 格式                      | 支持情况     | 说明                                |
 | ----------------------- | -------- | --------------------------------- |
 | TXT                     | 完整       | 大文件分段加载、自动章节识别、多编码自适应             |
-| EPUB                    | 完整       | 目录 / 封面 / 元数据，文件名编码多级回退            |
+| EPUB                    | 完整       | 目录 / 封面 / 元数据、内嵌插图显示与文件名编码回退       |
 | MOBI / AZW3 / AZW / PRC | 完整，自研解析  | PDB / KF8 容器，Kindle 压缩算法，封面提取     |
 | DOCX / FB2              | 完整       | 段落抽取 / 章节切分                       |
 | CBZ / ZIP 漫画            | 完整       | 自然排序，GBK 文件名回退                    |
@@ -67,7 +65,7 @@ Android 端小说 / 漫画阅读器，内置多书源在线聚合搜索与下载
 - 串珠快速翻页：长按 1s 唤出圆柱式页面环，拖动跟手，松手磁吸，甩动按力度连翻
 - 真实行边界分页，超大章节分块测量 + 缓存，首屏打开快
 - 字号 / 行距 / 页边距 / 首行缩进可调，五套阅读主题，字体可换可导入 TTF
-- 书签、划线高亮、全文搜索、目录自动定位
+- 章节书签、划线高亮、全文搜索、目录自动定位；漫画神回收藏与多种排行榜陈列
 - 自动滚屏、TTS 朗读、护眼模式、定时休息
 - 阅读进度按章保存，重开续读
 
@@ -84,21 +82,24 @@ Android 端小说 / 漫画阅读器，内置多书源在线聚合搜索与下载
 
 ### 书源与搜索
 
-- 内置书源：Z-Library、MangaDex、Venera 社区 JS 源、Legado JSON 书源、ehentai
+- 内置书源：Z-Library、MangaDex、Venera 社区 JS 源、Legado JSON 书源、ehentai，以及中文轻小说 / 网文资源
 - 聚合搜索：多源并发，逐源出结果即展示；每源 6 条预览可展开；繁简与变体匹配
 - Z-Library：多节点内置与自动容灾、节点管理、验证自动处理、多格式下载
 - 自定义书源：支持 Legado `@css:` / `@json:` 规则，本地文件或网络导入
 - 在线小说：文字源搜索结果可直接阅读正文
+- 小说整本下载与更新：支持轻小说中文文库、中文机翻 Web 连载、国内网文 TXT 等来源；更新时保留阅读位置和书签
+- 漫画详情显示来源提供的标签、别名及章节信息
 - 书源调试日志：查看请求记录与失败原因
 - 书源管理页：快捷入口 + 小说 / 漫画分组 + 导入入口，逐源开关与登录
 
 ### 下载
 
-- 后台下载队列，切页锁屏不中断；3 路并发，支持暂停 / 继续 / 取消 / 重试
+- 后台下载队列，切页锁屏不中断；漫画任务可在进程重启后恢复，支持暂停 / 继续 / 取消 / 重试
 - 断点续传
 - 按文件内容校验真实格式，错误页不入库
 - 下载卡片显示封面、进度、速度；完成后自动入库并缓存封面
-- 漫画单章 / 批量下载；书架可分享书籍原文件
+- 漫画单章 / 批量下载；当前阅读页优先加载，预览图可先显示、高清图随后替换，并有失败重试
+- 书架可分享书籍原文件；删除书籍会按资源身份清理关联数据和文件
 
 ### 漫画翻译
 
@@ -117,13 +118,12 @@ Android 端小说 / 漫画阅读器，内置多书源在线聚合搜索与下载
 ### 界面与交互
 
 - 统一排版与动效：字号层级、过渡曲线、按压反馈全局一致
-- 触觉反馈分级（轻 / 中 / 重 / 成功等），可在设置中关闭
+- 触觉反馈分级（轻 / 中 / 重 / 等），可在设置中关闭
 - 玻璃卡片按压缩放、随滚动轻微摆动，可调卡片与玻璃参数
-- 玻璃画质三档可调，可按机型性能选择
+- 玻璃画质四档可调，可按机型性能选择
 - 底部安全区、字体缩放、平板断点统一适配，不同机型显示一致
 - 列表与图片加载补齐动画与稳定 key，减少跳位
 - 输入法弹出 / 收起不挤压页面内容，搜索与滚动保持跟手
-- 尊重系统「减少动态效果」与「降低透明度」，自动简化动画与玻璃
 - 吉祥物 Roxy：按场景切换姿态与微动效
 
 ### 个性化
@@ -137,36 +137,36 @@ Android 端小说 / 漫画阅读器，内置多书源在线聚合搜索与下载
 
 ## 截图
 
-| 书架主页                                | 书库 · 选择书源                             |
-| ----------------------------------- | ------------------------------------- |
-| ![书架主页](docs/screenshots/shot1.jpg) | ![书库书源选择](docs/screenshots/shot2.jpg) |
+README 展示使用 `promo/` 中的新品牌封面与实机界面素材。
 
-| 书源管理                                | 阅读统计                                | 设置页                                |
-| ----------------------------------- | ----------------------------------- | ---------------------------------- |
-| ![书源管理](docs/screenshots/shot3.jpg) | ![阅读统计](docs/screenshots/shot4.jpg) | ![设置页](docs/screenshots/shot5.jpg) |
+| 新手引导 | 阅读书签 | 小说排版 |
+| --- | --- | --- |
+| <img src="./promo/captures/real-device/roxy-onboarding.png" width="230" alt="Roxy 新手引导界面"/> | <img src="./promo/experience/assets/native-bookmark.webp" width="230" alt="阅读书签提示"/> | <img src="./promo/experience/assets/native-novel-layout.webp" width="230" alt="小说排版设置"/> |
 
 ***
 
 ## 安装
 
-**直接安装**：前往 [Releases](https://github.com/a1553846342-dotcom/EASYREADER/releases) 下载 APK（arm64-v8a），允许「安装未知来源应用」后安装。
+**直接安装**：前往 [Releases](https://github.com/a1553846342-dotcom/Ciallo-Reader/releases) 下载 APK（arm64-v8a），允许「安装未知来源应用」后安装。
 
 **源码编译**：需要 JDK 17+ 与 Android SDK（compileSdk 35），网络可访问 Google Maven。
 
 ```bash
-git clone https://github.com/a1553846342-dotcom/EASYREADER.git
-cd EASYREADER
+git clone https://github.com/a1553846342-dotcom/Ciallo-Reader.git
+cd Ciallo-Reader
 echo "sdk.dir=/你的/Android/Sdk/路径" > local.properties
 ./gradlew :app:assembleRelease
 ```
 
-输出在 `app/build/outputs/apk/release/app-release.apk`。未配置签名环境变量时自动使用调试签名，clone 后可直接构建。
+1.2.0 Release APK 可从 [GitHub Release](https://github.com/a1553846342-dotcom/Ciallo-Reader/releases/download/v1.2.0/Ciallo-Reader-v1.2.0.apk) 下载；Gradle 原始输出在 `app/build/outputs/apk/release/app-release.apk`。本次构建环境未配置发布 keystore，因此 APK 使用仓库调试证书签名；它只能覆盖同一调试证书签名的安装，正式分发请配置发布签名后重新构建。
 
 ***
 
 ## 使用说明
 
 **添加书源**：底部 Tab「书库」顶部切换书源；更多漫画源在设置 → 书源管理 →「更新 Venera 源」；自定义规则走导入入口（支持 Legado JSON 格式）。
+
+**开启成人漫画源**：进入「设置」标签页，找到「高级内容」，打开「带你登大郎~~~」。等待 Venera 源列表更新后，返回「书库」，在漫画书源选择器中选择对应来源。关闭该开关会隐藏成人源。
 
 **导入本地书**：书架页「+ 导入新书」，支持 TXT / EPUB / MOBI / AZW3 / CBZ。
 
@@ -276,6 +276,8 @@ Release 包只含 arm64 库，x86_64 模拟器转译运行会崩溃；Debug 包�
 
 | 版本    | 日期         | 主要内容                              |
 | ----- | ---------- | --------------------------------- |
+| 1.2.0 | 2026-10-03 | 多源搜索与漫画阅读体验升级；小说插图、书签神回、缓存清理及适配优化 |
+| 1.1.5 | 2026-10-02 | 聚合漫画搜索 8 路并发、原词优先；已有结果立即展示，后台补齐别名 |
 | 1.1.0 | 2026-09-24 | 书源管理页重排版；搜索与键盘交互优化；修复输入法挤压内容与滚动卡顿 |
 | 1.0.7 | 2026-09-21 | 前端与交互整改：跨机型适配、日历与统计修复、动效补齐、APK 瘦身 |
 | 1.0.6 | 2026-09-08 | 串珠快速翻页；漫画加载与书源修复                  |

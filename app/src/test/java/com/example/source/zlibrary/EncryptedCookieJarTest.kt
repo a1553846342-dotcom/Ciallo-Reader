@@ -16,7 +16,7 @@ class EncryptedCookieJarTest {
     @Test
     fun testSaveAndReloadAfterAppRestart() {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
-        val storage = ZLibraryCredentialStorage(context)
+        val storage = ZLibraryCredentialStorage(context.getSharedPreferences("credential-test", android.content.Context.MODE_PRIVATE))
         storage.clear()
 
         val cookieJar1 = EncryptedCookieJar(storage)
@@ -38,7 +38,7 @@ class EncryptedCookieJarTest {
     @Test
     fun testDomainIsolationDoesNotLeakCookies() {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
-        val storage = ZLibraryCredentialStorage(context)
+        val storage = ZLibraryCredentialStorage(context.getSharedPreferences("credential-test", android.content.Context.MODE_PRIVATE))
         storage.clear()
 
         val cookieJar = EncryptedCookieJar(storage)
@@ -58,7 +58,7 @@ class EncryptedCookieJarTest {
     @Test
     fun testDomainSwitchingIsolation() {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
-        val storage = ZLibraryCredentialStorage(context)
+        val storage = ZLibraryCredentialStorage(context.getSharedPreferences("credential-test", android.content.Context.MODE_PRIVATE))
         storage.clear()
 
         val cookieJar = EncryptedCookieJar(storage)

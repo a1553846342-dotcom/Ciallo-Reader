@@ -1,10 +1,50 @@
 package com.example.source.js
 
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotNull
+import org.junit.Assert.*
 import org.junit.Test
 
 class JsHtmlStoreTest {
+    @Test fun disposingADocumentAlsoReleasesElementsAndChildNodes() {
+        val store = JsHtmlStore()
+        store.parse(0, "<p>old<span>child</span></p>")
+        val element = store.querySelector(0, "p")!!
+        val children = store.getNodes(element)
+        assertEquals("oldchild", store.getText(element))
+        assertEquals("element", store.nodeType(children.last()))
+        assertNotNull(store.nodeToElement(children.last()))
+        store.dispose(0)
+        assertEquals("", store.getText(element))
+        children.forEach { assertEquals("unknown", store.nodeType(it)) }
+    }
+
+    @Test fun countBoundEvictsTheOldDocumentAndItsHandles() {
+        val store = JsHtmlStore()
+        store.parse(0, "<p>old</p>")
+        val old = store.querySelector(0, "p")!!
+        (1..8).forEach { store.parse(it, "<p>new$it</p>") }
+        assertNull(store.querySelector(0, "p"))
+        assertEquals("", store.getText(old))
+        assertEquals("new8", store.getText(store.querySelector(8, "p")!!))
+    }
+
+    @Test fun frequentlyUsedDocumentsSurviveCountEviction() {
+        val store = JsHtmlStore()
+        (0..7).forEach { store.parse(it, "<p>$it</p>") }
+        store.querySelector(0, "p")
+        store.parse(8, "<p>8</p>")
+        assertNotNull(store.querySelector(0, "p"))
+        assertNull(store.querySelector(1, "p"))
+    }
+
+    @Test fun sizeBudgetBoundsRetainedPagesBeforeTheCountLimit() {
+        val store = JsHtmlStore()
+        repeat(6) { store.parse(it, "<p>" + "x".repeat(600_000) + "</p>") }
+        assertNull(store.querySelector(0, "p"))
+        assertNotNull(store.querySelector(5, "p"))
+        val retained = (0..5).count { store.querySelector(it, "p") != null }
+        assertTrue("Retained $retained oversized documents", retained <= 3)
+    }
+
 
     @Test
     fun scriptElementTextReturnsData() {

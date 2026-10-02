@@ -46,7 +46,8 @@ import com.example.ui.theme.MintPrimary
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.net.URLEncoder
+import java.net.URLEncoder
+import com.example.ui.components.AppToast
 
 /**
  * Z-Library 节点管理窗口：
@@ -185,7 +186,7 @@ fun ZLibraryNodeManagementScreen(
     fun selectNode(node: String) {
         ZLibraryNodeManager.selectNode(context, node)
         selectedNode = node
-        Toast.makeText(context, "已切换到 $node", Toast.LENGTH_SHORT).show()
+        AppToast.makeText(context, "已切换到 $node", Toast.LENGTH_SHORT).show()
     }
 
     val defaultNode = ZLibraryNodeManager.DEFAULT_NODE
@@ -259,7 +260,7 @@ fun ZLibraryNodeManagementScreen(
                                                 foundNodes = nodes
                                                 showReplaceDialog = true
                                             } else {
-                                                Toast.makeText(context, "扒取失败，请检查网络后重试", Toast.LENGTH_LONG).show()
+                                                AppToast.makeText(context, "扒取失败，请检查网络后重试", Toast.LENGTH_LONG).show()
                                             }
                                         }
                                     },
@@ -364,9 +365,9 @@ fun ZLibraryNodeManagementScreen(
                                 if (ZLibraryNodeManager.addCustomNode(context, customInput)) {
                                     customNodes = ZLibraryNodeManager.getCustomNodes(context)
                                     customInput = ""
-                                    Toast.makeText(context, "已添加自定义节点", Toast.LENGTH_SHORT).show()
+                                    AppToast.makeText(context, "已添加自定义节点", Toast.LENGTH_SHORT).show()
                                 } else {
-                                    Toast.makeText(context, "请输入有效的域名", Toast.LENGTH_SHORT).show()
+                                    AppToast.makeText(context, "请输入有效的域名", Toast.LENGTH_SHORT).show()
                                 }
                             },
                             variant = AppButtonVariant.Secondary,
@@ -399,7 +400,7 @@ fun ZLibraryNodeManagementScreen(
                             ZLibraryNodeManager.saveScrapedNodes(context, foundNodes)
                             scrapedNodes = ZLibraryNodeManager.getScrapedNodes(context)
                             showReplaceDialog = false
-                            Toast.makeText(context, "已合并节点", Toast.LENGTH_SHORT).show()
+                            AppToast.makeText(context, "已合并节点", Toast.LENGTH_SHORT).show()
                         },
                         variant = AppButtonVariant.Primary,
                         buttonSize = AppButtonSize.Small

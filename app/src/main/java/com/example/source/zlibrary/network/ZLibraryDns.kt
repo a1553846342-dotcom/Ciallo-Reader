@@ -25,8 +25,8 @@ class ZLibraryDns : Dns {
         private const val TAG = "ZLibDns"
         val INSTANCE = ZLibraryDns()
         private const val CACHE_TTL_MS = 5 * 60 * 1000L // 5 minutes (DoH results only)
-        private const val FAIL_CACHE_TTL_MS = 30 * 1000L // 30s negative cache
-        private const val KNOWN_GOOD_TTL_MS = 24 * 60 * 60 * 1000L // remember verified IPs for 24h
+        private const val FAIL_CACHE_TTL_MS = 5 * 1000L // Short negative cache avoids amplifying transient failures
+        private const val KNOWN_GOOD_TTL_MS = 5 * 60 * 1000L // remember verified IPs for 24h
 
         /**
          * IP ranges that are never valid for Z-Library nodes. GFW / DNS-hijacking routers
@@ -47,29 +47,10 @@ class ZLibraryDns : Dns {
             0xC6120000.toInt() to 15,  // 198.18.0.0/15
             0xE0000000.toInt() to 4,   // 224.0.0.0/4
             0xF0000000.toInt() to 4,   // 240.0.0.0/4
-            // Meta / Facebook ranges (common GFW poisoning targets)
-            0x1F0D1800.toInt() to 21,  // 31.13.24.0/21
-            0x1F0D4000.toInt() to 18,  // 31.13.64.0/18
-            0x2D402800.toInt() to 22,  // 45.64.40.0/22
-            0x42DC9000.toInt() to 20,  // 66.220.144.0/20
-            0x453FB000.toInt() to 20,  // 69.63.176.0/20
-            0x45ABE000.toInt() to 19,  // 69.171.224.0/19
-            0x4A774C00.toInt() to 22,  // 74.119.76.0/22
-            0x66846000.toInt() to 20,  // 102.132.96.0/20
-            0x67046000.toInt() to 22,  // 103.4.96.0/22
-            0x81860000.toInt() to 17,  // 129.134.0.0/17
-            0x9DF00000.toInt() to 16,  // 157.240.0.0/16
-            0xADFC4000.toInt() to 19,  // 173.252.64.0/19
-            0xB33CC000.toInt() to 22,  // 179.60.192.0/22
-            0xB93CD800.toInt() to 22,  // 185.60.216.0/22
-            0xB92D0400.toInt() to 22,  // 185.45.4.0/22
-            0xB92D3800.toInt() to 22,  // 185.45.56.0/22
-            0xCC0F1400.toInt() to 22,  // 204.15.20.0/22
-            0x68F42A00.toInt() to 21,  // 104.244.42.0/21
         )
 
         private fun isSuspicious(ip: InetAddress): Boolean {
-            if (ip !is Inet4Address) return true
+            if (ip !is Inet4Address) return false
             val raw = ip.address ?: return true
             val value = ((raw[0].toInt() and 0xFF) shl 24) or
                 ((raw[1].toInt() and 0xFF) shl 16) or
@@ -98,9 +79,26 @@ class ZLibraryDns : Dns {
     }
 
     private val dohClient: OkHttpClient by lazy {
-        OkHttpClient.Builder()
+        com.example.source.SharedHttpTransport.builder()
             .dns(object : Dns {
-                override fun lookup(hostname: String): List<InetAddress> {
+                @Volatile private var watchingNetwork = false
+    fun watchNetwork(context: android.content.Context) {
+        if (watchingNetwork) return
+        synchronized(this) {
+            if (watchingNetwork) return
+            val manager = context.applicationContext.getSystemService(android.net.ConnectivityManager::class.java)
+            runCatching {
+                manager.registerDefaultNetworkCallback(object : android.net.ConnectivityManager.NetworkCallback() {
+                    override fun onAvailable(network: android.net.Network) { clearCaches() }
+                    override fun onLost(network: android.net.Network) { clearCaches() }
+                })
+                watchingNetwork = true
+            }
+        }
+    }
+    fun clearCaches() { cache.clear(); failCache.clear(); knownGoodCache.clear() }
+    override fun lookup(hostname: String): List<InetAddress> {
+        if (cache.size + failCache.size > 512 || knownGoodCache.size > 256) clearCaches()
                     return when (hostname) {
                         "dns.alidns.com" -> listOf(InetAddress.getByAddress("dns.alidns.com", byteArrayOf(223.toByte(), 5.toByte(), 5.toByte(), 5.toByte())))
                         "doh.pub" -> listOf(InetAddress.getByAddress("doh.pub", byteArrayOf(1.toByte(), 12.toByte(), 12.toByte(), 12.toByte())))
@@ -116,7 +114,24 @@ class ZLibraryDns : Dns {
             .build()
     }
 
+    @Volatile private var watchingNetwork = false
+    fun watchNetwork(context: android.content.Context) {
+        if (watchingNetwork) return
+        synchronized(this) {
+            if (watchingNetwork) return
+            val manager = context.applicationContext.getSystemService(android.net.ConnectivityManager::class.java)
+            runCatching {
+                manager.registerDefaultNetworkCallback(object : android.net.ConnectivityManager.NetworkCallback() {
+                    override fun onAvailable(network: android.net.Network) { clearCaches() }
+                    override fun onLost(network: android.net.Network) { clearCaches() }
+                })
+                watchingNetwork = true
+            }
+        }
+    }
+    fun clearCaches() { cache.clear(); failCache.clear(); knownGoodCache.clear() }
     override fun lookup(hostname: String): List<InetAddress> {
+        if (cache.size + failCache.size > 512 || knownGoodCache.size > 256) clearCaches()
         // Check positive cache (DoH results only)
         val cached = cache[hostname]
         if (cached != null && (System.currentTimeMillis() - cached.second < CACHE_TTL_MS)) {
@@ -133,14 +148,13 @@ class ZLibraryDns : Dns {
 
         // 1. System DNS is only a HINT: poisoned resolvers return fake (but valid-looking)
         //    IPs for blocked domains, so its answers join the candidate pool instead of
-        //    being trusted directly. IPv6 is dropped (OkHttp connects serially and would
-        //    stall on an unroutable IPv6 address; browsers use Happy Eyeballs).
+        //    being trusted directly. Preserve system IPv6 candidates for IPv6-only networks;
+        //    reachability ordering below still avoids prioritizing an unusable address.
         //    The lookup itself is time-bounded: poisoned resolvers can hang for 10-30s.
         val candidates = LinkedHashSet<InetAddress>()
         val systemDnsFuture = CompletableFuture.supplyAsync({
             try {
                 Dns.SYSTEM.lookup(hostname)
-                    .filterIsInstance<Inet4Address>()
                     .filterNot { isSuspicious(it) }
             } catch (e: Exception) {
                 Log.w(TAG, "System DNS lookup failed for $hostname: ${e.message}")

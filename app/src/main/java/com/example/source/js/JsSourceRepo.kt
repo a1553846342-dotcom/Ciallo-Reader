@@ -23,8 +23,10 @@ import java.util.concurrent.TimeUnit
  */
 object JsSourceRepo {
 
-    /** 本地补丁版本：升级后强制重新下载全部源脚本，避免缓存到旧补丁/坏脚本。 */
-    private const val PATCH_VERSION = 26
+    /** 本地补丁版本：升级后尝试更新源脚本，失败时仍可使用旧缓存。 */
+    private const val PATCH_VERSION = 39
+    // Raw cache format stays stable when compatibility patches change.
+    private const val RAW_CACHE_PREFIX = "// EASYREADER_RAW_SOURCE_V28\n"
 
     /** 已知成人源 key 黑名单（默认隐藏，设置彩蛋开启后可见）。 */
     val ADULT_KEYS = setOf(
@@ -32,23 +34,64 @@ object JsSourceRepo {
         "mh18", "hcomic", "hot_manga"
     )
 
-    /** 需要账号登录才能搜索/阅读的源。 */
-    val LOGIN_KEYS = setOf("picacg")
+    /** 需要账号的源（picacg 账密、爱看漫匿名可搜但部分功能需登录、vomic 免费注册后可读）。
+     *  mycomic 无账号系统：Cloudflare 盾由 CfWebViewSolver 在网络层自动过，不算登录。 */
+    val LOGIN_KEYS = setOf("picacg", "ikmmh", "vomic")
 
     /** 与 App 内置源重复、同 key 多账号、或需要用户自建服务器的源。 */
     private val EXCLUDED_KEYS = setOf(
         "manga_dex", "lanraragi", "komga", "kavita",
         "baozi", "jcomic",
         // 当前网络/站点确认不可用：同步仓库时默认排除
+        // （ccc 曾短期解除排除，2026-09-26 按用户"移除会员门槛源"要求重新排除：
+        //   其付费章节需账号购买，免费章之外不可读）
         "zaimanhua", "ManHuaGui", "ykmh", "happy", "Komiic",
-        "shonen_jump_plus", "mh1234", "ccc", "comic_walker"
-        , "mh18"
+        "shonen_jump_plus", "mh1234", "comic_walker",
+        "ccc", "mh18"
+        // 2026-10-02 repeated search/read audit: unstable WAF exit blocking.
+        // Keep the cached script for repair, but remove it from the offered list.
+        , "ikmmh"
     )
 
     /** 证书不完整/自签名，需要忽略 TLS 校验的源。 */
     private val INSECURE_KEYS = setOf("baozi")
 
-    private val client = OkHttpClient.Builder()
+    /**
+     * 本地内置源：不在远端仓库索引里，随 App 资产分发（assets/js_extra/）。
+     * 嗶哩/vomic 参考 Keiyoushi；扑飞按本站公开目录及阅读器数据格式适配。
+     * （tencent/kuaikan 已按用户要求下架：官方平台付费墙锁内容，归档于
+     *   %LOCALAPPDATA%/Temp/mp/archive_sources/，可随时恢复）
+     */
+    private val LOCAL_EXTRA_SOURCES = listOf(
+        Triple("bilimanga", "嗶哩漫畫", "bilimanga.js"),
+        Triple("vomic", "vomic漫画", "vomic.js"),
+        Triple("pufei", "扑飞漫画", "pufei.js"),
+    )
+
+    /** 从 assets 读取本地内置源并包装成 JsComicSource（不受远端仓库可用性影响）。 */
+    private fun loadLocalExtras(context: Context): List<JsComicSource> {
+        return LOCAL_EXTRA_SOURCES.mapNotNull { (key, name, fileName) ->
+            runCatching {
+                val body = context.assets.open("js_extra/$fileName").bufferedReader().readText()
+                if (!validScript(body)) {
+                    Log.w("JsRepo", "invalid local extra script: $fileName")
+                    return@mapNotNull null
+                }
+                JsComicSource(
+                    context = context,
+                    sourceKey = key,
+                    name = name,
+                    version = Regex("""\bversion\s*=\s*["']([^"']+)["']""")
+                        .find(body)?.groupValues?.get(1) ?: "1.0.0",
+                    script = patchScript(key, body),
+                    insecureTls = key in INSECURE_KEYS,
+                    loginRequired = key in LOGIN_KEYS
+                )
+            }.onFailure { Log.w("JsRepo", "load local extra failed: $fileName", it) }.getOrNull()
+        }
+    }
+
+    private val baseClient = com.example.source.SharedHttpTransport.builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(25, TimeUnit.SECONDS)
         .followRedirects(true)
@@ -78,42 +121,62 @@ object JsSourceRepo {
     /** 从本地缓存加载已安装的 JS 源（尊重成人源开关）。 */
     suspend fun loadCached(context: Context, includeAdult: Boolean): List<JsComicSource> =
         withContext(Dispatchers.IO) {
-            val prefs = context.getSharedPreferences("js_source_meta", Context.MODE_PRIVATE)
-            if (prefs.getInt("patch_version", 0) != PATCH_VERSION) {
-                dir(context).deleteRecursively()
-                // 清理旧补丁写入的 e-hentai 测试 cookie（sl/ns），避免污染新脚本
-                context.getSharedPreferences("js_source_cookies", Context.MODE_PRIVATE)
-                    .edit()
-                    .remove("ck_e-hentai.org")
-                    .remove("ck_exhentai.org")
-                    .apply()
-                return@withContext emptyList()
-            }
             val index = indexFile(context)
-            if (!index.exists()) return@withContext emptyList()
+            if (!index.exists()) return@withContext loadLocalExtras(context)
             try {
                 val metas = parseIndex(index.readText())
                     .filter { includeAdult || !it.adult }
                 val loaded = metas.mapNotNull { meta ->
                     val file = File(dir(context), meta.fileName)
-                    if (!file.exists()) return@mapNotNull null
+                    if (!file.exists() || file.length()>512*1024) return@mapNotNull null
+                    val body = file.readText()
+                    if (!validScript(body)) {
+                        Log.w("JsRepo", "invalid cached script: ${meta.fileName}")
+                        return@mapNotNull null
+                    }
                     JsComicSource(
                         context = context,
                         sourceKey = meta.key,
                         name = meta.name,
                         version = meta.version,
-                        script = patchScript(meta.key, file.readText()),
+                        // 旧版缓存已存放补丁后的脚本；新版有标记，才在内存里补丁。
+                        script = if (body.startsWith(RAW_CACHE_PREFIX)) {
+                            patchScript(meta.key, body.removePrefix(RAW_CACHE_PREFIX))
+                        } else if (meta.key in setOf("wnacg", "mxs")) {
+                            // These repairs are idempotent and also migrate pre-raw-cache scripts.
+                            patchScript(meta.key, body)
+                        } else body,
                         insecureTls = meta.insecure,
                         loginRequired = meta.key in LOGIN_KEYS
                     )
                 }
-                // 自愈：索引里有但脚本文件缺失（例如上次补丁失败）时返回空，
-                // 让调用方走 install 重新拉取，避免源悄悄消失
-                if (loaded.size != metas.size) emptyList() else loaded
+                // 本地内置源不受成人开关影响；即便远端缓存为空也始终可用
+                loaded + loadLocalExtras(context)
             } catch (e: Exception) {
-                emptyList()
+                loadLocalExtras(context)
             }
         }
+
+    /** 缓存中有脚本缺失或无效时，下次启动补拉，同时继续提供已加载的源。 */
+    fun needsRepair(context: Context, includeAdult: Boolean): Boolean = runCatching {
+        if (context.getSharedPreferences("js_source_meta", Context.MODE_PRIVATE)
+                .getInt("patch_version", 0) != PATCH_VERSION
+        ) return@runCatching true
+        val index = indexFile(context)
+        if (!index.exists()) return@runCatching true
+        parseIndex(index.readText())
+            .filter { includeAdult || !it.adult }
+            .any { meta ->
+                val file = File(dir(context), meta.fileName)
+                if (!file.exists()) true else {
+                    val body = file.readText()
+                    !validScript(body) || !body.startsWith(RAW_CACHE_PREFIX)
+                }
+            }
+    }.getOrDefault(true)
+
+    private fun validScript(body: String): Boolean =
+        body.length >= 1024 && !body.trimStart().startsWith("<")
 
     /**
      * 书源健康检查：并行搜索一个通用关键词，
@@ -161,7 +224,7 @@ object JsSourceRepo {
     ): List<JsComicSource> = withContext(Dispatchers.IO) {
         try {
             onStatus("正在获取源仓库列表…")
-            val indexEntry = fetchIndex(repoUrl)
+            val indexEntry = fetchIndex(context, repoUrl)
             if (indexEntry == null) {
                 Log.w("JsRepo", "fetch index failed: $repoUrl")
                 return@withContext emptyList()
@@ -176,10 +239,14 @@ object JsSourceRepo {
                     async(Dispatchers.IO) {
                         semaphore.withPermit {
                             try {
-                                val script = fetchScript(baseUrl, meta.fileName)
-                                if (script != null) {
+                                val script = fetchScript(context, baseUrl, meta.fileName)
+                                if (script != null && script.length<=512*1024) {
                                     val patched = patchScript(meta.key, script)
-                                    File(dir(context), meta.fileName).writeText(patched)
+                                    // 缓存原始脚本；loadCached 会在内存中补丁一次，避免重启后二次改写。
+                                    val atomic=android.util.AtomicFile(File(dir(context),meta.fileName))
+                                    val out=atomic.startWrite()
+                                    try { out.write((RAW_CACHE_PREFIX+script).toByteArray()); atomic.finishWrite(out) }
+                                    catch(e:Exception) { atomic.failWrite(out); throw e }
                                     meta to patched
                                 } else null
                             } catch (e: Exception) {
@@ -208,19 +275,19 @@ object JsSourceRepo {
                     insecureTls = meta.insecure,
                     loginRequired = meta.key in LOGIN_KEYS
                 )
-            }
+            } + loadLocalExtras(context)
         } catch (e: Exception) {
             Log.w("JsRepo", "install failed", e)
-            emptyList()
+            loadLocalExtras(context)
         }
     }
 
     /** 依次尝试配置仓库与镜像，返回（成功 URL，index 内容）。 */
-    private fun fetchIndex(repoUrl: String): Pair<String, String>? {
+    private fun fetchIndex(context: Context, repoUrl: String): Pair<String, String>? {
         val candidates = listOf(repoUrl) + INDEX_MIRRORS
         for (url in candidates) {
-            val body = fetch(url)
-            if (body != null) {
+            val body = fetch(context, url)
+            if (body != null && runCatching { JSONArray(body) }.isSuccess) {
                 Log.i("JsRepo", "index fetched from: $url")
                 return url to body
             }
@@ -230,25 +297,28 @@ object JsSourceRepo {
     }
 
     /** 脚本优先从 index 成功的那条链路下载，失败时再试其它镜像的对应路径。 */
-    private fun fetchScript(baseUrl: String, fileName: String): String? {
+    private fun fetchScript(context: Context, baseUrl: String, fileName: String): String? {
         val candidates = listOf("$baseUrl/$fileName") + INDEX_MIRRORS.map {
             "${it.substringBeforeLast('/', it)}/$fileName"
         }
         for (url in candidates) {
-            val body = fetch(url)
-            if (body != null) return body
+            val body = fetch(context, url)
+            if (body != null && validScript(body)) return body
         }
         return null
     }
 
     private fun parseIndex(json: String): List<SourceMeta> {
+        com.example.source.parser.RuleBudget.json(json)
         val arr = JSONArray(json)
+        require(arr.length()<=500) { "书源仓库条目过多" }
         val seen = HashSet<String>()
         return (0 until arr.length()).mapNotNull { i ->
             val obj = arr.optJSONObject(i) ?: return@mapNotNull null
             val key = obj.optString("key")
             val fileName = obj.optString("fileName")
             if (key.isBlank() || fileName.isBlank() || key in EXCLUDED_KEYS) return@mapNotNull null
+            if(fileName.contains("/") || fileName.contains("\\") || fileName.contains("..") || !fileName.endsWith(".js")) return@mapNotNull null
             if (!seen.add(key)) return@mapNotNull null
             SourceMeta(
                 key = key,
@@ -261,11 +331,89 @@ object JsSourceRepo {
         }
     }
 
+    private fun patchWnacgSearch(script: String): String {
+        val searchStart = script.indexOf("search = {")
+        val searchEnd = script.indexOf("    // favorite related", searchStart.coerceAtLeast(0))
+        if (searchStart < 0 || searchEnd <= searchStart) return script
+        return script.replaceRange(searchStart, searchEnd, """
+            search = {
+                load: async (keyword, options, page) => {
+                    const url = this.baseUrl + '/search/?q=' + encodeURIComponent(keyword)
+                        + '&f=_all&s=create_time_DESC&syn=yes&p=' + Math.max(1, Number(page) || 1);
+                    const res = await Network.get(url, {});
+                    if (res.status !== 200) throw 'Invalid Status Code ' + res.status;
+                    const document = new HtmlDocument(res.body);
+                    try {
+                        const container = document.querySelector('div.gallary_wrap > ul.cc, #classify_container, ul.imgBox');
+                        if (!container) throw '搜索页面未返回漫画列表，请稍后重试';
+                        const comics = [];
+                        const seen = new Set();
+                        for (const item of container.children) {
+                            const link = item.querySelector('a[href*="photos-index-aid-"]');
+                            const match = (link?.attributes?.href || '').match(/photos-index-aid-(\d+)/);
+                            const img = link?.querySelector('img');
+                            const titleEl = item.querySelector('div.info > div.title > a, a.ImgA span');
+                            const title = (titleEl?.text || link?.attributes?.title || link?.text || '').trim();
+                            if (!match || !title || seen.has(match[1])) continue;
+                            let cover = String(img?.attributes?.['data-original'] || img?.attributes?.['data-src'] || img?.attributes?.src || '').trim();
+                            if (cover.startsWith('//')) cover = 'https://' + cover.replace(/^\/+/, '');
+                            else if (cover.startsWith('/')) cover = this.baseUrl + cover;
+                            const info = item.querySelector('div.info_col, span.info');
+                            comics.push(new Comic({id:match[1],title:title,cover:cover,description:info?.text?.trim() || ''}));
+                            seen.add(match[1]);
+                        }
+                        const total = Number((document.querySelector('p.result > b')?.text || '').replace(/,/g, ''));
+                        let pages = total > 0 ? Math.ceil(total / 24) : 1;
+                        for (const a of document.querySelectorAll('.paginator a[href]')) {
+                            const match = (a.attributes.href || '').match(/[?&]p=(\d+)/);
+                            if (match) pages = Math.max(pages, Number(match[1]));
+                        }
+                        return {comics:comics,maxPage:pages};
+                    } finally { document.dispose(); }
+                }
+            }
+
+        """.trimIndent() + "\n\n")
+    }
+
+    private fun patchMxsReader(script: String): String = script.replace(
+        Regex("""loadEp:\s*async\s*\(comicId, epId\)\s*=>\s*\{[\s\S]*?(?=// 加载评论列表)""")
+    ) {
+        """
+        loadEp: async (comicId, epId) => {
+            const url = this.baseUrl + '/chapter/' + epId;
+            const doc = await this.fetchDocument(url);
+            try {
+                const images = [];
+                for (const img of doc.querySelectorAll('img.lazy, .comicpage img, #manga-reader img')) {
+                    const attrs = img.attributes || {};
+                    let value = String(attrs['data-original'] || attrs['data-src'] || attrs['data-lazy-src'] || attrs.src || '').trim();
+                    if (!value || /^(data:|javascript:)/i.test(value)) continue;
+                    if (value.startsWith('//')) value = 'https://' + value.replace(/^\/+/, '');
+                    else if (!/^https?:\/\//i.test(value)) value = this.baseUrl + (value.startsWith('/') ? '' : '/') + value;
+                    images.push(value);
+                }
+                if (!images.length) throw '本章中未找到图片';
+                return {images:images};
+            } finally { doc.dispose(); }
+        },
+        onImageLoad: (url, comicId, epId) => ({
+            headers: {
+                'Referer': this.baseUrl + '/chapter/' + epId,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+        }),
+
+        """.trimIndent() + "\n\n        "
+    }
+
     /**
      * 针对远端脚本的本地兼容补丁（站点改版后脚本选择器失效，等上游更新前先兜底）。
      * 仅做最小改动，不破坏源脚本其它逻辑。
      */
     private fun patchScript(key: String, script: String): String = when (key) {
+        // 漫蛙吧 API 域名迁移（mwuu.cc 301 → manwaxu.cc），2026-09-26 实测
+        "manwaba" -> script.replace("https://mwuu.cc", "https://manwaxu.cc")
         "ehentai" -> {
             var p = script.replace(
             Regex(
@@ -480,7 +628,8 @@ object JsSourceRepo {
             )
             p
         }
-        "wnacg" -> script.replace(
+        "wnacg" -> {
+            var patched = script.replace(
             Regex(
                 """let title = document\.querySelector\("div\.userwrap > h2"\)\.text\s*""" +
                     """let cover = document\.querySelector\("div\.userwrap > div\.asTB > div\.asTBcell\.uwthumb > img"\)\.attributes\["src"\]\s*""" +
@@ -506,9 +655,9 @@ object JsSourceRepo {
             let coverEl = document.querySelector("div#Cover > img") || document.querySelector("div.userwrap > div.asTB > div.asTBcell.uwthumb > img")
             let cover = coverEl ? (coverEl.attributes["src"] || "") : ""
             if (cover.startsWith("////")) {
-                cover = 'https:' + cover.substring(4)
+                cover = 'https://' + cover.substring(4)
             } else if (cover.startsWith("//")) {
-                cover = 'https:' + cover.substring(2)
+                cover = 'https://' + cover.substring(2)
             }
             let labels = document.querySelectorAll("div.asTBcell.uwconn > label")
             let pagesEl = document.querySelector("p.txtItme > span.date") || labels[1]
@@ -528,6 +677,30 @@ object JsSourceRepo {
             let uploader = uploaderEl ? uploaderEl.text : ""
             """.trimIndent()
         )
+            patched = patched.replace(
+                "return `https://${'$'}{domain0.trim()}`",
+                "return `https://${'$'}{domain0.trim() === 'wnacg.com' ? (Wnacg.domains[0] || 'www.wn001.cfd') : domain0.trim()}`"
+            ).let { body -> if (body.contains("!/^wnacg\\d+\\.link")) body else body.replace(
+                "!domain.includes(\"wn01.link\")",
+                // The publisher links to wnacg01/02.link before the actual comic sites.
+                // Publishing pages have no /search/ route and must not become baseUrl.
+                "!domain.includes(\"wn01.link\") && !/^wnacg\\d+\\.link${'$'}/i.test(domain)"
+            ) }.let { body -> if (body.contains("chapters: chapters,")) body else body.replace(
+                "            return new ComicDetails({\n                id: id,",
+                """            let chapters = new Map();
+            document.querySelectorAll('a[href*="/photos-slide-aid-"]').forEach((link) => {
+                let match = (link.attributes['href'] || '').match(/photos-slide-aid-(\d+)/);
+                if (match) chapters.set(match[1], link.text.trim() || `第${'$'}{chapters.size + 1}章`);
+            });
+            return new ComicDetails({
+                id: id,
+                chapters: chapters,"""
+            ) }.replace(
+                "`${'$'}{this.baseUrl}/photos-gallery-aid-${'$'}{comicId}.html`",
+                "`${'$'}{this.baseUrl}/photos-gallery-aid-${'$'}{epId || comicId}.html`"
+            )
+            patchWnacgSearch(patched)
+        }
         // hitomi：gg.js（图片子域映射）10 分钟内复用，避免每开一个章节都重新下载并 eval
         "hitomi" -> {
             var patched = script.replace(
@@ -561,6 +734,7 @@ object JsSourceRepo {
                 """return files.map((image) => url_from_url_from_hash(0, image, "webp"));"""
             )
         }
+        "mxs" -> patchMxsReader(script)
         // 漫画人：loadEp 直接把 epId 拼成相对路径，Cronet 无法请求；补成绝对 URL
         "manhuaren" -> script.replace(
             Regex("""let url = `\$\{epId\}/`;"""),
@@ -575,6 +749,46 @@ object JsSourceRepo {
             var patched = script.replace(
                 Regex("""let res = await Network\.get\(url\);"""),
                 """let res = await Network.get(url, Comick.getRandomHeaders());"""
+            )
+            // Large books have dozens of catalogue pages. Preserve the entire list and its
+            // order, but fetch later pages in bounded batches instead of a serial chain.
+            val catalogueStart = patched.indexOf("                while (page <= lastPage) {")
+            val catalogueEnd = if (catalogueStart >= 0)
+                patched.indexOf("                let result = new Map();", catalogueStart) else -1
+            if (catalogueEnd > catalogueStart) {
+                patched = patched.replaceRange(catalogueStart, catalogueEnd, """
+                const fetchCataloguePage = async (number) => {
+                    const url = `https://comick.art/api/comics/${'$'}{slug}/chapter-list?page=${'$'}{number}`;
+                    const response = await Network.get(url, Comick.getRandomHeaders());
+                    if (response.status !== 200) throw `Invalid status code: ${'$'}{response.status}`;
+                    return JSON.parse(response.body);
+                };
+                const firstPage = await fetchCataloguePage(1);
+                const firstItems = Array.isArray(firstPage.data) ? firstPage.data : [];
+                if (firstItems.length) {
+                    latestTimestamp = firstItems[0].updated_at || firstItems[0].publish_at || firstItems[0].created_at || null;
+                }
+                collectChapters(firstItems);
+                lastPage = Number(firstPage.pagination?.last_page || 1);
+                if (!Number.isInteger(lastPage) || lastPage < 1 || lastPage > 512) throw 'Invalid catalogue page count';
+                for (let start = 2; start <= lastPage; start += 4) {
+                    const requests = [];
+                    for (let number = start; number <= Math.min(start + 3, lastPage); number++) {
+                        requests.push(fetchCataloguePage(number));
+                    }
+                    const replies = await Promise.all(requests);
+                    for (const reply of replies) collectChapters(Array.isArray(reply.data) ? reply.data : []);
+                }
+
+                """.trimIndent().prependIndent("                ") + "\n")
+            }
+            patched = patched.replace(
+                """} catch (error) {
+                chapters = new Map();
+            }""",
+                """} catch (error) {
+                throw error;
+            }"""
             )
             patched = patched.replace(
                 Regex(
@@ -625,6 +839,34 @@ object JsSourceRepo {
                 });
                 """.trimIndent()
             )
+            val searchStart = patched.indexOf("    search = {")
+            val searchEnd = if (searchStart >= 0) patched.indexOf("    /// single comic related", searchStart) else -1
+            if (searchEnd >= 0) {
+                var searchBlock = patched.substring(searchStart, searchEnd)
+                val urlStart = searchBlock.indexOf("            let url = `https://comick.art/search?")
+                val urlEnd = if (urlStart >= 0) searchBlock.indexOf(';', urlStart) else -1
+                if (urlEnd >= 0) searchBlock = searchBlock.replaceRange(
+                    urlStart, urlEnd + 1,
+                    """
+            if (!this.__searchCursors) this.__searchCursors = {};
+            if (Number(page) === 1) this.__searchCursors[keyword] = {};
+            let cursor = this.__searchCursors[keyword]?.[Number(page)];
+            let url = cursor
+                ? `https://comick.art/search?q=${'$'}{encodeURIComponent(keyword)}&cursor=${'$'}{encodeURIComponent(cursor)}`
+                : `https://comick.art/search?q=${'$'}{encodeURIComponent(keyword)}&page=${'$'}{page}`;
+                    """.trimIndent()
+                )
+                searchBlock = searchBlock.replace(
+                    "let maxpage = mangaList.total/mangaList.per_page",
+                    """
+                    if (jsonData.next_cursor) {
+                        this.__searchCursors[keyword][Number(page) + 1] = jsonData.next_cursor;
+                    }
+                    let maxpage = jsonData.next_cursor ? Number(page) + 1 : Number(page);
+                    """.trimIndent()
+                )
+                patched = patched.replaceRange(searchStart, searchEnd, searchBlock)
+            }
             patched
         }
         // picacg：登录后补存账号，否则搜索时的 reLogin 报 Invalid account data
@@ -716,37 +958,144 @@ object JsSourceRepo {
                     }
                 }
             }
-            patched + """
-            ;(() => {
-                const S = CopyManga.prototype;
-                const wrapRetry = (obj, fnName) => {
-                    const orig = obj[fnName];
-                    if (typeof orig !== 'function') return;
-                    obj[fnName] = async function () {
-                        let lastErr;
-                        for (let attempt = 0; attempt < 3; attempt++) {
-                            try {
-                                return await orig.apply(this, arguments);
-                            } catch (e) {
-                                lastErr = e;
-                                if (attempt === 0) {
-                                    try { await this.refreshAppApi(); } catch (e2) {}
-                                }
-                                await new Promise(r => setTimeout(r, 600 * (attempt + 1)));
-                            }
-                        }
-                        throw lastErr;
-                    };
-                };
-                if (S.search) wrapRetry(S.search, 'load');
-                if (S.comic) wrapRetry(S.comic, 'loadInfo');
-            })();
+            patched
+        }
+        "jm" -> script.replace(
+            "this.convertData(await res.text(), domainSecret)",
+            "this.convertData((await res.text()).replace(/^\\uFEFF/, ''), domainSecret)"
+        )
+        "nhentai" -> script.replace(
+            "    getApiBaseHeaders() {\n        return {",
+            """
+    getApiBaseHeaders() {
+        const apiKey = this.getApiKey();
+        return {
+            ...(apiKey ? {Authorization: 'Key ' + apiKey} : {}),
             """.trimIndent()
+        )
+        "ikmmh" -> {
+            // Keiyoushi's current adapter uses the site's public app entry point.
+            // Migrate the former default without replacing a user-chosen mirror.
+            var patched = script.replace("\"https://www.ikmmh.com\"", "\"https://ymcdnyfqdapp.ikmmh.com\"")
+                .replace(
+                    "Ikm.baseUrl = String(baseUrl).trim().replace(/\\/+\u0024/, \"\");",
+                    "Ikm.baseUrl = String(baseUrl).trim().replace(/\\/+\u0024/, \"\");\n" +
+                        "    if (Ikm.baseUrl === 'https://www.ikmmh.com') Ikm.baseUrl = 'https://ymcdnyfqdapp.ikmmh.com';"
+                ).replace(
+                "`user=${'$'}{account}&pass=${'$'}{pwd}`",
+                "`user=${'$'}{encodeURIComponent(account)}&pass=${'$'}{encodeURIComponent(pwd)}`"
+            )
+            val searchStart = patched.indexOf("  search = {")
+            val searchEnd = if (searchStart >= 0) patched.indexOf("  // 收藏功能", searchStart) else -1
+            if (searchEnd >= 0 && patched.substring(searchStart, searchEnd).contains("li.comic-item")) {
+                val searchBlock = patched.substring(searchStart, searchEnd)
+                    .replace("        let res = await Network.get(",
+                        "        await validatorGet(Ikm.baseUrl + '/', Ikm.webHeaders);\n        let res = await Network.get(")
+                    .replace("err.message", "(err?.message || String(err))")
+                    .replace(
+                        "        let document = new HtmlDocument(res.body);",
+                        "        if (res.status !== 200) throw new Error('Invalid status code: ' + res.status);\n        let document = new HtmlDocument(res.body);"
+                    )
+                    .replace("li.comic-item", "li.comic-item, div.classification")
+                    .replace(
+                        "e.querySelector(\"p.title\").text.split(\"~\")[0]",
+                        "(e.querySelector(\"p.title\")?.text || e.querySelector(\"h2 a\")?.text || \"\").split(\"~\")[0]"
+                    )
+                    .replace(
+                        "e.querySelector(\"img\").attributes[\"src\"]",
+                        "e.querySelector(\"img\")?.attributes[\"data-src\"] || e.querySelector(\"img\")?.attributes[\"src\"] || \"\""
+                    )
+                    .replace(
+                        "e.querySelector(\"span.chapter\").text",
+                        "e.querySelector(\"span.chapter\")?.text || e.querySelector(\"p.describe a\")?.text || \"\""
+                    )
+                    .replace(
+                        "`${'$'}{Ikm.baseUrl}${'$'}{e.querySelector(\"a\").attributes[\"href\"]}`",
+                        "absoluteUrl(e.querySelector(\"a\")?.attributes[\"href\"] || \"\")"
+                    )
+                patched = patched.replaceRange(searchStart, searchEnd, searchBlock)
+            }
+            val detailStart = patched.indexOf("      let title = document.querySelector(\n        \"div.book-hero__detail > div.title\"")
+            val detailEndMarker = "        isFavorite: isFavorite,\n      };"
+            val detailEnd = if (detailStart >= 0) patched.indexOf(detailEndMarker, detailStart) else -1
+            if (detailEnd >= 0) {
+                patched = patched.replaceRange(
+                    detailStart,
+                    detailEnd + detailEndMarker.length,
+                    """
+      const titleMeta = document.querySelector("meta[property='og:title']");
+      const coverMeta = document.querySelector("meta[property='og:image']");
+      const descriptionMeta = document.querySelector("meta[name='description']");
+      let title = titleMeta?.attributes["content"] || id;
+      return {
+        title: title.split("~")[0],
+        cover: coverMeta?.attributes["content"] || "",
+        description: descriptionMeta?.attributes["content"] || "",
+        tags: {},
+        chapters: eps,
+        recommend: [],
+        isFavorite: isFavorite,
+      };
+                    """.trimIndent()
+                )
+            }
+            patched = patched.replace("    loadEp: async (comicId, epId) => {", """
+    loadEp: async (comicId, epId) => {
+      if (Ikm.baseUrl === 'https://ymcdnyfqdapp.ikmmh.com') {
+        const ids = String(epId).match(/\/chapter\/(\d+)\/(\d+)/);
+        if (!ids) throw new Error('章节地址无效');
+        // The current public app endpoint serves complete batches through read/pics.
+        // Warm up PHPSESSID once; keep it through all batches, as in Keiyoushi.
+        await validatorGet(Ikm.baseUrl + '/', Ikm.webHeaders);
+        const readBatch = async (offset) => {
+          const response = await validatorPost(Ikm.baseUrl + '/api/comic/read/pics',
+            {...Ikm.jsonHead, Referer: epId},
+            'id=' + encodeURIComponent(ids[2]) + '&aid=' + encodeURIComponent(ids[1]) +
+              '&offset=' + offset + '&limit=10');
+          if (response.status !== 200) throw new Error('HTTP ' + response.status);
+          const batch = parseReadPicsImages(response, epId);
+          if (!batch.ok) throw new Error('源站未提供正文图片，请检查章节权限');
+          return batch;
+        };
+        const first = await readBatch(0);
+        if (!first.images.length) throw new Error('该章节没有可读取的正文图片');
+        const images = first.images.slice();
+        const total = first.total;
+        if (total > 1000) throw new Error('章节页数超过安全上限');
+        if (total > 0) {
+          for (let offset = images.length; offset < total; offset += 20) {
+            const startedAt = Date.now();
+            const offsets = [];
+            for (let value = offset; value < Math.min(offset + 20, total); value += 10) offsets.push(value);
+            const batches = await Promise.all(offsets.map(readBatch));
+            for (let index = 0; index < batches.length; index++) {
+              const batch = batches[index];
+              const expected = Math.min(10, total - offsets[index]);
+              if (batch.images.length !== expected) throw new Error('源站返回了不完整的章节图片，请重试');
+              images.push(...batch.images);
+            }
+            // Match the maintained adapter's two requests per 500 ms.
+            const pause = 500 - (Date.now() - startedAt);
+            if (offset + 20 < total && pause > 0) await new Promise(resolve => setTimeout(resolve, pause));
+          }
+          if (images.length !== total) throw new Error('章节图片数量不完整');
+        } else {
+          for (let offset = images.length; offset < 1000; offset += 10) {
+            if (images.length % 10 !== 0) break;
+            const batch = await readBatch(offset);
+            images.push(...batch.images);
+            if (batch.images.length < 10) break;
+          }
+        }
+        return {images};
+      }
+            """.trimIndent())
+            patched
         }
         else -> script
     }
 
-    private fun fetch(url: String): String? {
+    private fun fetch(context: Context, url: String): String? {
         return try {
             val request = Request.Builder()
                 .url(url)
@@ -755,7 +1104,8 @@ object JsSourceRepo {
                     "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.5359.128 Mobile Safari/537.36"
                 )
                 .build()
-            client.newCall(request).execute().use { response ->
+            JsSourceProxy.failoverClient(context.applicationContext, baseClient)
+                .newCall(request).execute().use { response ->
                 if (!response.isSuccessful) null else response.body?.string()
             }
         } catch (e: Exception) {

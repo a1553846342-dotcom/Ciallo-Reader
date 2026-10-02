@@ -1,8 +1,10 @@
 package com.example.source.impl
 
+import android.content.Context
 import android.util.Log
 import com.example.source.AuthenticationState
 import com.example.source.ComicChapter
+import com.example.source.ComicInfo
 import com.example.source.ComicSource
 import com.example.source.DownloadInfo
 import com.example.source.LoginCredential
@@ -10,7 +12,9 @@ import com.example.source.SearchBook
 import com.example.source.SourceCapabilities
 import com.example.source.SourceException
 import com.example.source.SourceResult
+import com.example.source.js.JsSourceProxy
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -32,8 +36,13 @@ import java.util.concurrent.TimeUnit
  * that are external on the official API.
  */
 class MangaDexSource(
-    private val client: OkHttpClient = defaultClient
+    private val client: OkHttpClient = defaultClient,
+    context: Context? = null
 ) : ComicSource {
+
+    private val http = context?.let {
+        JsSourceProxy.failoverClient(it.applicationContext, client)
+    } ?: client
 
     override val id: String = "mangadex"
     override val name: String = "MangaDex 漫画"
@@ -54,7 +63,7 @@ class MangaDexSource(
             "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
 
-        private val defaultClient = OkHttpClient.Builder()
+        private val defaultClient = com.example.source.SharedHttpTransport.builder()
             .connectTimeout(20, TimeUnit.SECONDS)
             .readTimeout(25, TimeUnit.SECONDS)
             .build()
@@ -69,16 +78,38 @@ class MangaDexSource(
                 // 镜像结果直接可用（章节/图链路成熟），官方 API 结果带 mdapi: 前缀 id，
                 // 详情/章节/图走官方 API 专用实现。
                 val encoded = URLEncoder.encode(keyword, "UTF-8")
-                val mirror = searchMirror(encoded)
-                val official = searchOfficialApi(keyword)
-                // 合并：镜像优先；官方结果去重（按规范化标题，避免同书双条目）
+                val mirrorRequest = async { runCatching { searchMirror(encoded) } }
+                val officialRequest = async { searchOfficialApi(keyword) }
+                val mirrorResult = mirrorRequest.await()
+                val mirror = mirrorResult.getOrDefault(emptyList())
+                val official = officialRequest.await()
+                if (mirrorResult.isFailure && official.isEmpty()) {
+                    throw SourceException.NetworkError(
+                        "MangaDex 搜索服务暂时不可用: ${mirrorResult.exceptionOrNull()?.message}"
+                    )
+                }
+                // 同名作品优先使用官方 ID，避免镜像搜索能命中但详情页已失效。
                 val merged = LinkedHashMap<String, SearchBook>()
                 mirror.forEach { merged[it.id] = it }
                 official.forEach { api ->
-                    if (merged.values.none {
-                            it.title.equals(api.title, ignoreCase = true) ||
-                                normalizeTitle(it.title) == normalizeTitle(api.title)
-                        }) {
+                    val apiMainTitle = officialUuid(api.id)?.let { uuid ->
+                        synchronized(officialTitleCache) { officialTitleCache[uuid] }
+                    }
+                    val mirrorMatch = mirror.firstOrNull {
+                        it.title.equals(api.title, ignoreCase = true) ||
+                            normalizeTitle(it.title) == normalizeTitle(api.title) ||
+                            (apiMainTitle != null &&
+                                normalizeTitle(it.title) == normalizeTitle(apiMainTitle))
+                    }
+                    if (mirrorMatch != null) {
+                        synchronized(mirrorToOfficialCache) {
+                            mirrorToOfficialCache[mirrorMatch.id] = api.id
+                            if (mirrorToOfficialCache.size > 64) {
+                                mirrorToOfficialCache.remove(mirrorToOfficialCache.keys.first())
+                            }
+                        }
+                        merged[mirrorMatch.id] = api
+                    } else {
                         merged[api.id] = api
                     }
                 }
@@ -120,7 +151,7 @@ class MangaDexSource(
                     id = slug,
                     sourceId = id,
                     title = title.ifBlank { "未知书名" },
-                    author = "MangaDex",
+                    author = "",
                     cover = cover.ifBlank { null }?.replace(".256.jpg", ".512.jpg"),
                     format = "漫画",
                     language = langCode?.let { languageLabel(it) }
@@ -140,13 +171,13 @@ class MangaDexSource(
         val encoded = URLEncoder.encode(keyword, "UTF-8")
         val url = "$OFFICIAL_API/manga?title=$encoded&limit=12" +
             "&contentRating%5B%5D=safe&contentRating%5B%5D=suggestive" +
-            "&includes%5B%5D=cover_art&order%5Brelevance%5D=desc"
+            "&includes%5B%5D=cover_art&includes%5B%5D=author&includes%5B%5D=artist&order%5Brelevance%5D=desc"
         val request = Request.Builder()
             .url(url)
             .header("User-Agent", UA)
             .header("Accept", "application/json")
             .build()
-        client.newCall(request).execute().use { response ->
+        http.newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
                 Log.i(TAG, "official api search HTTP ${response.code}")
                 return emptyList()
@@ -204,7 +235,6 @@ class MangaDexSource(
                         }
                     }
                 }
-                val originalLang = attrs.optString("originalLanguage", "")
                 // 记录 uuid→主标题（罗马音/英文），供官方章节无图时回退镜像搜索
                 if (mainTitle.isNotBlank()) {
                     synchronized(officialTitleCache) {
@@ -219,10 +249,11 @@ class MangaDexSource(
                         id = "mdapi:$uuid",
                         sourceId = id,
                         title = displayTitle,
-                        author = "MangaDex",
+                        author = officialCreators(item, "author").joinToString("、"),
                         cover = cover,
                         format = "漫画",
-                        language = languageLabel(originalLang)
+                        comicInfo = officialInfo(attrs).copy(artists = officialCreators(item, "artist")),
+                        description = officialText(attrs.optJSONObject("description")),
                     )
                 )
             }
@@ -231,12 +262,79 @@ class MangaDexSource(
     }.getOrDefault(emptyList())
 
     /** id 是否为官方 API 条目（"mdapi:<uuid>"） */
+    private fun officialText(values: JSONObject?): String? = values?.let { obj ->
+        listOf("zh-hans", "zh", "zh-hk", "en", "ja").firstNotNullOfOrNull { key ->
+            obj.optString(key).takeIf { it.isNotBlank() && it != "null" }
+        } ?: obj.keys().asSequence().map { obj.optString(it) }.firstOrNull { it.isNotBlank() && it != "null" }
+    }
+
+    private fun officialCreators(item: JSONObject, type: String): List<String> {
+        val relationships = item.optJSONArray("relationships") ?: return emptyList()
+        return (0 until relationships.length()).mapNotNull { i ->
+            relationships.optJSONObject(i)?.takeIf { it.optString("type") == type }
+                ?.optJSONObject("attributes")?.optString("name")?.takeIf { it.isNotBlank() }
+        }.distinct()
+    }
+
+    private fun officialInfo(attrs: JSONObject?): ComicInfo {
+        if (attrs == null) return ComicInfo()
+        val titles = mutableListOf<String>()
+        fun collect(obj: JSONObject?) { obj?.keys()?.forEach { key ->
+            obj.optString(key).takeIf { it.isNotBlank() && it != "null" }?.let(titles::add)
+        } }
+        collect(attrs.optJSONObject("title"))
+        attrs.optJSONArray("altTitles")?.let { array ->
+            for (i in 0 until array.length()) collect(array.optJSONObject(i))
+        }
+        val tags = attrs.optJSONArray("tags")
+        return ComicInfo(
+            alternateTitles = titles.distinct(),
+            tags = if (tags == null) emptyList() else (0 until tags.length()).mapNotNull { i ->
+                officialText(tags.optJSONObject(i)?.optJSONObject("attributes")?.optJSONObject("name"))
+            },
+            status = attrs.optString("status").ifBlank { null },
+            originalLanguage = attrs.optString("originalLanguage").ifBlank { null },
+            updatedAt = attrs.optString("updatedAt").ifBlank { null },
+        )
+    }
+
     private fun officialUuid(bookId: String): String? =
         if (bookId.startsWith("mdapi:")) bookId.removePrefix("mdapi:") else null
 
     /** 官方条目 uuid → 罗马音/英文主标题（章节无图时按标题回退镜像搜索的桥接表）。
      *  进程内会话缓存，容量极小（近次搜索结果量级）。 */
     private val officialTitleCache = LinkedHashMap<String, String>()
+    private val mirrorToOfficialCache = LinkedHashMap<String, String>()
+
+    /** uuid → 镜像站 slug：外链章节回退镜像时避免每章重复"取标题→搜索→匹配"。 */
+    private val mirrorSlugCache = LinkedHashMap<String, String>()
+
+    /**
+     * 定位作品在镜像站的 slug：先查缓存；未命中时按主标题搜索，
+     * 只接受归一化后相同的标题，防止同名角色的同人作品替代原作。
+     */
+    private fun mirrorSlugFor(uuid: String): String? {
+        synchronized(mirrorSlugCache) { mirrorSlugCache[uuid] }?.let { return it }
+        val mainTitle = synchronized(officialTitleCache) { officialTitleCache[uuid] }
+            ?: apiGet("$OFFICIAL_API/manga/$uuid")?.optJSONObject("data")
+                ?.optJSONObject("attributes")?.optJSONObject("title")?.let { titles ->
+                    listOf("en", "ja-ro", "ja", "zh-hans", "zh")
+                        .firstNotNullOfOrNull { key ->
+                            titles.optString(key, "").takeIf { it.isNotBlank() }
+                        }
+                }
+            ?: return null
+        val candidates = runCatching { searchMirror(URLEncoder.encode(mainTitle, "UTF-8")) }
+            .getOrDefault(emptyList())
+            .filter { it.id.isNotBlank() && !it.id.startsWith("mdapi:") }
+        val target = normalizeTitle(mainTitle)
+        val slug = candidates.firstOrNull { normalizeTitle(it.title) == target }?.id ?: return null
+        synchronized(mirrorSlugCache) {
+            mirrorSlugCache[uuid] = slug
+            if (mirrorSlugCache.size > 32) mirrorSlugCache.remove(mirrorSlugCache.keys.first())
+        }
+        return slug
+    }
 
     private fun apiGet(url: String): JSONObject? = runCatching {
         val request = Request.Builder()
@@ -244,26 +342,14 @@ class MangaDexSource(
             .header("User-Agent", UA)
             .header("Accept", "application/json")
             .build()
-        client.newCall(request).execute().use { response ->
+        http.newCall(request).execute().use { response ->
             if (!response.isSuccessful) return@use null
             response.body?.string()?.let { JSONObject(it) }
         }
     }.getOrNull()
 
-    /** 官方 API：按 uuid 找最新章节 id，再走 at-home API 取图。
-     *  注意：translatedLanguage 只接受 ^[a-z]{2}(-[a-z]{2})?$（zh-hans 非法→400），
-     *  用 zh / zh-hk / en。 */
-    private fun officialChapterImages(uuid: String): List<String> {
-        val feed = apiGet(
-            "$OFFICIAL_API/manga/$uuid/feed?translatedLanguage%5B%5D=zh" +
-                "&translatedLanguage%5B%5D=zh-hk" +
-                "&translatedLanguage%5B%5D=en" +
-                "&order%5Bchapter%5D=asc&limit=1&contentRating%5B%5D=safe" +
-                "&contentRating%5B%5D=suggestive&contentRating%5B%5D=erotica"
-        ) ?: return emptyList()
-        val data = feed.optJSONArray("data") ?: return emptyList()
-        val chapterId = data.optJSONObject(0)?.optString("id") ?: return emptyList()
-        if (chapterId.isBlank()) return emptyList()
+    /** 官方章节 id 直接交给 at-home API；章节列表已提供这个 id。 */
+    private fun officialChapterImages(chapterId: String): List<String> {
         val atHome = apiGet("$OFFICIAL_API/at-home/server/$chapterId") ?: return emptyList()
         val baseUrl = atHome.optString("baseUrl")
         val chapter = atHome.optJSONObject("chapter") ?: return emptyList()
@@ -278,17 +364,26 @@ class MangaDexSource(
         return out
     }
 
+    private fun officialImagesAvailable(images: List<String>): Boolean {
+        val first = images.firstOrNull() ?: return false
+        // The at-home API can list files that the image server already returns 404
+        // for. Read only a small range before accepting those URLs as a chapter.
+        return runCatching {
+            val request = Request.Builder().url(first).header("User-Agent", UA)
+                .header("Range", "bytes=0-63").build()
+            http.newCall(request).execute().use { response ->
+                response.isSuccessful && response.peekBody(64).bytes().isNotEmpty()
+            }
+        }.getOrDefault(false)
+    }
+
     /**
      * 第九轮回退：官方章节无托管图（externalLink 除外链）时，
      * 用 uuid→主标题桥接表在镜像站搜同作品，再在镜像章节列表里找同号章节，
      * 最后走镜像 read 页拿直链图。任何一步失败都静默返回空。
      */
     private fun mirrorFallbackImages(uuid: String, chapterNum: Float): List<String> = runCatching {
-        val mainTitle = synchronized(officialTitleCache) { officialTitleCache[uuid] } ?: return emptyList()
-        val slug = searchMirror(URLEncoder.encode(mainTitle, "UTF-8"))
-            .firstOrNull { it.id.isNotBlank() && !it.id.startsWith("mdapi:") }
-            ?.id
-            ?: return emptyList()
+        val slug = mirrorSlugFor(uuid) ?: return emptyList()
         // 拉镜像章节列表，找同号
         val doc = Jsoup.parse(getHtml("$BASE/manga/$slug"))
         val blocks = doc.select("ul.chapter-list-item")
@@ -340,14 +435,16 @@ class MangaDexSource(
         withContext(Dispatchers.IO) {
             try {
                 // 第九轮：官方 API 条目（mdapi:<uuid>）走官方详情
-                officialUuid(bookId)?.let { uuid ->
+                val officialId = officialUuid(bookId)
+                if (officialId != null) {
+                    val uuid = officialId
                     val json = apiGet(
-                        "$OFFICIAL_API/manga/$uuid?includes%5B%5D=cover_art"
-                    ) ?: return@let SourceResult.Error(
+                        "$OFFICIAL_API/manga/$uuid?includes%5B%5D=cover_art&includes%5B%5D=author&includes%5B%5D=artist"
+                    ) ?: return@withContext SourceResult.Error(
                         SourceException.NetworkError("MangaDex 官方 API 不可达")
                     )
-                    val item = json.optJSONArray("data")?.optJSONObject(0)
-                        ?: return@let SourceResult.Error(SourceException.ParseError("作品不存在"))
+                    val item = json.optJSONObject("data")
+                        ?: return@withContext SourceResult.Error(SourceException.ParseError("作品不存在"))
                     val attrs = item.optJSONObject("attributes")
                     val titleObj = attrs?.optJSONObject("title")
                     val title = titleObj?.let { t ->
@@ -373,13 +470,22 @@ class MangaDexSource(
                             id = bookId,
                             sourceId = id,
                             title = title,
-                            author = "MangaDex",
+                            author = officialCreators(item, "author").joinToString("、"),
                             cover = cover,
-                            format = "漫画"
+                            format = "漫画",
+                            description = officialText(attrs?.optJSONObject("description")),
+                            comicInfo = officialInfo(attrs).copy(artists = officialCreators(item, "artist")),
                         )
                     )
                 }
-                val doc = Jsoup.parse(getHtml("$BASE/manga/$bookId"))
+                val mirrorHtml = runCatching { getHtml("$BASE/manga/$bookId") }
+                val officialFallback = synchronized(mirrorToOfficialCache) {
+                    mirrorToOfficialCache[bookId]
+                }
+                if (mirrorHtml.isFailure && officialFallback != null) {
+                    return@withContext getDetail(officialFallback)
+                }
+                val doc = Jsoup.parse(mirrorHtml.getOrThrow())
                 val title = doc.selectFirst("h1")?.text()?.trim()
                     ?: doc.selectFirst("meta[property=og:title]")?.attr("content")?.trim()
                     ?: bookId
@@ -392,6 +498,7 @@ class MangaDexSource(
                         sourceId = id,
                         title = title,
                         author = author,
+                        description = doc.selectFirst("meta[name=description]")?.attr("content")?.takeIf { it.isNotBlank() },
                         cover = cover?.ifBlank { null }?.replace(".256.jpg", ".512.jpg"),
                         format = "漫画"
                     )
@@ -414,49 +521,89 @@ class MangaDexSource(
                 // 第九轮：官方 API 条目——章节列表按官方 feed 拉取（中→英优先）
                 val officialId = officialUuid(bookId)
                 if (officialId != null) {
-                    val feed = apiGet(
-                        "$OFFICIAL_API/manga/$officialId/feed?translatedLanguage%5B%5D=zh" +
-                            "&translatedLanguage%5B%5D=zh-hk" +
-                            "&translatedLanguage%5B%5D=en" +
-                            "&order%5Bchapter%5D=asc&limit=500&contentRating%5B%5D=safe" +
-                            "&contentRating%5B%5D=suggestive&contentRating%5B%5D=erotica"
-                    ) ?: return@withContext SourceResult.Error(
-                        SourceException.NetworkError("MangaDex 官方 API 不可达")
-                    )
-                    val data = feed.optJSONArray("data")
-                    if (data == null || data.length() == 0) {
-                        return@withContext SourceResult.Success(emptyList())
-                    }
-                    val chapters = ArrayList<ComicChapter>(data.length())
-                    val seen = HashSet<Float>()
-                    for (i in 0 until data.length()) {
-                        val item = data.optJSONObject(i) ?: continue
-                        val attrs = item.optJSONObject("attributes") ?: continue
-                        val chapterId = item.optString("id")
-                        val num = attrs.optDouble("chapter", Double.NaN)
-                        if (chapterId.isBlank() || num.isNaN()) continue
-                        val key = num.toFloat()
-                        if (!seen.add(key)) continue
-                        val label = if (key == key.toLong().toFloat()) {
-                            "第${key.toLong()}话"
-                        } else {
-                            "第$key 话"
-                        }
-                        chapters.add(
-                            ComicChapter(
-                                id = "mdapich:$chapterId:$key",
+                    val chapters = ArrayList<ComicChapter>()
+                    val bestByNumber = LinkedHashMap<Float, Pair<Int, ComicChapter>>()
+                    var offset = 0
+                    val pageSize = 500
+                    var numberedCount = 0
+                    var externalCount = 0
+                    do {
+                        val feed = apiGet(
+                            "$OFFICIAL_API/manga/$officialId/feed?translatedLanguage%5B%5D=zh" +
+                                "&translatedLanguage%5B%5D=zh-hk" +
+                                "&translatedLanguage%5B%5D=en" +
+                                "&order%5Bchapter%5D=asc&limit=$pageSize&offset=$offset" +
+                                "&contentRating%5B%5D=safe&contentRating%5B%5D=suggestive" +
+                                "&contentRating%5B%5D=erotica"
+                        ) ?: return@withContext SourceResult.Error(
+                            SourceException.NetworkError("MangaDex 官方 API 不可达")
+                        )
+                        val data = feed.optJSONArray("data") ?: break
+                        for (i in 0 until data.length()) {
+                            val item = data.optJSONObject(i) ?: continue
+                            val attrs = item.optJSONObject("attributes") ?: continue
+                            val chapterId = item.optString("id")
+                            val num = attrs.optDouble("chapter", Double.NaN)
+                            if (chapterId.isBlank()) continue
+                            val numbered = !num.isNaN()
+                            val key = if (numbered) num.toFloat() else (offset + i).toFloat()
+                            val label = if (!numbered) {
+                                "单话"
+                            } else if (key == key.toLong().toFloat()) {
+                                "第${key.toLong()}话"
+                            } else {
+                                "第$key 话"
+                            }
+                            val chapter = ComicChapter(
+                                id = "mdapich:$officialId:$chapterId:$key",
                                 title = attrs.optString("title", "").ifBlank { label },
                                 order = key
                             )
-                        )
-                    }
+                            if (numbered) {
+                                numberedCount++
+                                val languageRank = when (attrs.optString("translatedLanguage").lowercase()) {
+                                    "zh", "zh-hans" -> 0
+                                    "zh-hk", "zh-tw" -> 1
+                                    "en" -> 2
+                                    else -> 3
+                                }
+                                val external = !attrs.isNull("externalUrl") &&
+                                    attrs.optString("externalUrl").isNotBlank()
+                                if (external) externalCount++
+                                val rank = languageRank + (if (external) 10 else 0)
+                                val current = bestByNumber[key]
+                                if (current == null || rank < current.first) {
+                                    bestByNumber[key] = rank to chapter
+                                }
+                            } else {
+                                chapters.add(chapter)
+                            }
+                        }
+                        offset += data.length()
+                        if (data.length() < pageSize || offset >= feed.optInt("total", offset)) break
+                    } while (offset < 10000)
+                    chapters.addAll(bestByNumber.values.map { it.second })
                     chapters.sortBy { it.order }
+                    // 章节全为外链（如 One Piece 全卷外链 MangaPlus）时，阅读/下载
+                    // 每章都要走镜像回退；在列表加载时就定位一次镜像 slug 并缓存，
+                    // 后续各章直接复用，同时把"镜像没有该作品"提前暴露。
+                    if (numberedCount > 0 && externalCount >= numberedCount) {
+                        runCatching { mirrorSlugFor(officialId) }
+                    }
                     Log.i(TAG, "official chapters for $officialId -> ${chapters.size}")
                     return@withContext SourceResult.Success(chapters)
                 }
-                val doc = Jsoup.parse(getHtml("$BASE/manga/$bookId"))
-                val blocks = doc.select("ul.chapter-list-item")
+                val mirrorHtml = runCatching { getHtml("$BASE/manga/$bookId") }
+                val blocks = mirrorHtml.getOrNull()?.let { Jsoup.parse(it).select("ul.chapter-list-item") }
+                    ?: emptyList()
                 if (blocks.isEmpty()) {
+                    val officialFallback = synchronized(mirrorToOfficialCache) {
+                        mirrorToOfficialCache[bookId]
+                    }
+                    if (officialFallback != null) {
+                        return@withContext getChapters(officialFallback)
+                    }
+                    mirrorHtml.exceptionOrNull()?.let { throw it }
                     return@withContext SourceResult.Success(emptyList())
                 }
 
@@ -467,7 +614,7 @@ class MangaDexSource(
                     if (idx >= 0) idx else 10
                 }
 
-                val byNumber = LinkedHashMap<Int, ComicChapter>()
+                val byNumber = LinkedHashMap<Float, ComicChapter>()
                 var batchRequests = 0
 
                 for (block in orderedBlocks) {
@@ -517,19 +664,34 @@ class MangaDexSource(
                 // 按标题搜镜像拿 slug → 镜像章节列表找同号章节 → 镜像 read 页直链
                 if (chapterId.startsWith("mdapich:")) {
                     val parts = chapterId.removePrefix("mdapich:").split(':')
-                    val uuid = parts.getOrNull(0).orEmpty()
-                    val chapterNum = parts.getOrNull(1)?.toFloatOrNull()
-                    val images = officialChapterImages(uuid)
-                    Log.i(TAG, "official chapter images $uuid -> ${images.size}")
-                    if (images.isNotEmpty()) {
+                    // 旧版 ID 只有章节 UUID；新版同时携带作品 UUID，供外链章节回退镜像。
+                    val mangaUuid = parts.getOrNull(0).takeIf { parts.size >= 3 }
+                    val chapterUuid = parts.getOrNull(if (mangaUuid == null) 0 else 1).orEmpty()
+                    val chapterNum = parts.getOrNull(if (mangaUuid == null) 1 else 2)?.toFloatOrNull()
+                    val images = officialChapterImages(chapterUuid)
+                    Log.i(TAG, "official chapter images $chapterUuid -> ${images.size}")
+                    if (officialImagesAvailable(images)) {
                         return@withContext SourceResult.Success(images)
                     }
+                    // Saved chapters from older versions may carry only the chapter UUID.
+                    val metadata = if (mangaUuid == null || chapterNum == null) {
+                        apiGet("$OFFICIAL_API/chapter/$chapterUuid")?.optJSONObject("data")
+                    } else null
+                    val mangaId = mangaUuid ?: metadata?.optJSONArray("relationships")?.let { rels ->
+                        (0 until rels.length()).firstNotNullOfOrNull { i ->
+                            rels.optJSONObject(i)?.takeIf { it.optString("type") == "manga" }?.optString("id")
+                        }
+                    }
+                    val number = chapterNum ?: metadata?.optJSONObject("attributes")
+                        ?.optString("chapter")?.toFloatOrNull()
                     // 回退镜像：uuid→标题桥接表 → 镜像搜索 → 同号章节
-                    val fallback = if (chapterNum != null) mirrorFallbackImages(uuid, chapterNum) else emptyList()
-                    Log.i(TAG, "mirror fallback for $uuid ch$chapterNum -> ${fallback.size}")
+                    val fallback = if (!mangaId.isNullOrBlank() && number != null) {
+                        mirrorFallbackImages(mangaId, number)
+                    } else emptyList()
+                    Log.i(TAG, "mirror fallback for $chapterUuid ch$chapterNum -> ${fallback.size}")
                     return@withContext if (fallback.isEmpty()) {
                         SourceResult.Error(
-                            SourceException.ParseError("该章节在官方源为外链/无托管图，镜像站也未找到同章节")
+                            SourceException.ParseError("该章节官方图片不可用，镜像站也未找到同作品、同章节的图片")
                         )
                     } else {
                         SourceResult.Success(fallback)
@@ -565,6 +727,21 @@ class MangaDexSource(
     override suspend fun getDownloadInfo(bookId: String): SourceResult<DownloadInfo> =
         SourceResult.Error(SourceException.ParseError("漫画源按章节在线阅读/下载，不支持单文件下载"))
 
+    override suspend fun getChapterImageHeaders(
+        chapterId: String,
+        urls: List<String>
+    ): Map<String, Map<String, String>> = urls.associateWith { url ->
+        // Official at-home images must not inherit a third-party mirror Referer.
+        // Mirror pages and official API chapters can both appear in the same search.
+        val uri = runCatching { java.net.URI(url) }.getOrNull()
+        val host = uri?.host?.lowercase().orEmpty()
+        val official = host == "mangadex.org" || host.endsWith(".mangadex.org") ||
+            host == "mangadex.network" || host.endsWith(".mangadex.network") ||
+            (chapterId.startsWith("mdapich:") && !uri?.path.orEmpty().startsWith("/chapter/"))
+        if (official) mapOf("User-Agent" to UA)
+        else mapOf("User-Agent" to UA, "Referer" to REFERER)
+    }
+
     override suspend fun login(credential: LoginCredential): SourceResult<Boolean> =
         SourceResult.Success(false)
 
@@ -579,12 +756,12 @@ class MangaDexSource(
         doc: Element,
         slug: String,
         code: String,
-        out: LinkedHashMap<Int, ComicChapter>
+        out: LinkedHashMap<Float, ComicChapter>
     ) {
         val lang = code.lowercase()
         for (li in doc.select("li.item[data-number]")) {
             val numStr = li.attr("data-number").trim()
-            val num = numStr.toIntOrNull() ?: continue
+            val num = numStr.toFloatOrNull() ?: continue
             if (out.containsKey(num)) continue
             val a = li.selectFirst("a[href^=/read/]") ?: continue
             val text = a.text().trim()
@@ -593,7 +770,7 @@ class MangaDexSource(
             out[num] = ComicChapter(
                 id = href,
                 title = text.ifBlank { "第${numStr}话" },
-                order = num.toFloat()
+                order = num
             )
         }
     }
@@ -617,7 +794,7 @@ class MangaDexSource(
                 }
             } catch (_: Exception) {}
         }
-        return "MangaDex"
+        return ""
     }
 
     private fun languageLabel(code: String): String = when (code.uppercase()) {
@@ -652,7 +829,7 @@ class MangaDexSource(
         if (referer) builder.header("Referer", REFERER)
         if (xhr) builder.header("X-Requested-With", "XMLHttpRequest")
         val request = builder.build()
-        client.newCall(request).execute().use { response ->
+        http.newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
                 Log.e(TAG, "HTTP ${response.code} for ${url.take(140)}")
                 throw SourceException.NetworkError("MangaDex HTTP ${response.code} @ ${url.take(160)}")

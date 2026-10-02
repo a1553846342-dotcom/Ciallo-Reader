@@ -39,7 +39,7 @@ object BookShareHelper {
     private const val TAG = "BookShare"
     private const val SHARE_TEMP_DIR = "share_temp"
     /** 分享临时文件保留时间：给微信/QQ 留足读取时间，超时后自动删除，不长期占双份内存。 */
-    private const val SHARE_TEMP_RETENTION_MS = 5 * 60 * 1000L
+    private const val SHARE_TEMP_RETENTION_MS = 24 * 60 * 60 * 1000L
 
     /** 进程级作用域：分享面板关闭后延时清理临时文件，不依赖弹窗/页面存活。 */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -58,7 +58,8 @@ object BookShareHelper {
         runCatching {
             val dir = File(context.cacheDir, SHARE_TEMP_DIR)
             if (dir.exists()) {
-                dir.listFiles()?.forEach { runCatching { it.delete() } }
+                val cutoff = System.currentTimeMillis() - SHARE_TEMP_RETENTION_MS
+                dir.listFiles()?.filter { it.lastModified() < cutoff }?.forEach { runCatching { it.delete() } }
             }
         }
     }
@@ -177,7 +178,7 @@ object BookShareHelper {
             throw IllegalStateException("漫画页面文件缺失，无法分享")
         }
 
-        val out = File(context.cacheDir, "$SHARE_TEMP_DIR/${sanitizeFileName(book.title)}.cbz")
+        val out = File(context.cacheDir, "$SHARE_TEMP_DIR/${java.util.UUID.randomUUID()}_${sanitizeFileName(book.title)}.cbz")
         out.parentFile?.mkdirs()
         ZipOutputStream(FileOutputStream(out)).use { zip ->
             pages.forEachIndexed { index, page ->
@@ -197,7 +198,8 @@ object BookShareHelper {
         }.getOrDefault(emptyList())
         return tasks.firstOrNull {
             it.status == DownloadStatus.COMPLETED &&
-                it.title == book.title &&
+                (it.filePath.removePrefix("file://") == book.filePath.removePrefix("file://") ||
+                    (book.sourceId == it.sourceId && book.comicId == com.example.download.DownloadManager.originalBookId(it.id, it.sourceId))) &&
                 it.filePath.isNotBlank() &&
                 File(it.filePath).isFile
         }?.let { File(it.filePath) }
@@ -220,7 +222,7 @@ object BookShareHelper {
         mime: String
     ): ShareTarget {
         val ext = resolveExtension(context, uri, book, mime)
-        val out = File(context.cacheDir, "$SHARE_TEMP_DIR/${sanitizeFileName(book.title)}.$ext")
+        val out = File(context.cacheDir, "$SHARE_TEMP_DIR/${java.util.UUID.randomUUID()}_${sanitizeFileName(book.title)}.$ext")
         out.parentFile?.mkdirs()
         val input = context.contentResolver.openInputStream(uri)
             ?: throw IllegalStateException("无法读取源文件，可能已被移动或删除")
@@ -277,7 +279,7 @@ object BookShareHelper {
             if (!ch.content.endsWith("\n")) sb.append("\n")
             sb.append("\n")
         }
-        val out = File(context.cacheDir, "$SHARE_TEMP_DIR/${sanitizeFileName(book.title)}.txt")
+        val out = File(context.cacheDir, "$SHARE_TEMP_DIR/${java.util.UUID.randomUUID()}_${sanitizeFileName(book.title)}.txt")
         out.parentFile?.mkdirs()
         out.writeText(sb.toString(), Charsets.UTF_8)
         val uri = FileProvider.getUriForFile(context, authority(context), out)

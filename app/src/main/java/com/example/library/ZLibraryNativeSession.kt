@@ -83,6 +83,7 @@ class ZLibraryNativeSession(
 
     /** 离开书库时释放隐藏 WebView，回收渲染进程内存，避免后台持续占用。 */
     fun destroy() {
+        if(Looper.myLooper()!=Looper.getMainLooper()) { mainHandler.post { destroy() }; return }
         searchFinished = true
         scope.cancel()
         mainHandler.removeCallbacksAndMessages(null)
@@ -112,8 +113,14 @@ class ZLibraryNativeSession(
      * 界面渲染，彻底避免挂载 WebView 导致的窗口冻结/CPU 空转问题。
      */
     fun ensureCreated(context: Context) {
+        if(Looper.myLooper()!=Looper.getMainLooper()) { mainHandler.post { ensureCreated(context.applicationContext) }; return }
         if (webView == null) {
-            attach(WebView(context.applicationContext))
+            try { attach(WebView(context.applicationContext)) }
+            catch(e:Exception) {
+                searchFinished=true; mainHandler.removeCallbacksAndMessages(null)
+                onLoginResult(false,"系统 WebView 不可用，请更新 Android System WebView")
+                onSearchResults(emptyList(),"系统 WebView 不可用")
+            }
         }
     }
 

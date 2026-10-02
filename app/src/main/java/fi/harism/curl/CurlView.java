@@ -414,6 +414,18 @@ public class CurlView extends GLSurfaceView implements View.OnTouchListener,
 		mAllowLastPageCurl = allowLastPageCurl;
 	}
 
+	/** Reading direction changes book geometry and pointer coordinates together. */
+	public void setRightToLeft(boolean rightToLeft) {
+		synchronized (mRenderer) {
+			if (mRenderer.isRightToLeft() == rightToLeft) return;
+			mAnimate = false;
+			mCurlState = CURL_NONE;
+			mRenderer.setRightToLeft(rightToLeft);
+			updatePages();
+			requestRender();
+		}
+	}
+
 	/** Page-turn step size (1 = single page; 2 = double-page spread). Must be set before dragging starts. */
 	public void setSpreadStep(int step) {
 		mSpreadStep = Math.max(1, step);

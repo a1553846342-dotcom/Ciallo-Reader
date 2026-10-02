@@ -18,12 +18,16 @@ object SourceLog {
     private val fmt = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.CHINA)
 
     fun log(source: String, message: String) {
-        val line = "${fmt.format(Date())} [$source] $message"
+        val safe=message.replace(Regex("https?://[^\\s]+")) { hit ->
+            runCatching { val u=java.net.URI(hit.value); "${u.scheme}://${u.host}/…" }.getOrDefault("[URL]")
+        }.replace(Regex("(?i)(cookie|authorization|password|userkey|api[_-]?key|token)\\s*[:=]\\s*[^\\s,;]+"), "$1=[redacted]")
+        val redacted = if (Regex("(?i)(cookie|authorization|password|userkey|api[_-]?key|token)\\s*[:=]").containsMatchIn(message)) "[敏感信息已隐藏]" else safe
+        val line = synchronized(fmt) { "${fmt.format(Date())} [$source] $redacted" }
         synchronized(entries) {
             entries.addLast(line)
             while (entries.size > MAX) entries.removeFirst()
         }
-        android.util.Log.i("SourceLog", line)
+        if(com.example.BuildConfig.DEBUG) android.util.Log.i("SourceLog", line)
     }
 
     fun dump(): String = synchronized(entries) {

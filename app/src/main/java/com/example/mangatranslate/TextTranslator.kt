@@ -1,6 +1,9 @@
 package com.example.mangatranslate
 
 import kotlinx.coroutines.Dispatchers
+import com.example.source.executeCancellable
+import com.example.data.readImportBytes
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -54,10 +57,10 @@ object ScriptDetector {
  * 在线兜底翻译（第十七轮）：腾讯交互翻译 transmart（国内直连免费，批量多句）。
  * 旧 Google gtx 仅作备源（国内网络通常不可达）。
  */
-class OnlineFallbackTranslator : TextTranslator {
+class OnlineFallbackTranslator(private val context:android.content.Context?=null) : TextTranslator {
 
     private val client by lazy {
-        OkHttpClient.Builder()
+        com.example.source.SharedHttpTransport.builder()
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
             .build()
@@ -77,6 +80,8 @@ class OnlineFallbackTranslator : TextTranslator {
     suspend fun translateBatch(texts: List<String>, sourceLang: String): List<String>? =
         withContext(Dispatchers.IO) {
             if (texts.isEmpty()) return@withContext emptyList()
+            if(context!=null && !TranslationPrivacy.allowed(context)) return@withContext null
+            require(texts.size<=500 && texts.sumOf { it.length }<=128_000) { "翻译请求过大" }
             val srcLang = when (sourceLang) {
                 "ja" -> "ja"; "en" -> "en"; "zh" -> "zh"
                 else -> "auto"
@@ -99,12 +104,12 @@ class OnlineFallbackTranslator : TextTranslator {
                 .post(body.toString().toRequestBody("application/json".toMediaType()))
                 .build()
             runCatching {
-                client.newCall(request).execute().use { resp ->
+                client.newCall(request).executeCancellable().use { resp ->
                     if (!resp.isSuccessful) return@runCatching null
-                    val raw = resp.body?.string() ?: return@runCatching null
+                    val raw = resp.body?.byteStream()?.use { it.readImportBytes(2*1024*1024).toString(Charsets.UTF_8) } ?: return@runCatching null
                     parseTransmart(raw, texts.size)
                 }
-            }.getOrNull() ?: gtxFallback(texts, sourceLang)
+            }.getOrElse { kotlinx.coroutines.currentCoroutineContext().ensureActive(); null } ?: gtxFallback(texts, sourceLang)
         }
 
     /** 腾讯响应解析：{"auto_translation":["译1","译2",...]}。长度必须与请求一致。 */
@@ -127,12 +132,12 @@ class OnlineFallbackTranslator : TextTranslator {
                     val request = Request.Builder().url(url)
                         .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36")
                         .build()
-                    client.newCall(request).execute().use { resp ->
+                    client.newCall(request).executeCancellable().use { resp ->
                         if (!resp.isSuccessful) return@runCatching null
-                        val body = resp.body?.string() ?: return@runCatching null
+                        val body = resp.body?.byteStream()?.use { it.readImportBytes(2*1024*1024).toString(Charsets.UTF_8) } ?: return@runCatching null
                         parseGtx(body)
                     }
-                }.getOrNull()
+                }.getOrElse { kotlinx.coroutines.currentCoroutineContext().ensureActive(); null }
             }
             @Suppress("UNCHECKED_CAST")
             if (results.any { it == null }) null else results as List<String>

@@ -5,25 +5,24 @@ import android.content.SharedPreferences
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 
-class ZLibraryCredentialStorage(private val context: Context) {
-
-    private val prefs: SharedPreferences by lazy {
+class ZLibraryCredentialStorage private constructor(preferencesFactory: () -> SharedPreferences?) {
+    constructor(context: Context) : this({
         try {
+            context.getSharedPreferences("zlib_credentials_fallback", Context.MODE_PRIVATE).edit().clear().apply()
             val masterKey = MasterKey.Builder(context)
                 .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
                 .build()
-
             EncryptedSharedPreferences.create(
-                context,
-                "zlib_secure_credentials",
-                masterKey,
+                context, "zlib_secure_credentials", masterKey,
                 EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
                 EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
             )
-        } catch (e: Exception) {
-            context.getSharedPreferences("zlib_fallback_credentials", Context.MODE_PRIVATE)
-        }
-    }
+        } catch (_: Exception) { null }
+    })
+
+    // Test injection exercises cookie semantics independently of AndroidKeyStore support.
+    internal constructor(preferences: SharedPreferences?) : this({ preferences })
+    private val prefs: SharedPreferences? by lazy(preferencesFactory)
 
     fun saveCredentials(
         userId: String? = null,
@@ -31,7 +30,8 @@ class ZLibraryCredentialStorage(private val context: Context) {
         domain: String = DEFAULT_DOMAIN,
         cookies: String? = null
     ) {
-        prefs.edit()
+        val securePrefs = prefs ?: error("系统安全存储不可用，无法保存登录凭据，请修复系统密钥后重试")
+        securePrefs.edit()
             .putString(KEY_USER_ID, userId)
             .putString(KEY_USER_KEY, userKey)
             .putString(KEY_DOMAIN, domain.ifBlank { DEFAULT_DOMAIN })
@@ -39,13 +39,13 @@ class ZLibraryCredentialStorage(private val context: Context) {
             .apply()
     }
 
-    fun getUserId(): String? = prefs.getString(KEY_USER_ID, null)
-    fun getUserKey(): String? = prefs.getString(KEY_USER_KEY, null)
-    fun getDomain(): String = prefs.getString(KEY_DOMAIN, DEFAULT_DOMAIN) ?: DEFAULT_DOMAIN
-    fun getCookies(): String? = prefs.getString(KEY_COOKIES, null)
+    fun getUserId(): String? = runCatching { prefs?.getString(KEY_USER_ID, null) }.getOrNull()
+    fun getUserKey(): String? = runCatching { prefs?.getString(KEY_USER_KEY, null) }.getOrNull()
+    fun getDomain(): String = runCatching { prefs?.getString(KEY_DOMAIN, DEFAULT_DOMAIN) }.getOrNull() ?: DEFAULT_DOMAIN
+    fun getCookies(): String? = runCatching { prefs?.getString(KEY_COOKIES, null) }.getOrNull()
 
     fun clear() {
-        prefs.edit().clear().apply()
+        prefs?.edit()?.clear()?.apply()
     }
 
     fun isLoggedIn(): Boolean {

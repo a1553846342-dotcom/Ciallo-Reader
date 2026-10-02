@@ -15,6 +15,8 @@ import java.util.zip.GZIPInputStream
  */
 object ImageBytes {
 
+    private val normalizationLock=Any()
+    private val expandedLimit: Long get() = minOf(32L*1024*1024,Runtime.getRuntime().maxMemory()/12)
     private val GZIP_MAGIC = byteArrayOf(0x1F.toByte(), 0x8B.toByte())
 
     fun gunzipIfNeeded(bytes: ByteArray): ByteArray {
@@ -31,6 +33,7 @@ object ImageBytes {
                     while (true) {
                         val read = input.read(buffer)
                         if (read < 0) break
+                        require(output.size().toLong() + read <= expandedLimit) { "图片解压体积过大" }
                         output.write(buffer, 0, read)
                     }
                     output.toByteArray()
@@ -42,7 +45,8 @@ object ImageBytes {
     }
 
     /** 图片字节统一归一化：gzip 解压 + AVIF 转 PNG（BitmapFactory 在部分设备不支持 AVIF）。 */
-    fun normalizeImage(bytes: ByteArray, contentEncoding: String? = null): ByteArray {
+    fun normalizeImage(bytes: ByteArray, contentEncoding: String? = null): ByteArray = synchronized(normalizationLock) {
+        require(bytes.size<=32L*1024*1024) { "图片文件过大" }
         var result = if (contentEncoding?.contains("br", ignoreCase = true) == true) {
             brotliDecompress(bytes) ?: bytes
         } else {
@@ -52,13 +56,16 @@ object ImageBytes {
             result = try {
                 if (Build.VERSION.SDK_INT >= 28) {
                     val source = android.graphics.ImageDecoder.createSource(ByteBuffer.wrap(result))
-                    val bmp = android.graphics.ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
+                    val bmp = android.graphics.ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                        require(info.size.width.toLong()*info.size.height <= minOf(32L*1024*1024,Runtime.getRuntime().maxMemory()/8)/4) { "AVIF 图片过大" }
                         decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
                     }
-                    ByteArrayOutputStream().use { out ->
-                        bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
-                        out.toByteArray()
-                    }
+                    try {
+                        ByteArrayOutputStream().use { out ->
+                            check(bmp.compress(Bitmap.CompressFormat.PNG, 100, out))
+                            out.toByteArray()
+                        }
+                    } finally { bmp.recycle() }
                 } else {
                     result
                 }
@@ -67,7 +74,7 @@ object ImageBytes {
                 result
             }
         }
-        return result
+        result
     }
 
     private fun brotliDecompress(bytes: ByteArray): ByteArray? {
@@ -79,7 +86,8 @@ object ImageBytes {
                         while (true) {
                             val read = input.read(buffer)
                             if (read < 0) break
-                            output.write(buffer, 0, read)
+                            require(output.size().toLong() + read <= expandedLimit) { "图片解压体积过大" }
+                        output.write(buffer, 0, read)
                         }
                         output.toByteArray()
                     }
@@ -104,14 +112,11 @@ object ImageBytes {
     }
 
     /** 尝试用 BitmapFactory 解码，判断图片字节是否可用。 */
-    fun decodeOk(bytes: ByteArray): Boolean {
-        return try {
-            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-            bmp != null && bmp.width > 0 && bmp.height > 0
-        } catch (e: Exception) {
-            false
-        }
-    }
+    fun decodeOk(bytes: ByteArray): Boolean = try {
+        val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+        options.outWidth > 0 && options.outHeight > 0
+    } catch (_: Exception) { false }
 
     /**
      * hitomi 类图源会返回平台解不了的 AVIF；

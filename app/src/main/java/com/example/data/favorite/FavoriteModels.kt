@@ -130,6 +130,8 @@ data class ChapterReadEntity(
     /** 章节在阅读顺序中的序号（源正序/倒序归一化后的值） */
     val chapterIndex: Int = -1,
     val updatedAt: Long = System.currentTimeMillis(),
+    /** 读者手动标注的书签（详情页左滑/右滑该话卡片切换） */
+    val bookmarked: Boolean = false,
 ) {
     val state: ChapterReadState get() = ChapterReadState.of(status)
 }

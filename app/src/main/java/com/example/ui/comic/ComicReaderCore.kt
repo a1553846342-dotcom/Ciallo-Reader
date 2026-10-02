@@ -34,12 +34,12 @@ import androidx.compose.foundation.pager.VerticalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.CompositionLocalProvider
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -85,6 +85,7 @@ import com.example.mangatranslate.OnlineFallbackTranslator
 import com.example.mangatranslate.OrtSessions
 import com.example.mangatranslate.TranslationCoordinator
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -100,6 +101,7 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
 /** 目录条目（在线=章节；本地=页码） */
 data class ComicTocEntry(val id: String, val title: String)
@@ -189,6 +191,8 @@ fun ComicReaderCore(
     chapterNavLabel: String = "章节",
     onPageChanged: (rawPage: Int, isFinished: Boolean) -> Unit = { _, _ -> },
     remoteImageLoader: ImageLoader? = null,
+    /** 工具栏神回入口；未提供时不显示。 */
+    onGodMoment: (() -> Unit)? = null,
     onExit: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -259,13 +263,13 @@ fun ComicReaderCore(
     /* ── 漫画翻译协调器（第十五/十六/十八轮）：YOLO 气泡+离线 OCR → 用户选定引擎 → 形状烘焙回缓存 ── */
     OrtSessions.ensureCacheRoot(context)
     val translationCoordinator = remember {
-        TranslationCoordinator(context, OnlineFallbackTranslator(), LlmBubbleTranslator(context))
+        TranslationCoordinator(context, OnlineFallbackTranslator(context.applicationContext), LlmBubbleTranslator(context))
     }
     // 用户显式选择的引擎（第十八轮）随配置同步；换引擎同页自动重译（缓存 key 含引擎标识）
     translationCoordinator.selectedEngine = config.translationEngine
     val translationScope = remember { CoroutineScope(SupervisorJob() + Dispatchers.Default) }
-    val translationEpoch by translationCoordinator.epoch.collectAsState()
-    val translatingPages by translationCoordinator.busyKeys.collectAsState()
+    val translationEpoch by translationCoordinator.epoch.collectAsStateWithLifecycle()
+    val translatingPages by translationCoordinator.busyKeys.collectAsStateWithLifecycle()
     DisposableEffect(translationCoordinator) {
         onDispose {
             // release = 取消任务 + 归还 ONNX 会话内存（det/rec/yolo 约 60-100MB 常驻）
@@ -309,7 +313,7 @@ fun ComicReaderCore(
                 forcedLang = forcedLang,
                 textScale = cfg.translationTextScale,
                 loadBase = {
-                    loader.load(ref = entry.ref, cacheKey = entry.cacheKey, geo = entry.geo, tone = toneOf(cfg)).bitmap
+                    loader.loadForDisplay(ref = entry.ref, cacheKey = entry.cacheKey, geo = entry.geo, tone = toneOf(cfg), visible = entry.visible).bitmap
                 },
                 publishBaked = { loader.replaceProcessed(entry.cacheKey, it) },
             )
@@ -383,6 +387,15 @@ fun ComicReaderCore(
     var scrollFraction by remember { mutableStateOf(0f) }
     val latestExit by rememberUpdatedState(onExit)
 
+    var chapterNavigationPending by remember(pages) { mutableStateOf(false) }
+    fun navigateChapter(next: Boolean): Boolean {
+        val action = (if (next) onNextChapter else onPrevChapter) ?: return false
+        if (chapterNavigationPending) return false
+        chapterNavigationPending = true
+        action()
+        return true
+    }
+
     // 沉浸式系统栏（退出阅读器时恢复，避免影响其它页面）
     val view = LocalView.current
     DisposableEffect(Unit) {
@@ -408,24 +421,20 @@ fun ComicReaderCore(
         onDispose { }
     }
 
-    /* ── 翻页操作（方向感知；末页进下一章；无下一章停止自动） ── */
+    /* ── 翻页操作：首末页继续外翻进入相邻章节。 ── */
     fun goNext(): Boolean {
         if (currentSpread < spreadCount - 1) {
             currentSpread++
             return true
         }
-        return if (onNextChapter != null) {
-            onNextChapter.invoke()
-            true
-        } else {
-            if (autoRead) autoRead = false
-            false
-        }
+        if (navigateChapter(next = true)) return true
+        if (autoRead) autoRead = false
+        return false
     }
 
     fun goPrev() {
         if (currentSpread > 0) currentSpread--
-        else onPrevChapter?.invoke()
+        else navigateChapter(next = false)
     }
 
     /* ── 手势回调（点按区方向感知） ── */
@@ -506,7 +515,7 @@ fun ComicReaderCore(
      *  每次调用的"批次外取消"会取消同窗口其它槽位刚入队的任务（双页只剩
      *  下一跨最后槽位真正预载、后退几乎从不预载）+ 主 LRU 上限装不下窗口
      *  字节（增强页 ~29MB×6 槽）→ 翻页时重新解码 = 偶现加载圈。 */
-    val translationModelState by com.example.mangatranslate.TranslateModelManager.state.collectAsState()
+    val translationModelState by com.example.mangatranslate.TranslateModelManager.state.collectAsStateWithLifecycle()
     LaunchedEffect(currentSpread, layout, displayConfig, translationModelState) {
         if (!verticalMode) {
             val entries = ArrayList<ComicPageLoader.WindowEntry>(6)
@@ -515,13 +524,16 @@ fun ComicReaderCore(
             // 旧读实时 config，滤镜拖动后 250ms 内翻页会以新指纹预载、旧指纹显示，
             // 同页双份处理；displayConfig 入 key 后指纹落定即自动重预载并重建驻留，
             // 旧指纹驻留项随之解除——同时消解 F4 的陈旧驻留残留）。
-            val order = intArrayOf(currentSpread, currentSpread + 1, currentSpread - 1)
+            val online = pages.any { it is ComicPageRef.Remote }
+            val order = if (online) intArrayOf(currentSpread, currentSpread + 1, currentSpread + 2, currentSpread - 1)
+                else intArrayOf(currentSpread, currentSpread + 1, currentSpread - 1)
             order.filter { it in layout.spreads.indices }.forEach { si ->
                 layout.spreads[si].slots.forEach { slot ->
                     val rot = ((displayConfig.bookRotation + (bookState.pageRotations[slot.ref.id] ?: 0)) % 360 + 360) % 360
                     entries.add(
                         ComicPageLoader.WindowEntry(
                             ref = slot.ref,
+                            visible = si == currentSpread,
                             cacheKey = "${slot.ref.id}|${slot.half}|${displayConfig.imagePipelineFingerprint()}|r$rot",
                             geo = ComicImagePipeline.Geometry(
                                 half = slot.half,
@@ -611,6 +623,8 @@ fun ComicReaderCore(
                 autoScrollSpeedDp = config.autoScrollSpeedDp,
                 onReachEnd = { goNext() },
                 onScrollFraction = { scrollFraction = it },
+                onPreviousChapter = { navigateChapter(next = false) },
+                onNextChapter = { navigateChapter(next = true) },
             )
             config.mode == ComicMode.MAGNETIC -> ComicMagneticPager(
                 layout = layout, config = displayConfig, loader = loader, bookState = bookState,
@@ -622,6 +636,7 @@ fun ComicReaderCore(
                 autoRead = autoRead,
                 autoIntervalSec = config.autoPageIntervalSec,
                 goNext = { goNext() },
+                goPrev = { goPrev() },
             )
             else -> ComicPagedReader(
                 layout = layout, config = displayConfig, loader = loader, bookState = bookState,
@@ -633,6 +648,7 @@ fun ComicReaderCore(
                 autoIntervalSec = config.autoPageIntervalSec,
                 goNext = { goNext() },
                 dynamicBgColor = if (config.bgType == ComicBgType.DYNAMIC) dynamicBg else null,
+                goPrev = { goPrev() },
             )
         }
         }
@@ -713,8 +729,9 @@ fun ComicReaderCore(
         toc = toc,
         currentChapterIndex = currentChapterIndex,
         onJumpToChapter = onJumpToChapter,
-        onPrevChapter = onPrevChapter,
-        onNextChapter = onNextChapter,
+        onPrevChapter = onPrevChapter?.let { { navigateChapter(next = false); Unit } },
+        onNextChapter = onNextChapter?.let { { navigateChapter(next = true); Unit } },
+        onGodMoment = onGodMoment?.let { open -> { autoRead = false; open() } },
         chapterNavLabel = chapterNavLabel,
         pages = pages,
         loader = loader,
@@ -787,7 +804,7 @@ fun resolveTapAction(pos: Offset, size: Size, config: ComicReaderConfig): ComicG
 
 sealed interface PageBitmapState {
     data object Loading : PageBitmapState
-    data class Ready(val bitmap: Bitmap) : PageBitmapState
+    data class Ready(val bitmap: Bitmap, val refining: Boolean = false, val error: Throwable? = null) : PageBitmapState
     data class Failed(val error: Throwable?) : PageBitmapState
 }
 
@@ -798,6 +815,7 @@ fun rememberPageBitmap(
     config: ComicReaderConfig,
     bookState: ComicBookState,
     retry: Int = 0,
+    visible: Boolean = true,
 ): State<PageBitmapState> {
     // 可空槽位：恒定返回 Loading 态（两个分支各占 1 个 remember 节点，组合结构稳定，
     // 供调用方以固定调用结构避免条件 composable 崩溃）
@@ -825,13 +843,24 @@ fun rememberPageBitmap(
                 "seed=${cacheKey.take(44)} hit=${hit != null}",
             )
         }
-        return hit?.let { PageBitmapState.Ready(it) } ?: PageBitmapState.Loading
+        return hit?.let { PageBitmapState.Ready(it) }
+            ?: loader.peekReadingPreview(cacheKey)?.let { PageBitmapState.Ready(it, refining = true) }
+            ?: PageBitmapState.Loading
     }
     val translationEpoch = LocalComicTranslationEpoch.current
-    return produceState<PageBitmapState>(seed(), cacheKey, retry, translationEpoch) {
-        value = seed()
-        val result = runCatching {
-            loader.load(
+    // produceState retains its old value when only its producer keys change. Key the
+    // state itself so a new page cannot display the previous page even for one frame.
+    val state = remember(loader, slot.ref, cacheKey, retry, translationEpoch) { mutableStateOf(seed()) }
+    LaunchedEffect(loader, slot.ref, cacheKey, retry, translationEpoch, visible) {
+        val previews = launch {
+            loader.previewEpoch.collect {
+                if (loader.peekProcessed(cacheKey) == null) loader.peekReadingPreview(cacheKey)?.let {
+                    state.value = PageBitmapState.Ready(it, refining = true)
+                }
+            }
+        }
+        try {
+            val result = loader.loadForDisplay(
                 ref = slot.ref,
                 cacheKey = cacheKey,
                 geo = ComicImagePipeline.Geometry(
@@ -842,11 +871,20 @@ fun rememberPageBitmap(
                     manualCrop = config.manualCrop,
                 ),
                 tone = toneOf(config),
+                visible = visible,
             )
+            previews.cancel()
+            state.value = PageBitmapState.Ready(result.bitmap)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (error: Exception) {
+            state.value = (state.value as? PageBitmapState.Ready)?.copy(refining = false, error = error)
+                ?: PageBitmapState.Failed(error)
+        } finally {
+            previews.cancel()
         }
-        value = result.getOrNull()?.let { PageBitmapState.Ready(it.bitmap) }
-            ?: PageBitmapState.Failed(result.exceptionOrNull())
     }
+    return state
 }
 
 /* ══════════════ 分页阅读（单页/双页） ══════════════ */
@@ -887,6 +925,7 @@ private fun ComicPagedReader(
     autoRead: Boolean,
     autoIntervalSec: Float,
     goNext: () -> Unit,
+    goPrev: () -> Unit,
     dynamicBgColor: Color? = null,
 ) {
     val rtl = config.direction == ComicDirection.RTL
@@ -903,6 +942,7 @@ private fun ComicPagedReader(
             gestureCallbacks = gestureCallbacks, onBitmapShown = onBitmapShown,
             autoRead = autoRead, autoIntervalSec = autoIntervalSec, goNext = goNext,
             dynamicBgColor = dynamicBgColor,
+            goPrev = goPrev,
         )
         return
     }
@@ -915,7 +955,9 @@ private fun ComicPagedReader(
         snapshotFlow { pagerState.settledPage }
             .distinctUntilChanged()
             .collect { settled ->
-                hapticView.performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY)
+                if (com.example.ui.feedback.HapticsGate.enabled) {
+                    hapticView.performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY)
+                }
                 onSpreadChanged(settled)
             }
     }
@@ -945,6 +987,7 @@ private fun ComicPagedReader(
     // 第 9 条：单/双页模式页间距——每页两侧各留 spacing/2，翻页拖动时页间露出设定间距
     val spacingHalf = (config.pageSpacingDp / 2f).dp
 
+    val childZoomed = remember { mutableStateOf(false) }
     val cell: @Composable (Int) -> Unit = { idx ->
         val spread = layout.spreads.getOrNull(idx)
         if (spread != null) {
@@ -975,6 +1018,7 @@ private fun ComicPagedReader(
                     ComicSpreadCell(
                         spread = spread, config = config, loader = loader, bookState = bookState,
                         gestureCallbacks = gestureCallbacks, onBitmapShown = onBitmapShown,
+                        onZoomChanged = { if (pagerState.currentPage == idx) childZoomed.value = it },
                         isCurrentPage = pagerState.currentPage == idx,
                     )
                 }
@@ -983,6 +1027,7 @@ private fun ComicPagedReader(
                     ComicSpreadCell(
                         spread = spread, config = config, loader = loader, bookState = bookState,
                         gestureCallbacks = gestureCallbacks, onBitmapShown = onBitmapShown,
+                        onZoomChanged = { if (pagerState.currentPage == idx) childZoomed.value = it },
                         isCurrentPage = pagerState.currentPage == idx,
                     )
                 }
@@ -990,72 +1035,29 @@ private fun ComicPagedReader(
         }
     }
 
-    /* ── 平移模式越界回弹（第 5 条 SLIDE 定义：真实位移 + 越界回弹）：
-          Initial pass 抢先消费边界拖动，整页橡胶带阻尼跟手，松手弹簧回正 ── */
-    val edgeBounce = remember { Animatable(0f) }
-    val bounceScope = rememberCoroutineScope()
-    val bounceModifier = if (isSlide && config.gestureSwipe) {
-        Modifier
-            .pointerInput(layout.spreadCount, ttb, rtl) {
-                val w = size.width.toFloat()
-                val h = size.height.toFloat()
-                val span = if (ttb) h else w
-                val slop = viewConfiguration.touchSlop
-                // reverseLayout（RTL）下首末页"外侧"方向与 LTR 镜像：d 归一化为
-                // "外侧拉拽为正"（sign 翻转），回弹平移再乘回 sign 保持跟手方向
-                val sign = if (rtl) -1f else 1f
-                awaitEachGesture {
-                    val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                    var total = 0f
-                    var active = false
-                    while (true) {
-                        val ev = awaitPointerEvent(PointerEventPass.Initial)
-                        val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
-                        if (!ch.pressed) break
-                        val d = (if (ttb) ch.positionChange().y else ch.positionChange().x) * sign
-                        val atStart = pagerState.currentPage == 0
-                        val atEnd = pagerState.currentPage >= layout.spreadCount - 1
-                        val beyond = (atStart && d > 0f) || (atEnd && d < 0f)
-                        if (!active && abs(total + d) > slop && beyond) active = true
-                        if (active) {
-                            total += d
-                            // c=0.55 渐近橡胶带（与磁吸模式同款曲线），首末页对称
-                            val page = pagerState.currentPage
-                            val damped = if (page <= 0 && total > 0f) {
-                                (1f - 1f / (total * 0.55f / span + 1f)) * (span / 0.55f)
-                            } else if (page >= layout.spreadCount - 1 && total < 0f) {
-                                -((1f - 1f / (-total * 0.55f / span + 1f)) * (span / 0.55f))
-                            } else total
-                            bounceScope.launch { edgeBounce.snapTo(damped * sign) }
-                            ch.consume()
-                        }
-                    }
-                    if (active) {
-                        bounceScope.launch {
-                            edgeBounce.animateTo(0f, spring(dampingRatio = 0.75f, stiffness = 380f))
-                        }
-                    }
-                }
-            }
-            .graphicsLayer {
-                if (edgeBounce.value != 0f) {
-                    if (ttb) translationY = edgeBounce.value else translationX = edgeBounce.value
-                }
-            }
-    } else Modifier
+    val chapterEdgeModifier = Modifier.comicChapterEdgeSwipe(
+        enabled = config.gestureSwipe,
+        direction = config.direction,
+        atStart = { pagerState.settledPage == 0 && !pagerState.isScrollInProgress },
+        atEnd = { pagerState.settledPage == layout.spreadCount - 1 && !pagerState.isScrollInProgress },
+        zoomed = { childZoomed.value },
+        bounce = isSlide,
+        onPrevious = goPrev,
+        onNext = goNext,
+    )
 
-    if (ttb && config.mode == ComicMode.SINGLE) {
+    if (ttb) {
         VerticalPager(
             state = pagerState,
             userScrollEnabled = config.gestureSwipe,
-            modifier = Modifier.fillMaxSize().then(bounceModifier),
+            modifier = Modifier.fillMaxSize().then(chapterEdgeModifier),
         ) { idx -> cell(idx) }
     } else {
         HorizontalPager(
             state = pagerState,
             reverseLayout = rtl,
             userScrollEnabled = config.gestureSwipe,
-            modifier = Modifier.fillMaxSize().then(bounceModifier),
+            modifier = Modifier.fillMaxSize().then(chapterEdgeModifier),
             beyondViewportPageCount = 1,
         ) { idx -> cell(idx) }
     }
@@ -1117,6 +1119,7 @@ private fun ComicMagneticPager(
     autoRead: Boolean,
     autoIntervalSec: Float,
     goNext: () -> Unit,
+    goPrev: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     val rtl = config.direction == ComicDirection.RTL
@@ -1153,6 +1156,16 @@ private fun ComicMagneticPager(
     Box(
         Modifier
             .fillMaxSize()
+            .comicChapterEdgeSwipe(
+                enabled = config.gestureSwipe,
+                direction = config.direction,
+                atStart = { latestCurrentSpread == 0 && !magDragActive.value },
+                atEnd = { latestCurrentSpread == layout.spreadCount - 1 && !magDragActive.value },
+                zoomed = { childZoomed.value },
+                bounce = true,
+                onPrevious = goPrev,
+                onNext = goNext,
+            )
             .pointerInput(layout.spreadCount, rtl, ttb) {
                 val w = size.width.toFloat()
                 val h = size.height.toFloat()
@@ -1196,6 +1209,7 @@ private fun ComicMagneticPager(
                             val damped = resumeBase + dampEdgeDrag(total, latestCurrentSpread, layout.spreadCount, span)
                             scope.launch { drag.snapTo(damped) }
                             change.consume()
+
                         }
                     }
                     if (dragging) {
@@ -1221,7 +1235,9 @@ private fun ComicMagneticPager(
                                 drag.snapTo(0f)
                                 onSpreadChanged(targetPage)
                                 // 第 6 节：磁吸吸附成功轻触觉
-                                hapticView.performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY)
+                                if (com.example.ui.feedback.HapticsGate.enabled) {
+                                    hapticView.performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY)
+                                }
                             }
                         }
                     } else if (magDragActive.value) {
@@ -1283,6 +1299,8 @@ private fun ComicVerticalList(
     translationModelState: com.example.mangatranslate.TranslateModelManager.DownloadState =
         com.example.mangatranslate.TranslateModelManager.DownloadState.NotDownloaded,
     onScheduleTranslation: (List<ComicPageLoader.WindowEntry>, ComicReaderConfig) -> Unit = { _, _ -> },
+    onPreviousChapter: () -> Unit,
+    onNextChapter: () -> Unit,
 ) {
     val listState = rememberLazyListState(initialFirstVisibleItemIndex = currentSpread)
     val density = LocalDensity.current
@@ -1332,6 +1350,7 @@ private fun ComicVerticalList(
                 entries.add(
                     ComicPageLoader.WindowEntry(
                         ref = slot.ref,
+                        visible = si == currentSpread,
                         cacheKey = "${slot.ref.id}|${slot.half}|${config.imagePipelineFingerprint()}|r$rot",
                         geo = ComicImagePipeline.Geometry(
                             half = slot.half,
@@ -1403,23 +1422,35 @@ private fun ComicVerticalList(
         )
     } else androidx.compose.foundation.gestures.ScrollableDefaults.flingBehavior()
 
-    LazyColumn(
-        state = listState,
-        modifier = Modifier
-            .fillMaxSize()
-            .onSizeChanged { onAreaSizeChanged(Size(it.width.toFloat(), it.height.toFloat())) }
-            .zoomableWithScroll(zoomState = zoomState, onTap = onTap),
-        verticalArrangement = Arrangement.spacedBy(strategy.spacingDp.dp),
-        flingBehavior = snapFling,
-    ) {
-        itemsIndexed(layout.spreads, key = { _, s -> "spread_${s.index}_${s.firstRawIndex}" }) { _, spread ->
-            ComicVerticalItem(
-                spread = spread, config = config, loader = loader, bookState = bookState,
-                // 主色喂入门控：仅"最可见项"（currentSpread 上报源）可喂，多可见项
-                // 并存时不允许后组合项覆盖当前页色调（第 25 条）
-                onBitmapShown = onBitmapShown,
-                isCurrentPage = spread.index == currentSpread,
-            )
+    val chapterEdge = Modifier.fillMaxSize().comicChapterEdgeSwipe(
+        enabled = config.gestureSwipe,
+        direction = ComicDirection.TTB,
+        atStart = { !listState.canScrollBackward && !listState.isScrollInProgress },
+        atEnd = { !listState.canScrollForward && !listState.isScrollInProgress },
+        zoomed = { zoomState.scale > 1.01f },
+        onPrevious = onPreviousChapter,
+        onNext = onNextChapter,
+    )
+
+    Box(modifier = chapterEdge) {
+        LazyColumn(
+            state = listState,
+            modifier = Modifier
+                .fillMaxSize()
+                .onSizeChanged { onAreaSizeChanged(Size(it.width.toFloat(), it.height.toFloat())) }
+                .zoomableWithScroll(zoomState = zoomState, onTap = onTap),
+            verticalArrangement = Arrangement.spacedBy(strategy.spacingDp.dp),
+            flingBehavior = snapFling,
+        ) {
+            itemsIndexed(layout.spreads, key = { _, s -> "spread_${s.index}_${s.firstRawIndex}" }) { _, spread ->
+                ComicVerticalItem(
+                    spread = spread, config = config, loader = loader, bookState = bookState,
+                    // 主色喂入门控：仅"最可见项"（currentSpread 上报源）可喂，多可见项
+                    // 并存时不允许后组合项覆盖当前页色调（第 25 条）
+                    onBitmapShown = onBitmapShown,
+                    isCurrentPage = spread.index == currentSpread,
+                )
+            }
         }
     }
 }
@@ -1438,22 +1469,17 @@ private fun ComicVerticalItem(
 ) {
     val slot = spread.slots.firstOrNull() ?: return
     var retry by remember(slot.ref.id) { mutableIntStateOf(0) }
-    val state by rememberPageBitmap(loader, slot, config, bookState, retry)
+    val state by rememberPageBitmap(loader, slot, config, bookState, retry, visible = isCurrentPage)
     // 位图状态按 cacheKey 键控：换页/换管线指纹时旧页位图立即失效——
     // 无 key 的 remember 会在 Loading 期间残留上一页画面（快速滚动闪错帧的根因）。
     // 第六轮族 A：初值同步取播种后的 state（缓存命中 ⇒ 第一帧即内容）。
-    var imageBitmap by remember(slot.ref.id, config.imagePipelineFingerprint()) {
-        mutableStateOf((state as? PageBitmapState.Ready)?.bitmap?.asImageBitmap())
-    }
+    val imageBitmap = (state as? PageBitmapState.Ready)?.bitmap?.asImageBitmap()
 
     // effect 键含 isCurrentPage：item 晋升为最可见项时位图早已 Ready 也会补喂主色
     LaunchedEffect(state, isCurrentPage) {
         if (state is PageBitmapState.Ready) {
             val bmp = (state as PageBitmapState.Ready).bitmap
-            imageBitmap = bmp.asImageBitmap()
             if (isCurrentPage) onBitmapShown(bmp)
-        } else if (state is PageBitmapState.Failed) {
-            imageBitmap = null
         }
     }
 
@@ -1469,10 +1495,7 @@ private fun ComicVerticalItem(
                 contentAlignment = Alignment.Center
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    com.example.ui.components.ChasingDots(
-                        size = 52.dp,
-                        color = androidx.compose.material3.MaterialTheme.colorScheme.secondary,
-                    )
+                    ComicLoadingFeedback(slot.ref) { retry++ }
                     enhanceHintFor(
                         config,
                         loader.sizes.value[slot.ref.id]?.let { maxOf(it.width, it.height) } ?: 2400,
@@ -1489,12 +1512,15 @@ private fun ComicVerticalItem(
             }
             is PageBitmapState.Ready -> {
                 imageBitmap?.let {
+                    Box(Modifier.fillMaxWidth()) {
                     androidx.compose.foundation.Image(
                         bitmap = it,
                         contentDescription = "第 ${spread.firstRawIndex + 1} 页",
                         modifier = Modifier.fillMaxWidth(),
                         contentScale = ContentScale.FillWidth
                     )
+                    ComicRefinementFeedback(s.refining, s.error, Modifier.align(Alignment.BottomCenter)) { retry++ }
+                    }
                 }
             }
         }
@@ -1684,23 +1710,14 @@ private fun SinglePageContent(
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val density = LocalDensity.current
         val container = Size(maxWidth.value * density.density, maxHeight.value * density.density)
-        val state by rememberPageBitmap(loader, slot, config, bookState, retry)
+        val state by rememberPageBitmap(loader, slot, config, bookState, retry, visible = isCurrentPage)
         // 位图/内禀尺寸按槽位身份键控：换页瞬间旧内容立即清空（Loading 占位），
         // 不允许旧页位图在新页解码期间残留覆盖——快速翻页闪错帧的根因。
         // 第六轮族 A：初值同步取自播种后的 state（缓存命中 ⇒ 第一帧即内容），
         // 不再等 LaunchedEffect 下一拍赋值（那一拍 = 闪烁帧）。
-        var imageBitmap by remember(slot.ref.id) {
-            mutableStateOf(
-                (state as? PageBitmapState.Ready)?.bitmap?.asImageBitmap()
-            )
-        }
-        var intrinsic by remember(slot.ref.id) {
-            mutableStateOf(
-                (state as? PageBitmapState.Ready)
-                    ?.let { Size(it.bitmap.width.toFloat(), it.bitmap.height.toFloat()) }
-                    ?: Size.Zero
-            )
-        }
+        val ready = state as? PageBitmapState.Ready
+        val imageBitmap = ready?.bitmap?.asImageBitmap()
+        val intrinsic = ready?.let { Size(it.bitmap.width.toFloat(), it.bitmap.height.toFloat()) } ?: Size.Zero
         val cacheKey = "${slot.ref.id}|${slot.half}|${config.imagePipelineFingerprint()}|" +
             "r${((config.bookRotation + (bookState.pageRotations[slot.ref.id] ?: 0)) % 360 + 360) % 360}"
 
@@ -1709,8 +1726,6 @@ private fun SinglePageContent(
         LaunchedEffect(state, isCurrentPage) {
             if (state is PageBitmapState.Ready) {
                 val bmp = (state as PageBitmapState.Ready).bitmap
-                imageBitmap = bmp.asImageBitmap()
-                intrinsic = Size(bmp.width.toFloat(), bmp.height.toFloat())
                 // 1:1 档基准用「原始文件像素」（loader.sizes 记录、未 capEdge）——
                 // cap 到 2800 的位图会让大扫描图的 1:1 档算出偏低值被丢弃，双击循环缺档
                 val rawSize = loader.sizes.value[slot.ref.id]
@@ -1813,7 +1828,9 @@ private fun SinglePageContent(
                     state,
                     { retry++ },
                     enhanceHintFor(config, loader.sizes.value[slot.ref.id]?.let { maxOf(it.width, it.height) } ?: 2400),
+                    slot.ref,
                 )
+                ComicRefinementFeedback(ready?.refining == true, ready?.error, Modifier.align(Alignment.BottomCenter)) { retry++ }
                 // 区域高清层：严格覆盖 hiResRect 对应的内容坐标区域（与底层同变换，天然对齐）
                 hiRes?.let { bmp ->
                     val sx = if (intrinsic.width > 0f) zoomState.contentSize.width / intrinsic.width else 1f
@@ -1861,8 +1878,8 @@ private fun DoubleSpreadContent(
         val shiftXPx = with(density) { config.doubleShiftXDp.dp.toPx() }
         val shiftYPx = with(density) { config.doubleShiftYDp.dp.toPx() }
 
-        val state0 by rememberPageBitmap(loader, spread.slots[0], config, bookState, retry)
-        val state1 by rememberPageBitmap(loader, spread.slots.getOrNull(1) ?: spread.slots[0], config, bookState, retry)
+        val state0 by rememberPageBitmap(loader, spread.slots[0], config, bookState, retry, visible = isCurrentPage)
+        val state1 by rememberPageBitmap(loader, spread.slots.getOrNull(1) ?: spread.slots[0], config, bookState, retry, visible = isCurrentPage)
         val ready0 = state0 as? PageBitmapState.Ready
         val ready1 = state1 as? PageBitmapState.Ready
         val failed0 = state0 as? PageBitmapState.Failed
@@ -1955,10 +1972,7 @@ private fun DoubleSpreadContent(
                         contentAlignment = Alignment.Center
                     ) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            com.example.ui.components.ChasingDots(
-                                size = 52.dp,
-                                color = androidx.compose.material3.MaterialTheme.colorScheme.secondary,
-                            )
+                            ComicLoadingFeedback(slot.ref) { retry++ }
                             enhanceHintFor(
                                 config,
                                 loader.sizes.value[slot.ref.id]?.let { maxOf(it.width, it.height) } ?: 2400,
@@ -1968,6 +1982,17 @@ private fun DoubleSpreadContent(
                 }
             }
         }
+        ComicRefinementFeedback(ready0?.refining == true || ready1?.refining == true,
+            ready0?.error ?: ready1?.error, Modifier.align(Alignment.BottomCenter)) { retry++ }
+    }
+}
+
+@Composable
+internal fun ComicRefinementFeedback(refining: Boolean, error: Throwable?, modifier: Modifier = Modifier, onRetry: () -> Unit) {
+    if (!refining && error == null) return
+    Column(modifier.background(Color(0x99000000)).padding(8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        if (error == null) Text("高清图加载中…", color = Color.White, fontSize = 12.sp)
+        else TextButton(onClick = onRetry) { Text("高清图加载失败 · 重试", color = Color.White) }
     }
 }
 
@@ -2012,7 +2037,7 @@ internal fun ZoomableImageLayer(
 }
 
 @Composable
-private fun PagePlaceholder(state: PageBitmapState, onRetry: () -> Unit, enhanceHint: String? = null) {
+private fun PagePlaceholder(state: PageBitmapState, onRetry: () -> Unit, enhanceHint: String? = null, ref: ComicPageRef? = null) {
     when (state) {
         is PageBitmapState.Loading -> Box(
             Modifier.fillMaxSize(),
@@ -2022,10 +2047,7 @@ private fun PagePlaceholder(state: PageBitmapState, onRetry: () -> Unit, enhance
                 // 第七轮第 1 条子问题 C：统一加载指示——原样复用书库搜索的
                 // ChasingDots 组件（同一 Composable、同一套动画曲线与配色参数），
                 // 保持全 App 加载态视觉语言一致，不使用系统默认转圈圈
-                com.example.ui.components.ChasingDots(
-                    size = 52.dp,
-                    color = androidx.compose.material3.MaterialTheme.colorScheme.secondary,
-                )
+                ComicLoadingFeedback(ref, onRetry)
                 // 第六轮第 5 条：增强引擎开启时的耗时预期提示——用户可区分
                 // "AI 处理中（有明确预期）"与"卡死"
                 enhanceHint?.let {
@@ -2042,6 +2064,34 @@ private fun PagePlaceholder(state: PageBitmapState, onRetry: () -> Unit, enhance
             TextButton(onClick = onRetry) { Text("点击重试", color = Color.White.copy(alpha = 0.8f)) }
         }
         is PageBitmapState.Ready -> Unit
+    }
+}
+
+/** Real byte progress; unknown response length remains indeterminate. */
+@Composable
+internal fun ComicLoadingFeedback(ref: ComicPageRef?, onRetry: (() -> Unit)? = null) {
+    var elapsed by remember(ref?.id) { mutableIntStateOf(0) }
+    LaunchedEffect(ref?.id) { while (true) { delay(1000); elapsed++ } }
+    val transfer = if (ref is ComicPageRef.Remote) {
+        val flow = remember(ref.url) { ComicTransfers.state(ref.url) }
+        val progress by flow.collectAsStateWithLifecycle()
+        progress
+    } else null
+    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        com.example.ui.components.ChasingDots(size = 40.dp, color = androidx.compose.material3.MaterialTheme.colorScheme.secondary)
+        val fraction = transfer?.fraction
+        if (fraction != null && fraction < 1f) LinearProgressIndicator(progress = { fraction }, modifier = Modifier.width(144.dp))
+        val label = when {
+            fraction == 1f -> "正在展开页面…"
+            fraction != null -> "正在加载 · ${(fraction * 100).toInt()}%"
+            (transfer?.bytes ?: 0) > 0 -> "已接收 ${transfer!!.bytes / 1024} KB"
+            elapsed >= 5 -> "连接较慢，正在加载…"
+            else -> "正在加载页面…"
+        }
+        Text(label, color = Color(0xBBFFFFFF), fontSize = 12.sp)
+        if (elapsed >= 8 && onRetry != null) TextButton(onClick = onRetry) {
+            Text("重新加载", color = Color.White)
+        }
     }
 }
 

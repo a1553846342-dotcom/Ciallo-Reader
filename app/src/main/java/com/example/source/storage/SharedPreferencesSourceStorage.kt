@@ -5,6 +5,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 class SharedPreferencesSourceStorage(context: Context) : SourceStorage {
+    private val directory = java.io.File(context.filesDir, "source_configs").apply { mkdirs() }
     private val prefs = context.getSharedPreferences("book_sources_config", Context.MODE_PRIVATE)
 
     override suspend fun saveSourceState(sourceId: String, enabled: Boolean) = withContext(Dispatchers.IO) {
@@ -32,24 +33,53 @@ class SharedPreferencesSourceStorage(context: Context) : SourceStorage {
         prefs.getString("active_source_id", null)
     }
 
+    private fun configFile(id: String): java.io.File {
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(id.toByteArray())
+        return java.io.File(directory, digest.joinToString("") { "%02x".format(it) } + ".json")
+    }
+
     override suspend fun saveCustomSourceJson(sourceId: String, jsonContent: String) = withContext(Dispatchers.IO) {
-        prefs.edit().putString("custom_source_json_$sourceId", jsonContent).commit()
-        Unit
+        synchronized(storageLock) {
+            require(jsonContent.toByteArray().size <= 2 * 1024 * 1024) { "书源配置超过 2MiB" }
+            val atomic = android.util.AtomicFile(configFile(sourceId))
+            val out = atomic.startWrite()
+            try { out.write(jsonContent.toByteArray(Charsets.UTF_8)); atomic.finishWrite(out) }
+            catch (e: Exception) { atomic.failWrite(out); throw e }
+            val ids = prefs.getStringSet("custom_source_ids", emptySet()).orEmpty() + sourceId
+            check(prefs.edit().putStringSet("custom_source_ids", ids).remove("custom_source_json_$sourceId").commit())
+        }
     }
 
     override suspend fun getCustomSourceJsons(): Map<String, String> = withContext(Dispatchers.IO) {
-        val result = mutableMapOf<String, String>()
-        prefs.all.forEach { (key, value) ->
-            if (key.startsWith("custom_source_json_") && value is String) {
-                val sourceId = key.removePrefix("custom_source_json_")
-                result[sourceId] = value
+        synchronized(storageLock) {
+            val ids = prefs.getStringSet("custom_source_ids", emptySet()).orEmpty().toMutableSet()
+            val editor = prefs.edit()
+            prefs.all.forEach { (key, value) ->
+                if (key.startsWith("custom_source_json_") && value is String) {
+                    val id = key.removePrefix("custom_source_json_")
+                    require(value.toByteArray().size <= 2 * 1024 * 1024) { "书源配置超过 2MiB" }
+                    val atomic = android.util.AtomicFile(configFile(id))
+                    val out = atomic.startWrite()
+                    try { out.write(value.toByteArray(Charsets.UTF_8)); atomic.finishWrite(out) }
+                    catch (e: Exception) { atomic.failWrite(out); throw e }
+                    ids.add(id); editor.remove(key)
+                }
             }
+            check(editor.putStringSet("custom_source_ids", ids).commit())
+            ids.mapNotNull { id ->
+                val f = configFile(id)
+                if (f.isFile && f.length() <= 2 * 1024 * 1024) id to android.util.AtomicFile(f).openRead().bufferedReader().use { it.readText() } else null
+            }.toMap()
         }
-        result
     }
 
     override suspend fun removeCustomSourceJson(sourceId: String) = withContext(Dispatchers.IO) {
-        prefs.edit().remove("custom_source_json_$sourceId").remove("source_enabled_$sourceId").commit()
-        Unit
+        synchronized(storageLock) {
+            check(prefs.edit().putStringSet("custom_source_ids", prefs.getStringSet("custom_source_ids", emptySet()).orEmpty() - sourceId)
+                .remove("custom_source_json_$sourceId").remove("source_enabled_$sourceId").commit())
+            android.util.AtomicFile(configFile(sourceId)).delete()
+        }
     }
+
+    companion object { private val storageLock = Any() }
 }

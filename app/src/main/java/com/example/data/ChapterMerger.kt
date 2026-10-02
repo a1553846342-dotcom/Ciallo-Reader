@@ -35,6 +35,7 @@ object ChapterMerger {
         CONTINUATION_TITLE.matchEntire(title.trim())?.groupValues?.get(1) ?: title
 
     fun buildLogicalChapters(physical: List<Chapter>): LogicalChapterBook {
+        val byOrder = physical.associateBy { it.chapterOrder }
         val maxOrder = physical.maxOfOrNull { it.chapterOrder } ?: -1
         val physToLog = IntArray(maxOrder + 1) { it }
         val physOffset = IntArray(maxOrder + 1)
@@ -47,8 +48,8 @@ object ChapterMerger {
 
         fun flush() {
             if (parts.isEmpty()) return
-            val first = physical.first { it.chapterOrder == parts.first() }
-            val last = physical.first { it.chapterOrder == parts.last() }
+            val first = byOrder.getValue(parts.first())
+            val last = byOrder.getValue(parts.last())
             logical.add(
                 Chapter(
                     bookId = first.bookId,
@@ -68,7 +69,7 @@ object ChapterMerger {
         for (ch in physical) {
             val order = ch.chapterOrder
             val m = CONTINUATION_TITLE.matchEntire(ch.title.trim())
-            val isContinuation = m != null && baseTitle == m.groupValues[1] && parts.isNotEmpty()
+            val isContinuation = m != null && baseTitle == m.groupValues[1] && parts.isNotEmpty() && parts.size < 4
             if (isContinuation) {
                 physOffset[order] = buffer.length
                 buffer.append(ch.content)
@@ -76,7 +77,7 @@ object ChapterMerger {
                 physToLog[order] = logical.size
             } else {
                 flush()
-                baseTitle = ch.title.trim()
+                baseTitle = cleanSplitTitle(ch.title.trim())
                 buffer.append(ch.content)
                 parts.add(order)
                 physOffset[order] = 0

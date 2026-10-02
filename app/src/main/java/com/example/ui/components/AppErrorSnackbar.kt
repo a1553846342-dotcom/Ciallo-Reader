@@ -124,7 +124,7 @@ fun AppErrorSnackbar(
                 TextButton(
                     onClick = {
                         clipboardManager.setText(AnnotatedString(message))
-                        Toast.makeText(context, "错误日志已复制到剪贴板", Toast.LENGTH_SHORT).show()
+                        AppToast.makeText(context, "错误日志已复制到剪贴板", Toast.LENGTH_SHORT).show()
                         onActionClick?.invoke()
                     },
                     contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),

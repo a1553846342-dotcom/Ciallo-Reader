@@ -25,7 +25,7 @@ object ZLibraryCoverLoader {
     }
 
     private fun buildLoader(context: Context): ImageLoader {
-        val clientBuilder = OkHttpClient.Builder()
+        val clientBuilder = com.example.source.SharedHttpTransport.builder()
             .dns(ZLibraryDns.INSTANCE)
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(15, TimeUnit.SECONDS)

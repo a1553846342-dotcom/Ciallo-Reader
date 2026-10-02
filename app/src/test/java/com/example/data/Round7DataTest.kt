@@ -287,7 +287,7 @@ class Round7DataTest {
 
     @Test
     fun repository_defaultCategoryGuard() = runBlocking {
-        val repo = BookRepository(ctx, db.bookDao())
+        val repo = BookRepository(ctx, db.bookDao(), db)
         repo.ensureDefaultCategory()
         repo.ensureDefaultCategory() // 幂等
         val def = db.bookDao().getCategoryByName(DEFAULT_CATEGORY)

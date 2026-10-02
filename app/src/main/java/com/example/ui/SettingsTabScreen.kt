@@ -56,7 +56,7 @@ import com.example.ui.components.AppButtonSize
 import com.example.ui.components.scrollTiltSource
 import com.example.ui.components.AppButtonVariant
 import com.example.ui.components.TabScreenHeader
-import com.example.ui.components.rememberHeaderCollapsed
+import com.example.ui.components.rememberHeaderCollapsedSource
 import com.example.ui.components.ColorMorphSwatch
 import com.example.ui.components.AppLiquidButton
 import com.example.ui.components.SegmentedPillSelector
@@ -75,8 +75,10 @@ import com.example.ui.theme.onColor
 import com.example.ui.theme.glassTitleColor
 import com.example.ui.help.LibraryHelpBottomSheet
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.ensureActive
 import androidx.compose.foundation.layout.widthIn
 import com.example.ui.adaptive.AdaptiveSpec
+import com.example.ui.components.AppToast
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -100,16 +102,23 @@ fun SettingsTabScreen(
     onAdultSourcesChange: (Boolean) -> Unit = {},
     orientationLockVal: Int = prefs.screenOrientationLock,
     onOrientationLockChange: (Int) -> Unit = { prefs.screenOrientationLock = it },
+    hapticsEnabledVal: Boolean = prefs.hapticsEnabled,
+    onHapticsChange: (Boolean) -> Unit = { prefs.hapticsEnabled = it },
     renderQualityVal: Int = prefs.renderQuality,
     onRenderQualityChange: (Int) -> Unit = { prefs.renderQuality = it },
     /** 卡片微调共享状态：由 MainActivity 持有并注入 LocalCardTweaks；滑块实时改写。 */
     cardTweaksState: MutableState<com.example.ui.components.CardTweaks>? = null,
+    /* ── 神回（GodMoment）设置分组 ── */
+    godSettings: com.example.god.GodMomentSettingsStore? = null,
+    onOpenGodRanking: (() -> Unit)? = null,
+    /** true = 从排行榜陈列方式按钮跳入：打开后动画滚动到神回设置分区 */
+    focusGodSettings: Boolean = false,
     /* ── 隐私模式（第七轮第 6.4 条）：全部带默认值，未接线时不出现该能力 ── */
     privacyModeEnabled: Boolean = false,
-    onEnablePrivacyMode: (String) -> Boolean = { false },
-    onDisablePrivacyMode: (String) -> Boolean = { false },
-    onVerifyPrivacyPin: (String) -> Boolean = { false },
-    onChangePrivacyPin: (String, String) -> Boolean = { _, _ -> false },
+    onEnablePrivacyMode: suspend (String) -> Boolean = { false },
+    onDisablePrivacyMode: suspend (String) -> Boolean = { false },
+    onVerifyPrivacyPin: suspend (String) -> Boolean = { false },
+    onChangePrivacyPin: suspend (String, String) -> Boolean = { _, _ -> false },
     onToggleCategoryProtected: (CategoryEntity, Boolean) -> Unit = { _, _ -> },
     /* ── 第九轮：全局无痕浏览开关（在线/不受保护分类的阅读也可不计统计） ── */
     incognitoBrowsingEnabled: Boolean = false,
@@ -120,6 +129,64 @@ fun SettingsTabScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    var backupBusy by remember { mutableStateOf(false) }
+    var restoreUri by remember { mutableStateOf<Uri?>(null) }
+    val exportBackupLauncher=rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        if(uri!=null && !backupBusy) scope.launch {
+            backupBusy=true
+            val temp=java.io.File(context.cacheDir,"backup_${java.util.UUID.randomUUID()}.zip")
+            try {
+                backupManager.exportBackupArchive(temp)
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    context.contentResolver.openOutputStream(uri)?.use { out -> temp.inputStream().use { it.copyTo(out,64*1024) } }
+                        ?: error("无法写入选择的位置")
+                }
+                AppToast.makeText(context,"备份已保存",Toast.LENGTH_SHORT).show()
+            } catch(e:Exception) {
+                if(e is kotlinx.coroutines.CancellationException) throw e
+                AppToast.makeText(context,"备份失败：${e.message}",Toast.LENGTH_LONG).show()
+            } finally { temp.delete(); backupBusy=false }
+        }
+    }
+    val importBackupLauncher=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if(uri!=null && !backupBusy) restoreUri=uri
+    }
+    if(restoreUri!=null) AlertDialog(
+        onDismissRequest={ if(!backupBusy) restoreUri=null },
+        title={ Text("恢复备份") },
+        text={ Text("恢复将替换当前书架、标注、收藏和阅读记录，暂停正在下载的任务，并重新打开应用。") },
+        confirmButton={ TextButton(enabled=!backupBusy,onClick={
+            val uri=restoreUri ?: return@TextButton
+            scope.launch {
+                backupBusy=true
+                val temp=java.io.File(context.cacheDir,"restore_${java.util.UUID.randomUUID()}.zip")
+                try {
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        context.contentResolver.openInputStream(uri)?.use { input -> temp.outputStream().use { output ->
+                            val buffer=ByteArray(64*1024); var total=0L
+                            while(true) {
+                                val read=input.read(buffer); if(read<0) break
+                                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                                total+=read; require(total<=4L*1024*1024*1024) { "备份文件过大" }
+                                output.write(buffer,0,read)
+                            }
+                        } } ?: error("无法打开备份")
+                    }
+                    check(backupManager.restoreBackupArchive(temp)) { "备份恢复失败" }
+                    restoreUri=null
+                    AppToast.makeText(context,"恢复完成",Toast.LENGTH_SHORT).show()
+                    context.packageManager.getLaunchIntentForPackage(context.packageName)?.let {
+                        it.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK)
+                        context.startActivity(it)
+                    }
+                } catch(e:Exception) {
+                    if(e is kotlinx.coroutines.CancellationException) throw e
+                    AppToast.makeText(context,"恢复失败：${e.message}",Toast.LENGTH_LONG).show()
+                } finally { temp.delete(); backupBusy=false }
+            }
+        }) { Text(if(backupBusy) "正在恢复…" else "恢复并重新打开") } },
+        dismissButton={ TextButton(enabled=!backupBusy,onClick={ restoreUri=null }) { Text("取消") } },
+    )
 
     var restReminderMinutes by remember { mutableStateOf(prefs.restReminderMinutes) }
     var showCustomMinutes by remember { mutableStateOf(false) }
@@ -190,9 +257,9 @@ fun SettingsTabScreen(
                 val localUriStr = Uri.fromFile(file).toString()
                 splashPosterUri = localUriStr
                 prefs.customSplashPosterUri = localUriStr
-                Toast.makeText(context, "海报已设置", Toast.LENGTH_SHORT).show()
+                AppToast.makeText(context, "海报已设置", Toast.LENGTH_SHORT).show()
             } catch (e: Exception) {
-                Toast.makeText(context, "图片设置失败", Toast.LENGTH_SHORT).show()
+                AppToast.makeText(context, "图片设置失败", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -224,9 +291,9 @@ fun SettingsTabScreen(
                 prefs.appBackgroundMode = 1
                 appBgMode = 1
                 AppBackgroundController.update(1, localUriStr, appBgDim)
-                Toast.makeText(context, "背景已设置（横竖屏自动裁剪填充）", Toast.LENGTH_SHORT).show()
+                AppToast.makeText(context, "背景已设置（横竖屏自动裁剪填充）", Toast.LENGTH_SHORT).show()
             } catch (e: Exception) {
-                Toast.makeText(context, "背景设置失败", Toast.LENGTH_SHORT).show()
+                AppToast.makeText(context, "背景设置失败", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -241,8 +308,17 @@ fun SettingsTabScreen(
     ) {
     // 滚动联动折叠头部：state 提前声明供 topBar 与列表共用
     val settingsListState = rememberLazyListState()
+
+    // 排行榜「陈列方式」按钮跳入：动画滚动到神回设置分区。
+    // 神回 item 下标 = 前 14 个固定 item + 条件显示的成人源卡片（1/0）。
+    // ⚠️ 在神回分区之前增删设置项时，同步更新这里的固定计数。
+    LaunchedEffect(focusGodSettings) {
+        if (!focusGodSettings) return@LaunchedEffect
+        val godIndex = 14 + if (showAdultSourceCard) 1 else 0
+        settingsListState.animateScrollToItem(godIndex)
+    }
     settingsListState.scrollTiltSource()
-    val settingsHeaderCollapsed = rememberHeaderCollapsed(settingsListState)
+    val settingsHeaderCollapsedSource = rememberHeaderCollapsedSource(settingsListState)
     val backAction = onBack
     val settingsLeading: (@Composable androidx.compose.foundation.layout.RowScope.() -> Unit)? =
         if (backAction != null) {
@@ -260,7 +336,7 @@ fun SettingsTabScreen(
             containerColor = Color.Transparent,
             topBar = {
                 TabScreenHeader(
-                    collapsed = settingsHeaderCollapsed,
+                    collapsedSource = settingsHeaderCollapsedSource,
                     modifier = Modifier.statusBarsPadding(),
                     title = "设置",
                     subtitle = "SETTINGS & PREFERENCES",
@@ -307,7 +383,7 @@ LazyColumn(
                                             onClick = {
                                                 splashPosterUri = null
                                                 prefs.customSplashPosterUri = null
-                                                Toast.makeText(context, "已还原默认海报", Toast.LENGTH_SHORT).show()
+                                                AppToast.makeText(context, "已还原默认海报", Toast.LENGTH_SHORT).show()
                                             },
                                             modifier = Modifier.padding(end = 4.dp)
                                         ) {
@@ -492,7 +568,7 @@ LazyColumn(
                                                 prefs.appBackgroundMode = 0
                                                 appBgMode = 0
                                                 AppBackgroundController.update(0, null, appBgDim)
-                                                Toast.makeText(context, "已恢复默认背景", Toast.LENGTH_SHORT).show()
+                                                AppToast.makeText(context, "已恢复默认背景", Toast.LENGTH_SHORT).show()
                                             },
                                             variant = AppButtonVariant.Secondary,
                                             buttonSize = AppButtonSize.Small,
@@ -648,7 +724,7 @@ LazyColumn(
                                             showAdultSources = it
                                             prefs.showAdultSources = it
                                             onAdultSourcesChange(it)
-                                            Toast.makeText(context, if (it) "正在更新成人源…" else "成人源已隐藏", Toast.LENGTH_SHORT).show()
+                                            AppToast.makeText(context, if (it) "正在更新成人源…" else "成人源已隐藏", Toast.LENGTH_SHORT).show()
                                         }
                                     )
                                 }
@@ -724,6 +800,44 @@ LazyColumn(
                     }
                 }
 
+                // Section 2.55: 触控反馈（触觉）总开关
+                // 此前 LocalHapticsEnabled 在 MainActivity 里恒为 true，设置页根本没有这个入口：
+                // 马达坏了 / 开会不想震动 / 省电的用户只能去系统层关触感，或者改代码。
+                item {
+                    GlassCard(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp)
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Icon(Icons.Filled.Vibration, contentDescription = null, tint = MintPrimary)
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Column {
+                                        Text("触控反馈", fontWeight = FontWeight.SemiBold)
+                                        Text(
+                                            "点按与滑动时的震动确认",
+                                            fontSize = 11.sp,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                                AppSwitch(
+                                    checked = hapticsEnabledVal,
+                                    onCheckedChange = { onHapticsChange(it) }
+                                )
+                            }
+                        }
+                    }
+                }
+
                 // Section 2.6: 卡片视觉微调（自定义卡片参数折叠栏）
                 item {
                     GlassCard(
@@ -768,7 +882,7 @@ LazyColumn(
                                     ) {
                                         TextButton(onClick = {
                                             updateCardTweaks { com.example.ui.components.CardTweaks() }
-                                            Toast.makeText(context, "已恢复默认卡片参数", Toast.LENGTH_SHORT).show()
+                                            AppToast.makeText(context, "已恢复默认卡片参数", Toast.LENGTH_SHORT).show()
                                         }) {
                                             Text("重置默认", color = MintPrimary, fontWeight = FontWeight.Bold)
                                         }
@@ -867,6 +981,17 @@ LazyColumn(
                                 )
                             }
                         }
+                    }
+                }
+
+                // 神回（GodMoment）设置分组
+                // ⚠️ key 固定为 "god_settings"；focusGodSettings 滚动定位依赖它排查。
+                if (godSettings != null) {
+                    item(key = "god_settings") {
+                        com.example.god.GodSettingsSection(
+                            store = godSettings,
+                            onOpenRanking = onOpenGodRanking,
+                        )
                     }
                 }
 
@@ -1148,6 +1273,22 @@ LazyColumn(
                     }
                 }
 
+                item(key="user_backup") {
+                    SettingsSectionHeader("数据备份")
+                    GlassCard(modifier=Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(com.example.ui.design.DesignTokens.SpaceLg),verticalArrangement=Arrangement.spacedBy(com.example.ui.design.DesignTokens.SpaceMd)) {
+                            Text("备份书籍、原文件、标注、收藏、阅读记录与设置。登录凭据不包含在备份中。")
+                            Row(horizontalArrangement=Arrangement.spacedBy(com.example.ui.design.DesignTokens.SpaceMd)) {
+                                AppActionButton(text=if(backupBusy) "正在处理…" else "导出备份",enabled=!backupBusy,
+                                    onClick={ exportBackupLauncher.launch("Ciallo-backup.zip") },buttonSize=AppButtonSize.Small)
+                                AppActionButton(text="恢复备份",enabled=!backupBusy,
+                                    onClick={ importBackupLauncher.launch(arrayOf("application/zip","application/octet-stream")) },
+                                    variant=AppButtonVariant.Secondary,buttonSize=AppButtonSize.Small)
+                            }
+                        }
+                    }
+                }
+
                 // Section 7: Library Help & Manual
                 item {
                     SettingsSectionHeader("帮助手册")
@@ -1221,6 +1362,29 @@ LazyColumn(
                                 fontSize = 11.sp,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
                             )
+                            Spacer(Modifier.height(14.dp))
+                            val githubUriHandler = androidx.compose.ui.platform.LocalUriHandler.current
+                            Surface(
+                                shape = RoundedCornerShape(50),
+                                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.09f),
+                            ) {
+                                Row(
+                                    modifier = Modifier.clickable {
+                                        runCatching { githubUriHandler.openUri("https://github.com/a1553846342-dotcom/EASYREADER") }
+                                            .onFailure { AppToast.makeText(context, "暂时打不开 GitHub，稍后再来喵～", Toast.LENGTH_SHORT).show() }
+                                    }.padding(horizontal = 16.dp, vertical = 11.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(7.dp),
+                                ) {
+                                    Icon(Icons.Filled.Star, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(16.dp))
+                                    Text("狗修金，给颗 Star 好不好喵～", fontSize = 12.sp,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline)
+                                }
+                            }
+                            Spacer(Modifier.height(5.dp))
+                            Text("点这里，去 GitHub 摸摸小项目 ฅ^•ﻌ•^ฅ", fontSize = 10.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
                 }
@@ -1275,7 +1439,7 @@ LazyColumn(
                                 onAddCategory(newCategoryText.trim())
                                 newCategoryText = ""
                                 showAddCategoryDialog = false
-                                Toast.makeText(context, "新建成功", Toast.LENGTH_SHORT).show()
+                                AppToast.makeText(context, "新建成功", Toast.LENGTH_SHORT).show()
                             }
                         },
                         variant = AppButtonVariant.Primary,
@@ -1342,7 +1506,7 @@ LazyColumn(
             onPinSet = { newPin ->
                 if (onChangePrivacyPin(changePinOld, newPin)) {
                     showChangePin = false
-                    Toast.makeText(context, "密码已更新", Toast.LENGTH_SHORT).show()
+                    AppToast.makeText(context, "密码已更新", Toast.LENGTH_SHORT).show()
                 }
             },
             onPinVerified = { pin ->
@@ -1383,7 +1547,7 @@ LazyColumn(
                 if (ok) {
                     showDisableVerify = false
                     showManageWindow = false
-                    Toast.makeText(context, "隐私模式已关闭", Toast.LENGTH_SHORT).show()
+                    AppToast.makeText(context, "隐私模式已关闭", Toast.LENGTH_SHORT).show()
                 }
                 ok
             },

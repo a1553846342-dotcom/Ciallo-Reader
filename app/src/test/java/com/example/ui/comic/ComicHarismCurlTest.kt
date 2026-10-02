@@ -10,7 +10,7 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 
 /**
- * harism 整合层纯逻辑单测：索引映射（RTL 倒序 / LTR 恒等）、缓存键稳定性
+ * harism 整合层纯逻辑单测：索引映射（逻辑页码恒等，RTL 镜像几何）、缓存键稳定性
  * （含单页旋转——"旋转本页后 CURL 页空白"回归防线）、背景色映射、
  * 外部跳转同步策略（第 1/15/22 条）与同页变体回退缓存。
  */
@@ -20,11 +20,11 @@ import org.robolectric.annotation.GraphicsMode
 class ComicHarismCurlTest {
 
     @Test
-    fun `RTL 倒序映射往返一致且首末对调`() {
+    fun `RTL 逻辑页码往返一致且保持首末顺序`() {
         val n = 6
-        // our 0（第一页）↔ harism 5（末位）；our 5 ↔ harism 0
-        assertEquals(5, harismIndexFor(0, n, reversed = true))
-        assertEquals(0, harismIndexFor(5, n, reversed = true))
+        // 逻辑索引不反转；物理侧由 renderer 镜像。
+        assertEquals(0, harismIndexFor(0, n, reversed = true))
+        assertEquals(5, harismIndexFor(5, n, reversed = true))
         // 往返一致
         for (our in 0 until n) {
             assertEquals(our, ourIndexFor(harismIndexFor(our, n, true), n, true))
@@ -41,12 +41,12 @@ class ComicHarismCurlTest {
     }
 
     @Test
-    fun `RTL 前进等价 harism 索引递减`() {
+    fun `RTL 前进同样递增逻辑页码`() {
         val n = 6
         val our = 2
         val h = harismIndexFor(our, n, reversed = true)
-        // 前进（our+1）对应 harism CURL_LEFT 落定后的 --mCurrentIndex
-        assertEquals(h - 1, harismIndexFor(our + 1, n, reversed = true))
+        // 两种方向前进均使用逻辑 CURL_RIGHT，落定后 ++mCurrentIndex。
+        assertEquals(h + 1, harismIndexFor(our + 1, n, reversed = true))
     }
 
     @Test
@@ -159,14 +159,14 @@ class ComicHarismCurlTest {
         // 13 页双页 → 14 扁平单元（末 spread 单槽补 null）：
         // flat = [p0,p1,...,p11,p12,null]
         // RTL spread0 → harism 13 → 必须译到 flat[0]=p0（旧实现直接取 flat[13]=null → 黑屏）
-        assertEquals(0, flatUnitIndexFor(13, 14, reversed = true))
-        assertEquals(1, flatUnitIndexFor(12, 14, reversed = true))
-        assertEquals(13, flatUnitIndexFor(0, 14, reversed = true))
+        assertEquals(13, flatUnitIndexFor(13, 14, reversed = true))
+        assertEquals(12, flatUnitIndexFor(12, 14, reversed = true))
+        assertEquals(0, flatUnitIndexFor(0, 14, reversed = true))
         // LTR 恒等
         assertEquals(13, flatUnitIndexFor(13, 14, reversed = false))
         assertEquals(0, flatUnitIndexFor(0, 14, reversed = false))
         // 与 spreadToHarismTwo 往返一致：spread0(RTL) 的右页 h=13 ↦ flat[0]
         val h = spreadToHarismTwo(0, 14, reversed = true)
-        assertEquals(0, flatUnitIndexFor(h, 14, reversed = true))
+        assertEquals(1, flatUnitIndexFor(h, 14, reversed = true))
     }
 }

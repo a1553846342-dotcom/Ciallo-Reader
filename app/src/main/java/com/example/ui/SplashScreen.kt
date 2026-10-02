@@ -110,7 +110,8 @@ fun SplashScreen(
                 targetValue = 1.0f,
                 animationSpec = tween(durationMillis = 400)
             )
-            delay(1800)
+            // 开屏海报最长停留 900ms（可点击随时跳过），降低冷启动感知等待
+            delay(900)
             alpha.animateTo(
                 targetValue = 0f,
                 animationSpec = tween(durationMillis = 350)

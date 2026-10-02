@@ -104,6 +104,15 @@ class PreferencesManager(context: Context) {
         get() = prefs.getBoolean("keep_screen_on", true)
         set(value) = prefs.edit().putBoolean("keep_screen_on", value).apply()
 
+    /**
+     * 触控反馈（触觉）总开关。此前 LocalHapticsEnabled 在 MainActivity 里被硬编码为 true，
+     * 设置项不存在 → 用户想关马达没有任何入口。开启后同时约束两条通路：
+     * Compose 的 LocalHapticFeedback（波纹/滑块/底栏等）与 AppHaptics 的语义化震动。
+     */
+    var hapticsEnabled: Boolean
+        get() = prefs.getBoolean("haptics_enabled", true)
+        set(value) = prefs.edit().putBoolean("haptics_enabled", value).apply()
+
     var ttsSpeed: Float
         get() = prefs.getFloat("tts_speed", 1.0f)
         set(value) = prefs.edit().putFloat("tts_speed", value).apply()
@@ -115,6 +124,17 @@ class PreferencesManager(context: Context) {
     var totalReadTimeSeconds: Long
         get() = prefs.getLong("total_read_time_seconds", 0L)
         set(value) = prefs.edit().putLong("total_read_time_seconds", value).apply()
+
+    internal var readingTotalsReconciled: Boolean
+        get() = prefs.getBoolean("reading_totals_reconciled_v1", false)
+        set(value) { check(prefs.edit().putBoolean("reading_totals_reconciled_v1", value).commit()) }
+    internal var legacyUnattributedSeconds: Long
+        get() = prefs.getLong("legacy_unattributed_read_seconds", 0L).coerceAtLeast(0)
+        set(value) { check(prefs.edit().putLong("legacy_unattributed_read_seconds", value.coerceAtLeast(0)).commit()) }
+    internal fun legacyDailyTotals(): Map<String,Long> = prefs.all.mapNotNull { (key,value) ->
+        val date=key.removePrefix("daily_read_time_")
+        if(key.startsWith("daily_read_time_") && Regex("\\d{4}-\\d{2}-\\d{2}").matches(date) && value is Long && value>0) date to value else null
+    }.toMap()
 
     fun getDailyReadTime(dateStr: String): Long {
         return prefs.getLong("daily_read_time_$dateStr", 0L)

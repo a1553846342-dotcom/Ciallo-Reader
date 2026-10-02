@@ -96,6 +96,7 @@ import androidx.compose.foundation.shape.CircleShape
 
 import androidx.compose.foundation.shape.RoundedCornerShape
 
+import androidx.compose.foundation.text.BasicText
 import androidx.compose.foundation.text.selection.SelectionContainer
 
 import androidx.compose.foundation.verticalScroll
@@ -176,6 +177,18 @@ import androidx.compose.ui.unit.sp
 import com.example.data.*
 
 import com.example.ui.pageturn.PageCurlReaderContainer
+import com.example.ui.reader.NovelImageFullscreenViewer
+import com.example.ui.reader.NovelInlineImage
+import com.example.ui.reader.NovelInlineImages
+import com.example.ui.reader.buildAnnotatedWithImages
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInParent
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
+import androidx.compose.runtime.withFrameNanos
 import com.example.ui.pageturn.PageScrubberOverlay
 import com.example.ui.pageturn.PageTurnContainer
 
@@ -227,6 +240,8 @@ import java.util.*
 import kotlin.math.abs
 import androidx.compose.foundation.layout.widthIn
 import com.example.ui.adaptive.AdaptiveSpec
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.ui.components.AppToast
 
 
 
@@ -243,6 +258,11 @@ fun ReaderScreen(
     bookTitle: String,
 
     chapters: List<Chapter>,
+    readerLoading: Boolean,
+    loadedChapterIndices: Set<Int>,
+    readerLoadError: String?,
+    onRetryLoad: () -> Unit,
+    onEnsureChapterLoaded: (Int, Int) -> Unit,
 
     onBack: () -> Unit,
 
@@ -272,7 +292,8 @@ fun ReaderScreen(
 
     onRecordTime: (Long) -> Unit,
 
-    onSessionEnd: (ReadingSession) -> Unit = {}
+    onSessionEnd: (ReadingSession) -> Unit = {},
+    onCheckNovelUpdate: (() -> Unit)? = null
 
 ) {
 
@@ -315,7 +336,10 @@ fun ReaderScreen(
     // 键必须是 book.id 而非 book 对象：进度保存会让 ViewModel 发出新的 book 副本，
     // 若以对象为键，异步时序差会把 currentChapterIndex 重置回副本携带的值 ——
     // 表现就是"拖动条松手后被弹回原章节"。以 id 为键仅在换书时重建，进度竞态免疫。
-    var currentChapterIndex by remember(book?.id) { mutableIntStateOf(book?.currentChapterIndex ?: 0) }
+    var currentChapterIndex by remember(book?.id, chapters.isNotEmpty()) {
+        mutableIntStateOf(book?.currentChapterIndex ?: 0)
+    }
+    var reachedBookEnd by remember(book?.id) { mutableStateOf(false) }
 
     var showBars by remember { mutableStateOf(false) }
 
@@ -335,6 +359,16 @@ fun ReaderScreen(
 
     // 串珠快速翻页遮罩（长按阅读区中间 1s 触发）
     var scrubberVisible by remember { mutableStateOf(false) }
+    // 小说内嵌图片：当前全屏查看的图片路径
+    var fullscreenNovelImage by remember { mutableStateOf<String?>(null) }
+
+    // 全屏查看器（Dialog 自带独立窗口，覆盖在阅读器之上）
+    fullscreenNovelImage?.let { imgPath ->
+        NovelImageFullscreenViewer(
+            path = imgPath,
+            onDismiss = { fullscreenNovelImage = null }
+        )
+    }
 
 
 
@@ -362,7 +396,7 @@ fun ReaderScreen(
 
 
 
-    val isTtsPlaying by ttsManager.isPlaying.collectAsState()
+    val isTtsPlaying by ttsManager.isPlaying.collectAsStateWithLifecycle()
 
     var searchKeyword by remember { mutableStateOf("") }
 
@@ -383,11 +417,11 @@ fun ReaderScreen(
                         input?.use { inp -> file.outputStream().use { out -> inp.copyTo(out) } }
                         prefs.customFontPath = file.absolutePath
                         withContext(Dispatchers.Main) {
-                            Toast.makeText(context, "自定义字体已导入", Toast.LENGTH_SHORT).show()
+                            AppToast.makeText(context, "自定义字体已导入", Toast.LENGTH_SHORT).show()
                         }
                     } catch (_: Exception) {
                         withContext(Dispatchers.Main) {
-                            Toast.makeText(context, "字体导入失败", Toast.LENGTH_SHORT).show()
+                            AppToast.makeText(context, "字体导入失败", Toast.LENGTH_SHORT).show()
                         }
                     }
                 }
@@ -441,11 +475,11 @@ fun ReaderScreen(
 
                 prefs.customSplashPosterUri = localUriStr
 
-                Toast.makeText(context, "开屏海报已更新", Toast.LENGTH_SHORT).show()
+                AppToast.makeText(context, "开屏海报已更新", Toast.LENGTH_SHORT).show()
 
             } catch (e: Exception) {
 
-                Toast.makeText(context, "图片设置失败", Toast.LENGTH_SHORT).show()
+                AppToast.makeText(context, "图片设置失败", Toast.LENGTH_SHORT).show()
 
             }
 
@@ -747,6 +781,13 @@ fun ReaderScreen(
 
 
 
+    // 切章立即读取正文，进度写库与正文读取各自独立。
+    LaunchedEffect(book?.id, currentChapterIndex, chapters.size) {
+        if (book != null && !book.isComic && chapters.isNotEmpty()) {
+            onEnsureChapterLoaded(book.id, currentChapterIndex)
+        }
+    }
+
     // 翻页/模式切换：立即保存进度
 
     LaunchedEffect(currentChapterIndex, isScrollMode) {
@@ -755,7 +796,7 @@ fun ReaderScreen(
 
             val offsetToSave = if (isScrollMode) scrollState.value else currentCharOffset
 
-            val isFinished = currentChapterIndex == chapters.size - 1 && (if (isScrollMode) scrollState.value > 100 else true)
+            val isFinished = book.isFinished || reachedBookEnd
 
             onUpdateProgress(book.id, currentChapterIndex, offsetToSave, isFinished)
 
@@ -775,7 +816,9 @@ fun ReaderScreen(
 
             val offsetToSave = scrollState.value
 
-            val isFinished = currentChapterIndex == chapters.size - 1 && offsetToSave > 100
+            val isFinished = book.isFinished || reachedBookEnd ||
+                (currentChapterIndex == chapters.lastIndex && currentChapter?.content?.isNotEmpty() == true &&
+                    scrollState.maxValue > 0 && offsetToSave >= scrollState.maxValue)
 
             onUpdateProgress(book.id, currentChapterIndex, offsetToSave, isFinished)
 
@@ -793,7 +836,7 @@ fun ReaderScreen(
 
             val offsetToSave = currentCharOffset
 
-            val isFinished = currentChapterIndex == chapters.size - 1
+            val isFinished = book.isFinished || reachedBookEnd
 
             onUpdateProgress(book.id, currentChapterIndex, offsetToSave, isFinished)
 
@@ -813,7 +856,9 @@ fun ReaderScreen(
 
                 val offsetToSave = if (isScrollMode) scrollState.value else currentCharOffset
 
-                val isFinished = currentChapterIndex == chapters.size - 1 && (if (isScrollMode) scrollState.value > 100 else true)
+                val isFinished = book.isFinished || reachedBookEnd ||
+                    (isScrollMode && currentChapterIndex == chapters.lastIndex && currentChapter?.content?.isNotEmpty() == true &&
+                        scrollState.maxValue > 0 && scrollState.value >= scrollState.maxValue)
 
                 onUpdateProgress(book.id, currentChapterIndex, offsetToSave, isFinished)
 
@@ -841,7 +886,7 @@ fun ReaderScreen(
 
             onDeleteBookmark(existingBookmark.id)
 
-            Toast.makeText(context, "已取消书签", Toast.LENGTH_SHORT).show()
+            AppToast.makeText(context, "已取消书签", Toast.LENGTH_SHORT).show()
 
         } else {
 
@@ -946,6 +991,20 @@ fun ReaderScreen(
 
     // 小章节同步准备（秒开无闪烁）；超大章节后台准备，避免主线程被几 MB 文本卡住
 
+    // 搜索结果点击后的精确跳转与页内高亮：
+    // pendingSearchJump 携带结果条目（含逻辑章内字符偏移 logicalPosition），跳转后
+    // 在目标页/目标块高亮关键词；翻页离开目标页自动清除（见 BoxWithConstraints 内的监听）。
+    var pendingSearchJump by remember { mutableStateOf<SearchResultItem?>(null) }
+    var searchHighlightQuery by remember { mutableStateOf<String?>(null) }
+    val searchHighlightStyle = SpanStyle(
+        background = MintPrimary.copy(alpha = 0.45f),
+        fontWeight = FontWeight.Bold
+    )
+    var searchHighlightPage by remember { mutableIntStateOf(-1) }
+    var searchHighlightChunk by remember { mutableIntStateOf(-1) }
+    // 跳转时刻：大章渐进分页期间页数未稳定，清除判定加保护期防误清
+    var searchHighlightAt by remember { mutableLongStateOf(0L) }
+
     val smallChapter = (currentChapter?.content?.length ?: 0) <= LARGE_CHAPTER_THRESHOLD
 
     var formattedContent by remember(currentChapter, firstLineIndent) {
@@ -965,6 +1024,11 @@ fun ReaderScreen(
         mutableStateOf(if (smallChapter) chunkForScroll(formatted) else emptyList())
 
     }
+
+    // 搜索跳转用：全局文本块的 TextLayoutResult 与容器内 y 坐标。
+    // 滚动正文按块驱动渲染（文本块/图片块），key = 跨 chunk 累计的全局块序号
+    val chunkTextLayouts = remember(scrollChunks.size) { mutableStateMapOf<Int, TextLayoutResult>() }
+    val chunkTopYs = remember(scrollChunks.size) { mutableStateMapOf<Int, Float>() }
 
     var contentReady by remember(currentChapter, firstLineIndent) { mutableStateOf(smallChapter) }
 
@@ -1305,39 +1369,8 @@ fun ReaderScreen(
 
 
 
-            // 读完庆祝：本次阅读中真正翻到最后一章最后一页才触发（打开时恢复的旧进度停在末页不算读完）
-
-            var celebratedBookComplete by remember(book) { mutableStateOf(false) }
-
-            var hasLeftLastPage by remember(book) { mutableStateOf(false) }
-
-            LaunchedEffect(currentChapterIndex, currentSubPageIndex, pagesList.size, isScrollMode) {
-
-                if (celebratedBookComplete || isScrollMode || pagesList.isEmpty() || chapters.isEmpty()) return@LaunchedEffect
-
-                val atLastPageOfLastChapter = currentChapterIndex >= chapters.size - 1 &&
-
-                        currentSubPageIndex >= pagesList.size - 1
-
-                if (atLastPageOfLastChapter) {
-
-                    if (hasLeftLastPage && !celebratedBookComplete) {
-
-                        celebratedBookComplete = true
-
-                        MascotAnimationController.play(MascotEvent.BookComplete)
-
-                    }
-
-                } else {
-
-                    hasLeftLastPage = true
-
-                }
-
-            }
-
-
+            // 只在用户主动向前翻到书末时庆祝。进度恢复和渐进分页会改写页索引，不能据此触发动画。
+            var celebratedBookComplete by remember(book?.id) { mutableStateOf(false) }
 
             val nextChapter = chapters.getOrNull(currentChapterIndex + 1)
 
@@ -1515,6 +1548,185 @@ fun ReaderScreen(
 
             }
 
+            // 搜索结果点击后的精确跳转 + 页内高亮（pendingSearchJump / searchHighlightQuery
+            // 由搜索对话框点击处设置）。防竞态：必须等 currentChapterIndex 切到目标章、
+            // 文本/分页就绪后才执行；大章异步准备时由 key 变化自然重触发。
+
+            LaunchedEffect(pendingSearchJump, formattedContent, scrollChunks, currentChapterIndex) {
+
+                val jump = pendingSearchJump ?: return@LaunchedEffect
+
+                if (!isScrollMode) return@LaunchedEffect
+
+                if (currentChapterIndex != jump.chapterIndex) return@LaunchedEffect
+
+                if (scrollChunks.isEmpty() || formattedContent.isEmpty()) return@LaunchedEffect
+
+                val q = searchHighlightQuery ?: ""
+
+                // formatted 文本 = 物理章按顺序拼接（与搜索统计 occurrence 同一基准）：
+                // 取结果条目对应的第 N 处出现 —— 免疫缩进/清洗造成的偏移漂移
+                val pos = com.example.data.SearchLocator.nthOccurrence(formattedContent, q, jump.occurrence)
+
+                if (pos < 0) { pendingSearchJump = null; return@LaunchedEffect }
+
+                // 定位 pos 所在的全局块（与渲染同源的块遍历：块 raw 拼接 == formattedContent）。
+                // 文本块精确到块内偏移；图片块滚到块顶。
+                var gb = 0
+
+                var acc = 0
+
+                var targetBlock = -1
+
+                var targetIsText = false
+
+                var localInBlock = 0
+
+                blockLoop@ for (chunk in scrollChunks) {
+
+                    for (b in NovelInlineImages.splitIntoBlocks(chunk, textWidthPx.toFloat(), Float.MAX_VALUE)) {
+
+                        val len = b.raw.length
+
+                        if (pos < acc + len) {
+
+                            targetBlock = gb
+
+                            targetIsText = b is com.example.ui.reader.NovelInlineImages.InlineBlock.Text
+
+                            localInBlock = (pos - acc).coerceAtLeast(0)
+
+                            break@blockLoop
+
+                        }
+
+                        acc += len
+
+                        gb++
+
+                    }
+
+                }
+
+                if (targetBlock < 0) { targetBlock = (gb - 1).coerceAtLeast(0); targetIsText = false }
+
+                searchHighlightChunk = targetBlock
+
+                // 等待目标块完成组合与文本布局（onTextLayout 填充），最多让出几帧
+                var foundLayout: TextLayoutResult? = chunkTextLayouts[targetBlock]
+
+                var foundTop: Float? = chunkTopYs[targetBlock]
+
+                var tries = 0
+
+                while ((foundTop == null || (targetIsText && foundLayout == null)) && tries < 6) {
+
+                    withFrameNanos { }
+
+                    foundLayout = chunkTextLayouts[targetBlock]
+
+                    foundTop = chunkTopYs[targetBlock]
+
+                    tries++
+
+                }
+
+                val layout = foundLayout
+
+                val top = foundTop
+
+                if (top != null) {
+
+                    val lineTop = if (targetIsText && layout != null && layout.layoutInput.text.text.isNotEmpty()) {
+
+                        val line = layout.getLineForOffset(localInBlock.coerceIn(0, layout.layoutInput.text.text.length - 1))
+
+                        layout.getLineTop(line)
+
+                    } else 0f
+
+                    scrollState.scrollTo((top + lineTop).toInt().coerceIn(0, scrollState.maxValue))
+
+                } else {
+
+                    scrollState.scrollTo(0)
+
+                }
+
+                pendingSearchJump = null
+
+            }
+
+            // 相邻页插图预加载：翻页前把上一页/下一页的图解码进缓存，
+            // 翻页动画期间下一页层组合即可命中位图 —— 消除"翻页背后灰白、翻完才出图"
+            LaunchedEffect(activeSubPageIndex, pagesList) {
+
+                if (!isScrollMode && pagesList.isNotEmpty()) {
+
+                    val upcoming = listOfNotNull(
+                        pagesList.getOrNull(activeSubPageIndex + 1),
+                        pagesList.getOrNull(activeSubPageIndex - 1)
+                    ).flatMap { p ->
+                        NovelInlineImages.TOKEN_REGEX.findAll(p).map { m -> m.groupValues[1] }
+                    }
+
+                    NovelInlineImages.NovelImageCache.prewarm(upcoming)
+
+                }
+
+            }
+
+            LaunchedEffect(pendingSearchJump, pagesList, currentChapterIndex) {
+
+                val jump = pendingSearchJump ?: return@LaunchedEffect
+
+                if (isScrollMode || pagesList.isEmpty()) return@LaunchedEffect
+
+                if (currentChapterIndex != jump.chapterIndex) return@LaunchedEffect
+
+                val q = searchHighlightQuery ?: ""
+
+                // 页文本拼接 = formattedContent：取结果条目对应的第 N 处出现，再按累计页长度换算目标页
+                val pos = com.example.data.SearchLocator.nthOccurrence(formattedContent, q, jump.occurrence)
+
+                var acc = 0
+
+                var page = -1
+
+                for ((i, p) in pagesList.withIndex()) {
+
+                    if (pos < acc + p.length) { page = i; break }
+
+                    acc += p.length
+
+                }
+
+                if (page < 0) page = pagesList.lastIndex
+
+                searchHighlightPage = page
+
+                searchHighlightAt = System.currentTimeMillis()
+
+                updateSubPage(page)
+
+                pendingSearchJump = null
+
+            }
+
+            // 翻页离开目标页后清除高亮（跳转本身落到目标页则保留）；
+            // 跳转后 1.5s 内是渐进分页期，页数未稳定，不判定"离开"
+            LaunchedEffect(activeSubPageIndex) {
+
+                if (searchHighlightQuery != null && activeSubPageIndex != searchHighlightPage &&
+                    System.currentTimeMillis() - searchHighlightAt > 1500
+                ) {
+
+                    searchHighlightQuery = null
+
+                }
+
+            }
+
 
 
             val handleNextPage = {
@@ -1530,6 +1742,15 @@ fun ReaderScreen(
                     }
 
                 } else {
+
+                    if (!celebratedBookComplete && shouldCelebrateAfterForwardTurn(
+                            currentChapterIndex, chapters.size, activeSubPageIndex,
+                            pagesList, formattedContent.length
+                        )) {
+                        celebratedBookComplete = true
+                        reachedBookEnd = true
+                        MascotAnimationController.play(MascotEvent.BookComplete)
+                    }
 
                     if (activeSubPageIndex < pagesList.size - 1) {
 
@@ -1589,7 +1810,20 @@ fun ReaderScreen(
 
 
 
-            if (chapters.isEmpty() || !contentReady || (!isScrollMode && pagesList.isEmpty())) {
+            if (readerLoadError != null) {
+                Column(
+                    modifier = Modifier.fillMaxSize().padding(32.dp),
+                    verticalArrangement = Arrangement.Center,
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text("章节加载失败：$readerLoadError", color = textColor)
+                    Spacer(Modifier.height(16.dp))
+                    Button(onClick = onRetryLoad) { Text("重试加载") }
+                }
+            } else if (readerLoading || chapters.isEmpty() ||
+                (book?.isComic == false && currentChapterIndex !in loadedChapterIndices) ||
+                !contentReady ||
+                (!isScrollMode && pagesList.isEmpty())) {
 
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
 
@@ -1619,6 +1853,10 @@ fun ReaderScreen(
 
                 }
 
+            } else if (currentChapter?.content.isNullOrBlank()) {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("本章暂无正文", color = textColor.copy(alpha = 0.75f))
+                }
             } else {
 
                 currentChapter?.let { chapter ->
@@ -1877,31 +2115,71 @@ fun ReaderScreen(
 
                                                     Column {
 
-                                                        // 大章节按段切块渲染，避免单个巨型 Text 排版导致 ANR；
-
-                                                        // 仍为同一滚动容器，像素滚动位置与原文选择行为保持不变。
+                                                        // 大章节块驱动渲染：文本块 BasicText、图片块独立占空间。
+                                                        // 全局块序号（跨 chunk 累计）供搜索跳转定位；图片块不走
+                                                        // 文本流内联占位，占位失效/叠绘/点击错位一并根除。
+                                                        var globalBlockIndex = 0
 
                                                         scrollChunks.forEach { chunk ->
 
-                                                            Text(
+                                                            val scrollDensity = LocalDensity.current
 
+                                                            NovelInlineImages.splitIntoBlocks(
                                                                 text = chunk,
-
-                                                                style = MaterialTheme.typography.bodyLarge.copy(
-
-                                                                    fontSize = fontSize.sp,
-
-                                                                    lineHeight = lineHeight.sp,
-
-                                                                    fontFamily = selectedFontFamily,
-
-                                                                    color = textColor.copy(alpha = 0.92f),
-
-                                                                    platformStyle = PlatformTextStyle(includeFontPadding = false)
-
-                                                                )
-
-                                                            )
+                                                                contentWidthPx = textWidthPx.toFloat(),
+                                                                // 滚动模式无页高限制，长图自然延展
+                                                                maxHeightPx = Float.MAX_VALUE
+                                                            ).forEach { block ->
+                                                                val gb = globalBlockIndex
+                                                                globalBlockIndex++
+                                                                when (block) {
+                                                                    is com.example.ui.reader.NovelInlineImages.InlineBlock.Image -> {
+                                                                        Box(
+                                                                            modifier = Modifier
+                                                                                .fillMaxWidth()
+                                                                                .height(with(scrollDensity) { block.heightPx.toDp() })
+                                                                                .clipToBounds()
+                                                                                .onGloballyPositioned { coords ->
+                                                                                    chunkTopYs[gb] = coords.positionInParent().y
+                                                                                }
+                                                                        ) {
+                                                                            NovelInlineImage(
+                                                                                path = block.path,
+                                                                                onTap = { fullscreenNovelImage = block.path }
+                                                                            )
+                                                                        }
+                                                                    }
+                                                                    is com.example.ui.reader.NovelInlineImages.InlineBlock.Text -> {
+                                                                        // 文本块：搜索关键词高亮标注（坐标精确，无 token 混杂）
+                                                                        val blockAnnotated = buildAnnotatedString {
+                                                                            append(block.text)
+                                                                            if (searchHighlightChunk == gb && searchHighlightQuery != null && searchHighlightStyle != null) {
+                                                                                var at = block.text.indexOf(searchHighlightQuery!!, ignoreCase = true)
+                                                                                while (at >= 0) {
+                                                                                    addStyle(searchHighlightStyle!!, at, at + searchHighlightQuery!!.length)
+                                                                                    at = block.text.indexOf(searchHighlightQuery!!, at + searchHighlightQuery!!.length, ignoreCase = true)
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        BasicText(
+                                                                            text = blockAnnotated,
+                                                                            onTextLayout = { chunkTextLayouts[gb] = it },
+                                                                            modifier = Modifier
+                                                                                .fillMaxWidth()
+                                                                                .onGloballyPositioned { coords ->
+                                                                                    chunkTopYs[gb] = coords.positionInParent().y
+                                                                                },
+                                                                            style = MaterialTheme.typography.bodyLarge.copy(
+                                                                                fontSize = fontSize.sp,
+                                                                                lineHeight = lineHeight.sp,
+                                                                                fontFamily = selectedFontFamily,
+                                                                                color = textColor.copy(alpha = 0.92f),
+                                                                                platformStyle = PlatformTextStyle(includeFontPadding = false)
+                                                                            )
+                                                                        )
+                                                                    }
+                                                                }
+                                                            }
 
                                                         }
 
@@ -1940,12 +2218,18 @@ fun ReaderScreen(
                                         } else {
 
                                             RenderSinglePage(
+                                            interactive = false,
 
                                                 pageIndex = activeSubPageIndex,
 
                                                 pageText = pagesList.getOrNull(activeSubPageIndex) ?: "",
 
                                                 chapterTitle = currentChapter?.title,
+
+                                                // 只有当前页的插图注册命中矩形 —— 翻页容器的
+                                                // next/prev 层与快速翻页预览层同屏叠放（PageCurl
+                                                // 三页同位），全注册会让点击命中前/后一层的图
+                                                registerImageHit = true,
 
                                                 bgColor = bgColor,
 
@@ -1959,7 +2243,15 @@ fun ReaderScreen(
 
                                                 marginHorizontal = marginHorizontal,
 
-                                                showBars = showBars
+                                                    contentWidthPx = textWidthPx.toFloat(),
+
+                                                    maxImageHeightPx = textHeightPx.toFloat(),
+
+                                                    onImageClick = { p -> fullscreenNovelImage = p },
+
+                                                showBars = showBars,
+                                                highlightQuery = searchHighlightQuery,
+                                                highlightStyle = searchHighlightStyle,
 
                                             )
 
@@ -1976,6 +2268,7 @@ fun ReaderScreen(
                                             if (activeSubPageIndex < pagesList.size - 1) {
 
                                                 RenderSinglePage(
+                                                interactive = false,
 
                                                     pageIndex = activeSubPageIndex + 1,
 
@@ -1995,13 +2288,22 @@ fun ReaderScreen(
 
                                                     marginHorizontal = marginHorizontal,
 
-                                                    showBars = showBars
+                                                    contentWidthPx = textWidthPx.toFloat(),
+
+                                                    maxImageHeightPx = textHeightPx.toFloat(),
+
+                                                    onImageClick = { p -> fullscreenNovelImage = p },
+
+                                                    showBars = showBars,
+                                                    highlightQuery = searchHighlightQuery,
+                                                    highlightStyle = searchHighlightStyle,
 
                                                 )
 
                                             } else if (nextChapter != null) {
 
                                                 RenderSinglePage(
+                                                interactive = false,
 
                                                     pageIndex = 0,
 
@@ -2021,13 +2323,22 @@ fun ReaderScreen(
 
                                                     marginHorizontal = marginHorizontal,
 
-                                                    showBars = showBars
+                                                    contentWidthPx = textWidthPx.toFloat(),
+
+                                                    maxImageHeightPx = textHeightPx.toFloat(),
+
+                                                    onImageClick = { p -> fullscreenNovelImage = p },
+
+                                                    showBars = showBars,
+                                                    highlightQuery = searchHighlightQuery,
+                                                    highlightStyle = searchHighlightStyle,
 
                                                 )
 
                                             } else {
 
                                                 RenderSinglePage(
+                                                interactive = false,
 
                                                     pageIndex = 0,
 
@@ -2047,7 +2358,15 @@ fun ReaderScreen(
 
                                                     marginHorizontal = marginHorizontal,
 
-                                                    showBars = showBars
+                                                    contentWidthPx = textWidthPx.toFloat(),
+
+                                                    maxImageHeightPx = textHeightPx.toFloat(),
+
+                                                    onImageClick = { p -> fullscreenNovelImage = p },
+
+                                                    showBars = showBars,
+                                                    highlightQuery = searchHighlightQuery,
+                                                    highlightStyle = searchHighlightStyle,
 
                                                 )
 
@@ -2066,6 +2385,7 @@ fun ReaderScreen(
                                             if (activeSubPageIndex > 0) {
 
                                                 RenderSinglePage(
+                                                interactive = false,
 
                                                     pageIndex = activeSubPageIndex - 1,
 
@@ -2085,7 +2405,15 @@ fun ReaderScreen(
 
                                                     marginHorizontal = marginHorizontal,
 
-                                                    showBars = showBars
+                                                    contentWidthPx = textWidthPx.toFloat(),
+
+                                                    maxImageHeightPx = textHeightPx.toFloat(),
+
+                                                    onImageClick = { p -> fullscreenNovelImage = p },
+
+                                                    showBars = showBars,
+                                                    highlightQuery = searchHighlightQuery,
+                                                    highlightStyle = searchHighlightStyle,
 
                                                 )
 
@@ -2094,6 +2422,7 @@ fun ReaderScreen(
                                                 val lastIdx = (prevChapterPages.size - 1).coerceAtLeast(0)
 
                                                 RenderSinglePage(
+                                                interactive = false,
 
                                                     pageIndex = lastIdx,
 
@@ -2113,13 +2442,22 @@ fun ReaderScreen(
 
                                                     marginHorizontal = marginHorizontal,
 
-                                                    showBars = showBars
+                                                    contentWidthPx = textWidthPx.toFloat(),
+
+                                                    maxImageHeightPx = textHeightPx.toFloat(),
+
+                                                    onImageClick = { p -> fullscreenNovelImage = p },
+
+                                                    showBars = showBars,
+                                                    highlightQuery = searchHighlightQuery,
+                                                    highlightStyle = searchHighlightStyle,
 
                                                 )
 
                                             } else {
 
                                                 RenderSinglePage(
+                                                interactive = false,
 
                                                     pageIndex = 0,
 
@@ -2139,7 +2477,15 @@ fun ReaderScreen(
 
                                                     marginHorizontal = marginHorizontal,
 
-                                                    showBars = showBars
+                                                    contentWidthPx = textWidthPx.toFloat(),
+
+                                                    maxImageHeightPx = textHeightPx.toFloat(),
+
+                                                    onImageClick = { p -> fullscreenNovelImage = p },
+
+                                                    showBars = showBars,
+                                                    highlightQuery = searchHighlightQuery,
+                                                    highlightStyle = searchHighlightStyle,
 
                                                 )
 
@@ -2184,7 +2530,21 @@ fun ReaderScreen(
 
                                             // 卷页背面的纸：跟随阅读主题（夜间/OLED 下自动变深），
                                             // 修掉"翻页背面永远是米黄色不透明纯色"的老问题。
-                                            paperColor = bgColor
+                                            paperColor = bgColor,
+
+                                            // 点击位置命中正文插图 → 打开全屏并跳过翻页分派
+                                            onImageTapAt = { pos ->
+                                                val hitPath = NovelInlineImages.ImageHitRegistry.hit(pos)
+                                                if (hitPath != null) {
+                                                    fullscreenNovelImage = hitPath
+                                                    true
+                                                } else {
+                                                    // 未命中即清除非当前页残留：旧页注册在第一次
+                                                    // 点击后失效，不可能再被二次误命中
+                                                    NovelInlineImages.ImageHitRegistry.purgeStale()
+                                                    false
+                                                }
+                                            }
 
                                         )
 
@@ -2222,6 +2582,20 @@ fun ReaderScreen(
                                                 if (pagesList.size >= 2) scrubberVisible = true
                                             },
 
+                                            // 点击位置命中正文插图 → 打开全屏并跳过翻页分派
+                                            onImageTapAt = { pos ->
+                                                val hitPath = NovelInlineImages.ImageHitRegistry.hit(pos)
+                                                if (hitPath != null) {
+                                                    fullscreenNovelImage = hitPath
+                                                    true
+                                                } else {
+                                                    // 未命中即清除非当前页残留：旧页注册在第一次
+                                                    // 点击后失效，不可能再被二次误命中
+                                                    NovelInlineImages.ImageHitRegistry.purgeStale()
+                                                    false
+                                                }
+                                            },
+
                                             // 卷页背面的纸：跟随阅读主题，纸面/厚度高光/描边一并自适应。
                                             paperColor = bgColor
                                         )
@@ -2236,6 +2610,7 @@ fun ReaderScreen(
                                             initialPage = activeSubPageIndex,
                                             pageContent = { idx ->
                                                 RenderSinglePage(
+                                                interactive = false,
                                                     pageIndex = idx,
                                                     pageText = pagesList.getOrNull(idx) ?: "",
                                                     chapterTitle = currentChapter?.title,
@@ -2245,7 +2620,15 @@ fun ReaderScreen(
                                                     titleStyle = titleStyle,
                                                     titleReservePx = currentTitleReservePx,
                                                     marginHorizontal = marginHorizontal,
-                                                    showBars = false
+
+                                                    contentWidthPx = textWidthPx.toFloat(),
+
+                                                    maxImageHeightPx = textHeightPx.toFloat(),
+
+                                                    onImageClick = { p -> fullscreenNovelImage = p },
+                                                    showBars = false,
+                                                    highlightQuery = searchHighlightQuery,
+                                                    highlightStyle = searchHighlightStyle
                                                 )
                                             },
                                             onDismiss = { scrubberVisible = false },
@@ -2539,7 +2922,7 @@ fun ReaderScreen(
 
                                                         currentChapter?.let { ch ->
 
-                                                            ttsManager.startReading(ch.content, speed = prefs.ttsSpeed, pitch = prefs.ttsPitch)
+                                                            ttsManager.startReading(NovelInlineImages.stripTokens(ch.content), speed = prefs.ttsSpeed, pitch = prefs.ttsPitch)
 
                                                         }
 
@@ -2936,9 +3319,9 @@ fun ReaderScreen(
 
                                                     currentChapter?.let { ch ->
 
-                                                        ttsManager.startReading(ch.content, speed = prefs.ttsSpeed, pitch = prefs.ttsPitch)
+                                                        ttsManager.startReading(NovelInlineImages.stripTokens(ch.content), speed = prefs.ttsSpeed, pitch = prefs.ttsPitch)
 
-                                                        Toast.makeText(context, "已开启语音听书", Toast.LENGTH_SHORT).show()
+                                                        AppToast.makeText(context, "已开启语音听书", Toast.LENGTH_SHORT).show()
 
                                                     }
 
@@ -2990,7 +3373,7 @@ fun ReaderScreen(
                                                         onClick = {
                                                             showReaderMoreMenu = false
                                                             if (!isScrollMode) {
-                                                                Toast.makeText(context, "自动滚屏需切换到滚动模式", Toast.LENGTH_SHORT).show()
+                                                                AppToast.makeText(context, "自动滚屏需切换到滚动模式", Toast.LENGTH_SHORT).show()
                                                             } else {
                                                                 isAutoScrolling = !isAutoScrolling
                                                                 if (isAutoScrolling && isTtsPlaying) ttsManager.pause()
@@ -3091,31 +3474,63 @@ fun ReaderScreen(
 
                                                 // 基线原版 FluidSlider 视觉（用户设计零改动）；
                                                 // 横向拖动实时预览，松手(onPositionChangeFinished)才真正切章
-                                                Box(modifier = Modifier.weight(1f)) {
-                                                    FluidSlider(
-                                                        position = dragPos ?: currentChapterIndex.toFloat() /
-                                                            (chapters.size - 1).coerceAtLeast(1).toFloat(),
-                                                        onPositionChange = { dragPos = it },
-                                                        onPositionChangeFinished = {
-                                                            val p = dragPos
-                                                            // 终态必清预览（含被纵向滚动逃生门中断的情况）
-                                                            dragPos = null
-                                                            if (p != null) {
-                                                                val target = Math.round(p * (chapters.size - 1).coerceAtLeast(1).toFloat())
-                                                                    .coerceIn(0, chapters.lastIndex.coerceAtLeast(0))
-                                                                if (target != currentChapterIndex) {
-                                                                    currentChapterIndex = target
-                                                                    scope.launch { scrollState.scrollTo(0) }
-                                                                }
-                                                            }
-                                                        },
-                                                        bubbleText = "${previewIdx + 1}",
-                                                        barHeightDp = 26,
-                                                        startText = null,
-                                                        endText = null,
-                                                        colorBar = barContentColor
-                                                    )
-                                                }
+                                                    Box(modifier = Modifier.weight(1f)) {
+                                                        if (!isScrollMode && pagesList.size >= 2) {
+                                                            FluidSlider(
+                                                                position = dragPos
+                                                                    ?: activeSubPageIndex.toFloat() /
+                                                                    (pagesList.size - 1).coerceAtLeast(1).toFloat(),
+                                                                onPositionChange = { dragPos = it },
+                                                                onPositionChangeFinished = {
+                                                                    val p = dragPos
+                                                                    dragPos = null
+                                                                    if (p != null) {
+                                                                        val targetPage = Math.round(p * (pagesList.size - 1).coerceAtLeast(1).toFloat())
+                                                                            .coerceIn(0, pagesList.size - 1)
+                                                                        if (targetPage != activeSubPageIndex) {
+                                                                            updateSubPage(targetPage)
+                                                                        }
+                                                                    }
+                                                                },
+                                                                bubbleText = "${(dragPos?.let { Math.round(it * (pagesList.size - 1).coerceAtLeast(1)) } ?: activeSubPageIndex) + 1}",
+                                                                barHeightDp = 26,
+                                                                startText = null,
+                                                                endText = null,
+                                                                colorBar = barContentColor
+                                                            )
+                                                        } else if (isScrollMode) {
+                                                            FluidSlider(
+                                                                position = dragPos
+                                                                    ?: scrollState.value.toFloat() / scrollState.maxValue.coerceAtLeast(1),
+                                                                onPositionChange = { dragPos = it },
+                                                                onPositionChangeFinished = {
+                                                                    val p = dragPos
+                                                                    dragPos = null
+                                                                    if (p != null) {
+                                                                        scope.launch {
+                                                                            scrollState.scrollTo((p * scrollState.maxValue).toInt())
+                                                                        }
+                                                                    }
+                                                                },
+                                                                bubbleText = "${((dragPos ?: (scrollState.value.toFloat() / scrollState.maxValue.coerceAtLeast(1))) * 100).toInt()}%",
+                                                                barHeightDp = 26,
+                                                                startText = null,
+                                                                endText = null,
+                                                                colorBar = barContentColor
+                                                            )
+                                                        } else {
+                                                            FluidSlider(
+                                                                position = 0f,
+                                                                onPositionChange = { },
+                                                                onPositionChangeFinished = { },
+                                                                bubbleText = "1",
+                                                                barHeightDp = 26,
+                                                                startText = null,
+                                                                endText = null,
+                                                                colorBar = barContentColor
+                                                            )
+                                                        }
+                                                    }
 
                 
 
@@ -3157,9 +3572,14 @@ fun ReaderScreen(
 
                                                 Text(
 
-                                                    text = if (dragPos != null && chapters.isNotEmpty()) {
-                                                        val t = chapters.getOrNull(previewIdx)?.title.orEmpty()
-                                                        "跳转 → 第 ${previewIdx + 1}/${chapters.size} 章 · $t"
+                                                    text = if (dragPos != null && !isScrollMode && pagesList.size >= 2) {
+                                                        val targetPage = Math.round(dragPos!!.toFloat() * (pagesList.size - 1)).coerceIn(0, pagesList.size - 1)
+                                                        "跳转 → 本章第 ${targetPage + 1}/${pagesList.size} 页"
+                                                    } else if (dragPos != null && isScrollMode) {
+                                                        val frac = dragPos!!
+                                                        "跳转 → 本章 ${(frac * 100).toInt()}%"
+                                                    } else if (chapters.isNotEmpty()) {
+                                                        "第 ${currentChapterIndex + 1} / ${chapters.size} 章 · ${currentChapter?.title.orEmpty()}"
                                                     } else {
                                                         "第 ${currentChapterIndex + 1} / ${chapters.size} 章"
                                                     },
@@ -3185,9 +3605,9 @@ fun ReaderScreen(
 
                                                             currentChapter?.let { ch ->
 
-                                                                ttsManager.startReading(ch.content, speed = prefs.ttsSpeed, pitch = prefs.ttsPitch)
+                                                                ttsManager.startReading(NovelInlineImages.stripTokens(ch.content), speed = prefs.ttsSpeed, pitch = prefs.ttsPitch)
 
-                                                                Toast.makeText(context, "开启语音听书：${ch.title}", Toast.LENGTH_SHORT).show()
+                                                                AppToast.makeText(context, "开启语音听书：${ch.title}", Toast.LENGTH_SHORT).show()
 
                                                             }
 
@@ -3284,7 +3704,13 @@ fun ReaderScreen(
                         Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
 Column(modifier = Modifier.widthIn(max = AdaptiveSpec.sheetMaxWidth).fillMaxWidth().padding(16.dp).padding(bottom = 32.dp)) {
 
-                Text("目录 (${chapters.size}章)", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("目录 (${chapters.size}章)", Modifier.weight(1f), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                    if (onCheckNovelUpdate != null) TextButton(onClick = { showTocSheet = false; onCheckNovelUpdate() }) {
+                        Icon(Icons.Filled.Refresh, null, Modifier.size(16.dp))
+                        Spacer(Modifier.width(5.dp)); Text("检查更新")
+                    }
+                }
 
                 Spacer(modifier = Modifier.height(12.dp))
 
@@ -3411,7 +3837,7 @@ Column(modifier = Modifier.widthIn(max = AdaptiveSpec.sheetMaxWidth).fillMaxWidt
                         prefs.lineHeight = lineHeight
                         prefs.marginHorizontal = marginHorizontal
                         prefs.readerBrightness = readerBrightness
-                        Toast.makeText(context, "排版参数已重置", Toast.LENGTH_SHORT).show()
+                        AppToast.makeText(context, "排版参数已重置", Toast.LENGTH_SHORT).show()
                     }) {
                         Text("重置", fontWeight = FontWeight.Bold)
                     }
@@ -3738,6 +4164,9 @@ Column(modifier = Modifier.widthIn(max = AdaptiveSpec.sheetMaxWidth).fillMaxWidt
 
 
 
+    // 搜索结果点击后的精确跳转：切章完成、新章文本/分页就绪后定位到匹配行（滚动）/匹配页（翻页）。
+    // 跳转的 LaunchedEffect 放在 BoxWithConstraints 作用域内（那里才能读到 pagesList / updateSubPage）。
+
     if (showSearchDialog) {
 
         AlertDialog(
@@ -3788,9 +4217,11 @@ Column(modifier = Modifier.widthIn(max = AdaptiveSpec.sheetMaxWidth).fillMaxWidt
 
                         LazyColumn(modifier = Modifier.height(240.dp)) {
 
+                            // key 不能用 chapterIndex：大章拆出的"续N"物理章合并回同一逻辑章后，
+                            // 多条结果 logicalIndex 相同 → LazyColumn "Key was already used" 直接闪退
                             itemsIndexed(
                                 searchResults,
-                                key = { _, item -> item.chapterIndex }
+                                key = { index, _ -> index }
                             ) { _, item ->
 
                                 Card(
@@ -3811,9 +4242,13 @@ Column(modifier = Modifier.widthIn(max = AdaptiveSpec.sheetMaxWidth).fillMaxWidt
 
                                             currentChapterIndex = item.chapterIndex
 
-                                            showSearchDialog = false
+                                            // 记下关键词并携带精确偏移跳转：等新章文本/分页就绪后
+                                            // 定位到匹配位置并高亮（见 BoxWithConstraints 内的 LaunchedEffect）
+                                            searchHighlightQuery = searchKeyword
 
-                                            scope.launch { scrollState.scrollTo(0) }
+                                            pendingSearchJump = item
+
+                                            showSearchDialog = false
 
                                         },
 
@@ -3825,7 +4260,26 @@ Column(modifier = Modifier.widthIn(max = AdaptiveSpec.sheetMaxWidth).fillMaxWidt
 
                                         Text(item.chapterTitle, fontWeight = FontWeight.Bold, fontSize = 12.sp, color = MintPrimary)
 
-                                        Text(item.snippet, fontSize = 11.sp, maxLines = 2)
+                                        // 预览里高亮关键词（大小写不敏感的首处匹配）；颜色在组合期取好再进 remember
+                                        val accentColor = MintPrimary
+
+                                        val highlightedSnippet = remember(item.snippet, searchKeyword) {
+                                            buildAnnotatedString {
+                                                append(item.snippet)
+                                                if (searchKeyword.isNotBlank()) {
+                                                    val p = item.snippet.indexOf(searchKeyword, ignoreCase = true)
+                                                    if (p >= 0) {
+                                                        addStyle(
+                                                            SpanStyle(color = accentColor, fontWeight = FontWeight.Bold),
+                                                            p,
+                                                            p + searchKeyword.length
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        Text(highlightedSnippet, fontSize = 11.sp, maxLines = 2)
 
                                     }
 
@@ -4393,6 +4847,12 @@ private fun RenderSinglePage(
 
     bgColor: Color,
 
+    contentWidthPx: Float,
+
+    maxImageHeightPx: Float,
+
+    onImageClick: (String) -> Unit,
+
     textColor: Color,
 
     bodyStyle: TextStyle,
@@ -4403,9 +4863,24 @@ private fun RenderSinglePage(
 
     marginHorizontal: Int,
 
-    showBars: Boolean
+    showBars: Boolean,
+
+    // 是否把本页插图注册进命中表（仅当前页；next/prev/scrubber 层不注册，
+    // 否则 PageCurl 同屏叠放的多层会互相干扰，点击打开前面某层的图）
+    registerImageHit: Boolean = false,
+    // 本页插图是否可点击（仅当前页；PageCurl 把 prev 页组合在最顶层，其
+    // clickable 会拦截所有点击 —— 非当前层必须禁用让触摸穿透）
+    interactive: Boolean = true,
+    highlightQuery: String? = null,
+    highlightStyle: SpanStyle? = null
 
 ) {
+
+    // 本页成为"当前页"时更新命中表的页标识：翻页后残留矩形（引擎保留的旧层）
+    // 自动失效 —— 修复"图片下一页相同位置点击仍打开前面那张图"
+    if (registerImageHit) {
+        NovelInlineImages.ImageHitRegistry.setActivePage(pageText)
+    }
 
     Column(
 
@@ -4455,23 +4930,77 @@ private fun RenderSinglePage(
 
         Box(modifier = Modifier.weight(1f).fillMaxWidth().clipToBounds()) {
 
-            Text(
-
-                text = pageText,
-
-                style = bodyStyle,
-
+            // 块驱动渲染：文本块用 BasicText（含搜索高亮标注），图片块按长宽高
+            // 独立占空间（宽=内容宽、高=按长宽比收敛）—— 不再走文本流内联占位，
+            // 彻底避开占位失效导致的叠绘 / novel_img_N 字面 / 点击命中错位
+            Column(
                 modifier = Modifier
-
                     .fillMaxWidth()
-
                     .fillMaxHeight()
-
                     .padding(bottom = PAGE_TEXT_BOTTOM_PADDING_DP.dp)
-
                     .clipToBounds()
+            ) {
+                val blockDensity = LocalDensity.current
 
-            )
+                fun annotatedBlock(text: String) = buildAnnotatedString {
+                    append(text)
+                    if (!highlightQuery.isNullOrBlank() && highlightStyle != null) {
+                        var at = text.indexOf(highlightQuery, ignoreCase = true)
+                        while (at >= 0) {
+                            addStyle(highlightStyle, at, at + highlightQuery.length)
+                            at = text.indexOf(highlightQuery, at + highlightQuery.length, ignoreCase = true)
+                        }
+                    }
+                }
+
+                NovelInlineImages.splitIntoBlocks(pageText, contentWidthPx, maxImageHeightPx).forEachIndexed { blockIndex, block ->
+                    when (block) {
+                        is com.example.ui.reader.NovelInlineImages.InlineBlock.Image -> {
+                            if (registerImageHit) {
+                                // 注册真实屏幕矩形：翻页手势宿主按位置命中插图（点击打开全屏而非翻页）。
+                                // id 用稳定随机串 —— 同一张图在正文多处引用/多层叠放时互不覆盖
+                                val regId = remember(pageText, blockIndex) {
+                                    "img_${blockIndex}_${java.util.UUID.randomUUID()}"
+                                }
+                                androidx.compose.runtime.DisposableEffect(regId) {
+                                    onDispose { NovelInlineImages.ImageHitRegistry.unregister(regId) }
+                                }
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(with(blockDensity) { block.heightPx.toDp() })
+                                        .clipToBounds()
+                                        .onGloballyPositioned { coords ->
+                                            NovelInlineImages.ImageHitRegistry.register(
+                                                regId, block.path, coords.boundsInWindow(), pageText
+                                            )
+                                        }
+                                ) {
+                                    NovelInlineImage(path = block.path, onTap = { onImageClick(block.path) }, enabled = interactive)
+                                }
+                            } else {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(with(blockDensity) { block.heightPx.toDp() })
+                                        .clipToBounds()
+                                ) {
+                                    NovelInlineImage(path = block.path, onTap = { onImageClick(block.path) }, enabled = interactive)
+                                }
+                            }
+                        }
+                        is com.example.ui.reader.NovelInlineImages.InlineBlock.Text -> {
+                            BasicText(
+                                text = annotatedBlock(block.text),
+                                style = bodyStyle,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clipToBounds()
+                            )
+                        }
+                    }
+                }
+            }
 
         }
 
@@ -4623,5 +5152,3 @@ private fun ReaderFontOptionRow(
         trailing?.invoke()
     }
 }
-
-

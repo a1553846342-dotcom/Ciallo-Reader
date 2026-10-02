@@ -9,6 +9,7 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import java.util.concurrent.atomic.AtomicLong
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
 sealed class MascotEvent {
     object DeleteBook : MascotEvent()
@@ -67,7 +68,7 @@ object MascotAnimationController {
  */
 @Composable
 fun MascotOverlay(modifier: Modifier = Modifier) {
-    val latestEventInstance by MascotAnimationController.events.collectAsState(initial = null)
+    val latestEventInstance by MascotAnimationController.events.collectAsStateWithLifecycle(initialValue = null)
     var currentInstance by remember { mutableStateOf<MascotEventInstance?>(null) }
 
     // Interruption Strategy A: When a new event instance arrives, immediately interrupt current and start anew

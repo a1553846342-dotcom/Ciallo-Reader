@@ -61,7 +61,8 @@ class BubbleDetector(private val modelProvider: () -> InputStream, private val m
     )
 
     @Synchronized
-    fun detect(bitmap: Bitmap): List<Detection> {
+    // track 包住整页推理：关闭会话前必须等在飞推理结束，否则 ONNX native abort（翻译闪退根因）
+    fun detect(bitmap: Bitmap): List<Detection> = OrtSessions.track(session) {
         if (bitmap.width <= 1 || bitmap.height <= 1) return emptyList()
         // 第十九轮：长条漫页分块——1472² letterbox 对超高页会把气泡缩到不可检
         val ratio = bitmap.height.toFloat() / bitmap.width

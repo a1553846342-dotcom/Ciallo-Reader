@@ -1,6 +1,7 @@
 package com.example.data
 
 import android.content.Context
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
@@ -20,6 +21,12 @@ object EpubParser {
 
     private const val TAG = "EpubParser"
 
+    private fun imageBounds(file: File): BitmapFactory.Options =
+        BitmapFactory.Options().apply {
+            inJustDecodeBounds = true
+            BitmapFactory.decodeFile(file.absolutePath, this)
+        }
+
     fun isEpubFile(fileName: String): Boolean {
         return fileName.lowercase().endsWith(".epub")
     }
@@ -28,7 +35,8 @@ object EpubParser {
         context: Context,
         uri: Uri,
         fileName: String,
-        bookDao: BookDao
+        bookDao: BookDao,
+        targetBookId: Int? = null
     ): Result<Book> = withContext(Dispatchers.IO) {
         val tempDir = File(context.cacheDir, "epub_${System.currentTimeMillis()}")
         try {
@@ -42,6 +50,13 @@ object EpubParser {
                 return@withContext Result.failure(Exception("无法解压 EPUB 文件"))
             }
 
+            val encryption=File(tempDir,"META-INF/encryption.xml")
+            if(encryption.isFile) {
+                val document=org.jsoup.Jsoup.parse(encryption.readText(),"",org.jsoup.parser.Parser.xmlParser())
+                require(document.select("EncryptionMethod").all { node ->
+                    node.attr("Algorithm") in setOf("http://www.idpf.org/2008/embedding","http://ns.adobe.com/pdf/enc#RC")
+                }) { "EPUB 正文受 DRM 加密，无法导入" }
+            }
             // 2. Read META-INF/container.xml to find the OPF file path
             val containerFile = File(tempDir, "META-INF/container.xml")
             if (!containerFile.exists()) {
@@ -55,7 +70,7 @@ object EpubParser {
                 return@withContext Result.failure(Exception("无法解析 EPUB container.xml 中的 OPF 路径"))
             }
 
-            val opfFile = File(tempDir, decodeUrl(opfRelativePath))
+            val opfFile = ArchiveBudget.destination(tempDir, decodeUrl(opfRelativePath))
             if (!opfFile.exists()) {
                 tempDir.deleteRecursively()
                 return@withContext Result.failure(Exception("找不到 OPF 文件: $opfRelativePath"))
@@ -64,7 +79,8 @@ object EpubParser {
             val opfDir = opfFile.parentFile ?: tempDir
 
             // 3. Parse OPF file (metadata, manifest, spine)
-            val opfData = parseOpfXml(opfFile)
+            val parsedOpf = parseOpfXml(opfFile)
+            val opfData = parsedOpf.copy(tocTitles = readTocTitles(opfFile, tempDir, parsedOpf.manifestItems))
             val title = opfData.title.ifBlank { fileName.substringBeforeLast('.') }
             val author = opfData.author.ifBlank { "未知作者" }
 
@@ -77,8 +93,10 @@ object EpubParser {
                 totalChapters = 0
             )
 
-            val bookId = bookDao.insertBook(initialBook).toInt()
-            Log.d(TAG, "[EpubParser] Inserted initial book record with ID: $bookId")
+            // targetBookId 非空 = 老书补图片的迁移重解析：不新建书、失败也不删书
+            //（老书在 Room 事务回滚保护下由调用方收尾）
+            val bookId = targetBookId ?: bookDao.insertBook(initialBook).toInt()
+            Log.d(TAG, "[EpubParser] Using book record ID: $bookId")
 
             val chapters = mutableListOf<Chapter>()
             var chapterOrder = 0
@@ -86,17 +104,22 @@ object EpubParser {
             // 5. Load XHTML files in spine order
             for (idref in opfData.spineItemRefs) {
                 val href = opfData.manifestItems[idref] ?: continue
-                val xhtmlFile = File(opfDir, decodeUrl(href))
+                val xhtmlFile = File(opfDir, decodeUrl(href)).canonicalFile
+                require(xhtmlFile.toPath().startsWith(tempDir.canonicalFile.toPath())) { "EPUB正文路径越界" }
                 if (!xhtmlFile.exists()) {
-                    Log.w(TAG, "[EpubParser] Spine item file missing: ${xhtmlFile.absolutePath}")
-                    continue
+                    error("EPUB 缺少正文文件：$href")
                 }
 
                 val rawContent = readTextWithCharsetDetection(xhtmlFile)
                 if (rawContent.isBlank()) continue
 
-                val chapterTitle = extractChapterTitle(rawContent, opfData.tocTitles[href])
-                val cleanText = extractCleanTextFromHtml(rawContent)
+                // 5.1 XHTML 内嵌图片：EPUB 内图片用 epzip 零副本引用（不落盘），
+                //     data URI 图仍落盘 imageDir；token 内嵌正文
+                val imageDir = File(context.filesDir, "epub_images/$bookId")
+                val withImages = embedImageTokens(rawContent, xhtmlFile, tempDir, imageDir, uri.toString())
+
+                val chapterTitle = extractChapterTitle(rawContent, opfData.tocTitles[decodeUrl(href.substringBefore('#'))])
+                val cleanText = extractCleanTextFromHtml(withImages)
 
                 if (cleanText.isNotBlank()) {
                     chapters.add(
@@ -117,7 +140,7 @@ object EpubParser {
                 if (ch.content.length <= MAX_CHAPTER_LENGTH) {
                     splitChapters.add(ch.copy(chapterOrder = splitOrder++))
                 } else {
-                    val parts = ch.content.chunked(MAX_CHAPTER_LENGTH)
+                    val parts = ch.content.let { splitChapterText(it) }
                     parts.forEachIndexed { index, part ->
                         splitChapters.add(
                             Chapter(
@@ -135,7 +158,8 @@ object EpubParser {
 
             if (chapters.isEmpty()) {
                 tempDir.deleteRecursively()
-                bookDao.deleteBook(initialBook.copy(id = bookId))
+                File(context.filesDir, "epub_images/$bookId").deleteRecursively()
+                if (targetBookId == null) bookDao.deleteBook(initialBook.copy(id = bookId))
                 return@withContext Result.failure(Exception("EPUB 文件中未找到有效的正文内容"))
             }
 
@@ -159,10 +183,9 @@ object EpubParser {
 
             if (specCoverFile != null && specCoverFile.exists() && specCoverFile.isFile) {
                 // Verify decoding
-                val bytes = specCoverFile.readBytes()
-                val bitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                if (bitmap != null) {
-                    Log.d(TAG, "[COVER] 规格封面解码成功: ${bitmap.width}x${bitmap.height}")
+                val bounds = imageBounds(specCoverFile)
+                if (bounds.outWidth > 0 && bounds.outHeight > 0) {
+                    Log.d(TAG, "[COVER] 规格封面尺寸: ${bounds.outWidth}x${bounds.outHeight}")
                     finalCoverFile = specCoverFile
                     coverSource = "spec"
                 } else {
@@ -192,8 +215,8 @@ object EpubParser {
                     }
                     if (coverMatch != null) {
                         Log.d(TAG, "[COVER] 命中 优先级1 (包含'cover'的文件名): ${coverMatch.absolutePath}")
-                        val bytes = coverMatch.readBytes()
-                        if (android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size) != null) {
+                        val bounds = imageBounds(coverMatch)
+                        if (bounds.outWidth > 0 && bounds.outHeight > 0) {
                             selectedImgFile = coverMatch
                         } else {
                             Log.e(TAG, "[COVER] 优先级1 图片解码失败")
@@ -221,8 +244,8 @@ object EpubParser {
                                         }
                                         if (foundMatch != null && foundMatch.exists()) {
                                             Log.d(TAG, "[COVER] 命中 优先级2 (首章节首图): ${foundMatch.absolutePath}")
-                                            val bytes = foundMatch.readBytes()
-                                            if (android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size) != null) {
+                                            val bounds = imageBounds(foundMatch)
+                                            if (bounds.outWidth > 0 && bounds.outHeight > 0) {
                                                 selectedImgFile = foundMatch
                                                 break
                                             } else {
@@ -240,8 +263,8 @@ object EpubParser {
                         val largestImg = allImages.maxByOrNull { it.length() }
                         if (largestImg != null) {
                             Log.d(TAG, "[COVER] 命中 优先级3 (最大体积图): ${largestImg.absolutePath}, 大小: ${largestImg.length()} 字节")
-                            val bytes = largestImg.readBytes()
-                            if (android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size) != null) {
+                            val bounds = imageBounds(largestImg)
+                            if (bounds.outWidth > 0 && bounds.outHeight > 0) {
                                 selectedImgFile = largestImg
                             } else {
                                 Log.e(TAG, "[COVER] 优先级3 图片解码失败")
@@ -260,14 +283,7 @@ object EpubParser {
 
             var coverUri: String? = null
             if (finalCoverFile != null) {
-                val bytes = finalCoverFile.readBytes()
-                Log.d(TAG, "[COVER] 最终封面图片字节大小: ${bytes.size}")
-                val bitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                if (bitmap != null) {
-                    Log.d(TAG, "[COVER] 最终封面图片解码成功: ${bitmap.width}x${bitmap.height}")
-                } else {
-                    Log.e(TAG, "[COVER] 最终封面图片解码失败")
-                }
+                Log.d(TAG, "[COVER] 最终封面图片字节大小: ${finalCoverFile.length()}")
 
                 val coverDir = File(context.filesDir, "epub_covers")
                 if (!coverDir.exists()) coverDir.mkdirs()
@@ -296,6 +312,7 @@ object EpubParser {
             tempDir.deleteRecursively()
             Result.success(finalBook)
         } catch (t: Throwable) {
+            if (t is kotlinx.coroutines.CancellationException) throw t
             Log.e(TAG, "[EpubParser] Error during EPUB import", t)
             tempDir.deleteRecursively()
             Result.failure(Exception(t.localizedMessage ?: "EPUB 解析失败"))
@@ -306,18 +323,21 @@ object EpubParser {
         val charsets = listOf(StandardCharsets.UTF_8, Charset.forName("GBK"), Charset.forName("GB18030"))
         for (charset in charsets) {
             try {
+                destDir.listFiles()?.forEach { it.deleteRecursively() }
                 var success = false
                 context.contentResolver.openInputStream(uri)?.use { inputStream ->
+                    val budget = ArchiveBudget()
                     ZipInputStream(inputStream, charset).use { zip ->
                         var entry = zip.nextEntry
                         while (entry != null) {
-                            val outFile = File(destDir, entry.name)
+                            val outFile = ArchiveBudget.destination(destDir, entry.name)
                             if (entry.isDirectory) {
                                 outFile.mkdirs()
+                                budget.copyEntry(zip)
                             } else {
                                 outFile.parentFile?.mkdirs()
                                 FileOutputStream(outFile).use { out ->
-                                    zip.copyTo(out)
+                                    budget.copyEntry(zip, out)
                                 }
                             }
                             zip.closeEntry()
@@ -606,21 +626,35 @@ object EpubParser {
                 } catch (_: Exception) { }
             }
 
-            // Check if bytes are valid UTF-8
-            if (isValidUtf8(bytes)) {
-                String(bytes, StandardCharsets.UTF_8)
-            } else {
-                // Fallback to GBK / GB18030 for Chinese books
-                try {
-                    String(bytes, Charset.forName("GBK"))
-                } catch (_: Exception) {
-                    String(bytes, StandardCharsets.UTF_8)
-                }
-            }
+            String(bytes, CharsetSniffer.detect(bytes))
         } catch (e: Exception) {
-            Log.e(TAG, "[EpubParser] Error reading text file ${file.name}", e)
-            file.readText(StandardCharsets.UTF_8)
+            throw IllegalArgumentException("EPUB 文本编码无法识别：${file.name}",e)
         }
+    }
+
+    private fun readTocTitles(opf:File,root:File,manifest:Map<String,String>):Map<String,String> {
+        // Android's /data/user/0 and /data/data can refer to the same directory.
+        // Resolve both before computing relative paths, while keeping archive containment checks.
+        val canonicalRoot = root.canonicalFile
+        val result=linkedMapOf<String,String>()
+        val opfDocument=org.jsoup.Jsoup.parse(readTextWithCharsetDetection(opf),"",org.jsoup.parser.Parser.xmlParser())
+        val tocFiles=opfDocument.select("item").filter { it.attr("properties").split(' ').contains("nav") || it.attr("media-type")=="application/x-dtbncx+xml" }
+        for(item in tocFiles) {
+            val toc=ArchiveBudget.destination(canonicalRoot,opf.parentFile!!.canonicalFile.relativeTo(canonicalRoot).invariantSeparatorsPath+"/"+decodeUrl(item.attr("href")))
+            if(!toc.isFile) continue
+            val doc=org.jsoup.Jsoup.parse(readTextWithCharsetDetection(toc),"",org.jsoup.parser.Parser.xmlParser())
+            val links=if(toc.extension.lowercase()=="ncx") doc.select("navPoint") else doc.select("nav[epub:type=toc] a[href], nav a[href]")
+            for(link in links) {
+                val href=if(link.tagName()=="navPoint") link.selectFirst("content")?.attr("src") else link.attr("href")
+                val title=if(link.tagName()=="navPoint") link.selectFirst("navLabel")?.text() else link.text()
+                if(href.isNullOrBlank() || title.isNullOrBlank()) continue
+                val target=File(toc.parentFile,decodeUrl(href.substringBefore('#'))).canonicalFile
+                if(!target.toPath().startsWith(canonicalRoot.toPath())) continue
+                val key=target.relativeTo(opf.parentFile!!).invariantSeparatorsPath
+                result.putIfAbsent(key,title.trim())
+            }
+        }
+        return result
     }
 
     private fun isValidUtf8(bytes: ByteArray): Boolean {
@@ -678,31 +712,131 @@ object EpubParser {
         return "未命名章节"
     }
 
-    private fun extractCleanTextFromHtml(html: String): String {
+    /**
+     * 把 XHTML 内的 <img>/<image> 标签替换为 [IMG:绝对路径|宽|高] 占位符，
+     * 并把图片二进制拷贝到 imageDir 持久保存（正文去标签流程不会破坏该占位符）。
+     * 相同源图片只拷贝一次；SVG 等无法位图解码的格式保持原样（会被当作标签剔除）。
+     */
+    /**
+     * 把 XHTML 内的 <img>/<image> 标签替换为 [IMG:绝对路径|宽|高] 占位符，
+     * 并把图片二进制拷贝到 imageDir 持久保存（正文去标签流程不会破坏该占位符）。
+     * 相同源图片只拷贝一次；SVG 等无法位图解码的格式保持原样（会被当作标签剔除）。
+     */
+    private fun embedImageTokens(
+        rawContent: String,
+        xhtmlFile: File,
+        epubRootDir: File,
+        imageDir: File,
+        bookUri: String
+    ): String {
+        if (!rawContent.contains("<img", ignoreCase = true) &&
+            !rawContent.contains("<image", ignoreCase = true)
+        ) return rawContent
+
+        if (!imageDir.exists()) imageDir.mkdirs()
+
+        val copied = HashMap<String, String>()
+
+        val tagRegex = Regex(
+            """<(?:img|image)\b[^>]*?(?:xlink:href|src)\s*=\s*["']([^"']+)["'][^>]*>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        )
+
+        return tagRegex.replace(rawContent) { match ->
+            val rawSrc = match.groupValues[1].trim()
+            val token = buildImageToken(rawSrc, xhtmlFile, epubRootDir, imageDir, bookUri, copied)
+            token ?: match.value
+        }
+    }
+
+    /**
+     * 单张图片的占位符生成；失败返回 null（调用方回退为原标签）。
+     *
+     * EPUB 内的图片**不落盘副本**：token 引用「EPUB 文件 + 包内条目」（epzip:），
+     * 阅读时从 zip 流直接解码 —— 否则 EPUB 一份 + 解压图片一份，存储翻倍
+     * （用户实测 20MB 书 + 20MB 副本）。仅 data URI 图（无包内条目）仍落盘。
+     */
+    private fun buildImageToken(
+        rawSrc: String,
+        xhtmlFile: File,
+        epubRootDir: File,
+        imageDir: File,
+        bookUri: String,
+        copied: MutableMap<String, String>
+    ): String? {
+        val src = rawSrc.trim()
+        if (src.isBlank()) { Log.d(TAG, "[IMG] null: blank src"); return null }
+
+        val bytes: ByteArray
+        val epzipEntry: String?
+
+        if (src.startsWith("data:")) {
+            if (!src.contains("base64,")) { Log.d(TAG, "[IMG] null: data uri w/o base64"); return null }
+            bytes = android.util.Base64.decode(src.substringAfter("base64,", ""), android.util.Base64.DEFAULT)
+            epzipEntry = null
+        } else {
+            val srcFile = File(xhtmlFile.parentFile, decodeUrl(src.substringBefore('#')))
+            if (!srcFile.exists() || !srcFile.isFile) {
+                Log.d(TAG, "[IMG] null: src missing '${srcFile.absolutePath}' parent=${xhtmlFile.parentFile?.absolutePath}")
+                return null
+            }
+            val ext = srcFile.extension.lowercase()
+            if (ext !in supportedImageExtensions) { Log.d(TAG, "[IMG] null: ext '$ext' unsupported"); return null }
+            bytes = srcFile.readBytes()
+            // zip 内条目 = 临时解压文件相对解压根目录的路径（unzipEpub 按 entry.name 落盘，两者一致）
+            epzipEntry = runCatching {
+                srcFile.relativeTo(epubRootDir).invariantSeparatorsPath
+            }.getOrNull()
+        }
+
+        val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+        if (opts.outWidth <= 0 || opts.outHeight <= 0) {
+            Log.d(TAG, "[IMG] null: decode bounds ${opts.outWidth}x${opts.outHeight} bytes=${bytes.size}")
+            return null
+        }
+
+        if (epzipEntry != null && bookUri.startsWith("file:")) {
+            // EPUB 内图片：零副本引用（epzip: + 书文件 + 包内条目）
+            // bookUri 与 entry 之间用 ! 分隔（| 是 TOKEN_REGEX 的字段分隔符，
+            // epzip 引用必须保持「路径|宽|高」三段式）
+            val token = "[IMG:epzip:$bookUri!$epzipEntry|${opts.outWidth}|${opts.outHeight}]"
+            copied[src] = token
+            return token
+        }
+
+        // data URI 图（或书源非本地文件回退）：落盘
+        val ext = when (opts.outMimeType) {
+            "image/png" -> "png"; "image/webp" -> "webp"; "image/gif" -> "gif"
+            else -> "jpg"
+        }
+
+        val seq = copied.size + 1
+        val target = File(imageDir, "img_${seq}_${System.currentTimeMillis()}.$ext")
+        bytes.inputStream().use { input -> target.outputStream().use { input.copyTo(it) } }
+        copied[src] = target.absolutePath
+        return "[IMG:${target.absolutePath}|${opts.outWidth}|${opts.outHeight}]"
+    }
+
+    private val supportedImageExtensions = setOf("jpg", "jpeg", "png", "webp", "gif", "bmp")
+
+    internal fun extractCleanTextFromHtml(html: String): String {
         if (html.isBlank()) return ""
-
-        // 1. Remove <script>, <style>, <head>, and HTML comments
-        var text = html.replace(Regex("""(?s)<head.*?>.*?</head>"""), "")
-            .replace(Regex("""(?s)<script.*?>.*?</script>"""), "")
-            .replace(Regex("""(?s)<style.*?>.*?</style>"""), "")
-            .replace(Regex("""(?s)<!--.*?-->"""), "")
-
-        // 2. Convert paragraph/block tags to newlines
-        text = text.replace(Regex("""(?i)<(?:p|div|br|h[1-6]|li|tr)[^>]*>"""), "\n")
-            .replace(Regex("""(?i)</(?:p|div|h[1-6]|li|tr)>"""), "\n")
-
-        // 3. Strip all remaining HTML tags
-        text = text.replace(Regex("""<[^>]+>"""), "")
-
-        // 4. Unescape HTML entities
-        text = unescapeHtml(text)
-
-        // 5. Clean up redundant empty lines
-        val lines = text.split("\n")
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-
-        return lines.joinToString("\n\n")
+        val document = org.jsoup.Jsoup.parse(html)
+        document.select("script, style, head, rt, rp").remove()
+        val text = StringBuilder()
+        org.jsoup.select.NodeTraversor.traverse(object : org.jsoup.select.NodeVisitor {
+            override fun head(node: org.jsoup.nodes.Node, depth: Int) {
+                when (node) {
+                    is org.jsoup.nodes.TextNode -> text.append(node.wholeText)
+                    is org.jsoup.nodes.Element -> if (node.isBlock || node.tagName() == "br") text.append('\n')
+                }
+            }
+            override fun tail(node: org.jsoup.nodes.Node, depth: Int) {
+                if (node is org.jsoup.nodes.Element && node.isBlock) text.append('\n')
+            }
+        }, document.body())
+        return text.toString().lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.joinToString("\n\n")
     }
 
     private fun unescapeHtml(input: String): String {
@@ -771,7 +905,8 @@ object EpubParser {
         canvas.drawText("（含封面图片）", 300f, 440f, paint)
 
         val coverBytesStream = java.io.ByteArrayOutputStream()
-        coverBmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 90, coverBytesStream)
+        try { coverBmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 90, coverBytesStream) }
+        finally { coverBmp.recycle() }
         val coverBytes = coverBytesStream.toByteArray()
 
         val opfXml = if (isEpub3) {

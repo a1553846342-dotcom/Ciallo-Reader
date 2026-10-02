@@ -290,7 +290,7 @@ private fun TranslationTab(
     var downloading by remember { mutableFloatStateOf(-1f) }   // -1=空闲，0..1=进度
     var downloadError by remember { mutableStateOf<String?>(null) }
     var cacheBytes by remember { mutableStateOf(TranslationCache.totalBytes(context)) }
-    val onlineFallback = remember { OnlineFallbackTranslator() }
+    val onlineFallback = remember { OnlineFallbackTranslator(context.applicationContext) }
 
     fun startDownload() {
         if (downloading >= 0f) return
@@ -325,7 +325,8 @@ private fun TranslationTab(
 
     fun saveLlm(url: String, key: String, model: String, gemini: Boolean) {
         llmUrl = url; llmKey = key; llmModel = model; llmGemini = gemini
-        llmTranslator.saveConfig(LlmBubbleTranslator.LlmConfig(url, key, model, gemini))
+        runCatching { llmTranslator.saveConfig(LlmBubbleTranslator.LlmConfig(url, key, model, gemini)) }
+            .onFailure { android.widget.Toast.makeText(context, it.message ?: "配置保存失败", android.widget.Toast.LENGTH_LONG).show() }
     }
 
     if (engineSubPage == "ai") {
@@ -1391,6 +1392,7 @@ private fun PageThumbCell(
 
 /* ══════════════ 预设面板 ══════════════ */
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun ComicPresetSheet(
     store: ComicSettingsStore,
@@ -1416,139 +1418,144 @@ internal fun ComicPresetSheet(
         LazyColumn {
             // 收藏置顶（第 27 条）：列表按 favorite 降序稳定排序，收藏组永远在最前
             items(presets.sortedByDescending { it.favorite }, key = { it.id }) { preset ->
-                Row(
+                Column(
                     Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(12.dp))
                         .background(if (preset.favorite) PanelChipActiveBg else PanelChipBg)
                         .padding(horizontal = 12.dp, vertical = 8.dp)
                 ) {
-                    // 图标
-                    Box(
-                        Modifier
-                            .size(40.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(Color(0x2AF0D9C0)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(preset.emoji.take(2), color = MintPrimary, fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                    }
-                    Spacer(Modifier.width(10.dp))
-                    Column(Modifier.weight(1f)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                preset.name, color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium,
-                                maxLines = 1, overflow = TextOverflow.Ellipsis
-                            )
-                            if (preset.favorite) {
-                                Spacer(Modifier.width(6.dp))
-                                // 收藏标记（区别于"默认预设"）：实心星 + 强调色
-                                Icon(Icons.Filled.Star, "已收藏", tint = Color(0xFFFFD27D), modifier = Modifier.size(13.dp))
-                            }
-                            if (preset.id == defaultId) {
-                                Spacer(Modifier.width(6.dp))
-                                Text(
-                                    "默认", color = MintPrimary, fontSize = 10.sp,
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(4.dp))
-                                        .background(Color(0x1FFFFFFF))
-                                        .padding(horizontal = 4.dp, vertical = 1.dp)
-                                )
-                            }
-                            if (preset.builtIn) {
-                                Spacer(Modifier.width(6.dp))
-                                Text(
-                                    "内置", color = TextSecondary, fontSize = 10.sp,
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(4.dp))
-                                        .background(Color(0x1FFFFFFF))
-                                        .padding(horizontal = 4.dp, vertical = 1.dp))
-                            }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        // 图标
+                        Box(
+                            Modifier
+                                .size(40.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(Color(0x2AF0D9C0)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(preset.emoji, color = MintPrimary, fontSize = 13.sp, fontWeight = FontWeight.Bold)
                         }
-                        Text(
-                            "${preset.config.mode.label} · ${preset.config.direction.label} · ${preset.config.pageAnim.label}",
-                            color = TextSecondary, fontSize = 11.sp, maxLines = 1
-                        )
+                        Spacer(Modifier.width(10.dp))
+                        Column(Modifier.weight(1f)) {
+                            FlowRow(verticalArrangement = Arrangement.Center) {
+                                Text(
+                                    preset.name, color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                if (preset.favorite) {
+                                    Spacer(Modifier.width(6.dp))
+                                    // 收藏标记（区别于"默认预设"）：实心星 + 强调色
+                                    Icon(Icons.Filled.Star, "已收藏", tint = Color(0xFFFFD27D), modifier = Modifier.size(13.dp))
+                                }
+                                if (preset.id == defaultId) {
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        "默认", color = MintPrimary, fontSize = 10.sp,
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(4.dp))
+                                            .background(Color(0x1FFFFFFF))
+                                            .padding(horizontal = 4.dp, vertical = 1.dp)
+                                    )
+                                }
+                                if (preset.builtIn) {
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        "内置", color = TextSecondary, fontSize = 10.sp,
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(4.dp))
+                                            .background(Color(0x1FFFFFFF))
+                                            .padding(horizontal = 4.dp, vertical = 1.dp))
+                                }
+                            }
+                            Text(
+                                "${preset.config.mode.label} · ${preset.config.direction.label} · ${preset.config.pageAnim.label}",
+                                color = TextSecondary, fontSize = 11.sp
+                            )
+                        }
+                        // 应用
+                        Box(
+                            Modifier
+                                .clip(RoundedCornerShape(9.dp))
+                                .background(Color(0xFFF0D9C0))
+                                .clickableNoRipple { onApply(preset.config) }
+                                .padding(horizontal = 14.dp, vertical = 8.dp),
+                            contentAlignment = Alignment.Center
+                        ) { Text("应用", color = Color(0xFF0E1512), fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
                     }
-                    // 应用
-                    Box(
-                        Modifier
-                            .clip(RoundedCornerShape(9.dp))
-                            .background(Color(0xFFF0D9C0))
-                            .clickableNoRipple { onApply(preset.config) }
-                            .padding(horizontal = 14.dp, vertical = 8.dp),
-                        contentAlignment = Alignment.Center
-                    ) { Text("应用", color = Color(0xFF0E1512), fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
-                    Spacer(Modifier.width(4.dp))
-                    // 收藏开关（第 27 条：收藏后置顶 + 长按设置入口快捷应用）
-                    Box(
-                        Modifier
-                            .size(40.dp)
-                            .clip(CircleShape)
-                            .clickableNoRipple {
-                                store.togglePresetFavorite(preset.id)
-                                refresh()
-                            },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            if (preset.favorite) Icons.Filled.Star else Icons.Filled.StarBorder,
-                            if (preset.favorite) "取消收藏" else "收藏",
-                            tint = if (preset.favorite) Color(0xFFFFD27D) else TextSecondary,
-                            modifier = Modifier.size(16.dp)
-                        )
-                    }
-                    // 设为默认
-                    Box(
-                        Modifier
-                            .size(40.dp)
-                            .clip(CircleShape)
-                            .clickableNoRipple {
-                                store.setDefaultPreset(preset.id)
-                                refresh()
-                            },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            Icons.Outlined.PushPin,
-                            "设为默认",
-                            tint = if (preset.id == defaultId) MintPrimary else TextSecondary,
-                            modifier = Modifier.size(16.dp)
-                        )
-                    }
-                    Box(
-                        Modifier
-                            .size(40.dp)
-                            .clip(CircleShape)
-                            .clickableNoRipple {
-                                store.duplicatePreset(preset.id)
-                                refresh()
-                            },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(Icons.Filled.ContentCopy, "复制", tint = TextSecondary, modifier = Modifier.size(15.dp))
-                    }
-                    if (!preset.builtIn) {
+                    // Keep actions on their own wrapping row so names retain their width
+                    // on small screens and when the system font size is increased.
+                    FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                        // 收藏开关（第 27 条：收藏后置顶 + 长按设置入口快捷应用）
                         Box(
                             Modifier
                                 .size(40.dp)
                                 .clip(CircleShape)
-                                .clickableNoRipple { renameTarget = preset },
+                                .clickableNoRipple {
+                                    store.togglePresetFavorite(preset.id)
+                                    refresh()
+                                },
                             contentAlignment = Alignment.Center
                         ) {
-                            Icon(Icons.Filled.DriveFileRenameOutline, "重命名", tint = TextSecondary, modifier = Modifier.size(15.dp))
+                            Icon(
+                                if (preset.favorite) Icons.Filled.Star else Icons.Filled.StarBorder,
+                                if (preset.favorite) "取消收藏" else "收藏",
+                                tint = if (preset.favorite) Color(0xFFFFD27D) else TextSecondary,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                        // 设为默认
+                        Box(
+                            Modifier
+                                .size(40.dp)
+                                .clip(CircleShape)
+                                .clickableNoRipple {
+                                    store.setDefaultPreset(preset.id)
+                                    refresh()
+                                },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                Icons.Outlined.PushPin,
+                                "设为默认",
+                                tint = if (preset.id == defaultId) MintPrimary else TextSecondary,
+                                modifier = Modifier.size(16.dp)
+                            )
                         }
                         Box(
                             Modifier
                                 .size(40.dp)
                                 .clip(CircleShape)
                                 .clickableNoRipple {
-                                    store.deletePreset(preset.id)
+                                    store.duplicatePreset(preset.id)
                                     refresh()
                                 },
                             contentAlignment = Alignment.Center
                         ) {
-                            Icon(Icons.Filled.Delete, "删除", tint = Color(0xFFFF9A9A), modifier = Modifier.size(15.dp))
+                            Icon(Icons.Filled.ContentCopy, "复制", tint = TextSecondary, modifier = Modifier.size(15.dp))
+                        }
+                        if (!preset.builtIn) {
+                            Box(
+                                Modifier
+                                    .size(40.dp)
+                                    .clip(CircleShape)
+                                    .clickableNoRipple { renameTarget = preset },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(Icons.Filled.DriveFileRenameOutline, "重命名", tint = TextSecondary, modifier = Modifier.size(15.dp))
+                            }
+                            Box(
+                                Modifier
+                                    .size(40.dp)
+                                    .clip(CircleShape)
+                                    .clickableNoRipple {
+                                        store.deletePreset(preset.id)
+                                        refresh()
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(Icons.Filled.Delete, "删除", tint = Color(0xFFFF9A9A), modifier = Modifier.size(15.dp))
+                            }
                         }
                     }
                 }
@@ -1669,7 +1676,9 @@ internal fun ComicCropSheet(
         raw[2] = raw[2].coerceIn(raw[0] + 0.05f, 1f)
         raw[3] = raw[3].coerceIn(raw[1] + 0.05f, 1f)
         if (raw[0] == 0f || raw[1] == 0f || raw[2] == 1f || raw[3] == 1f) {
-            view.performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY)
+            if (com.example.ui.feedback.HapticsGate.enabled) {
+                view.performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY)
+            }
         }
         crop = raw.copyOf()
     }

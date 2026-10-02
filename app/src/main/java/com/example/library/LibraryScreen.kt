@@ -145,6 +145,7 @@ import com.example.source.ComicSource
 import com.example.source.LoginCredential
 import com.example.source.SourceResult
 import com.example.source.isNovelSource
+import com.example.source.isComicSource
 import com.example.ui.components.GlassCard
 import com.example.ui.glasskit.GlassKitCard
 import com.example.ui.components.GlassDialogWindowEffect
@@ -172,6 +173,7 @@ import androidx.compose.foundation.layout.widthIn
 import com.example.ui.adaptive.AdaptiveSpec
 import com.example.ui.design.DesignTokens
 import com.example.ui.theme.AppFonts
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -181,36 +183,38 @@ fun LibraryScreen(
     onOpenSourceManagement: () -> Unit = {},
     onImportLocalBook: () -> Unit = {},
     onOpenComic: (SearchBook) -> Unit = {},
+    onOpenLocalNovel: (com.example.data.Book) -> Unit = {},
     /** "sourceId::comicId" 集合：搜索结果卡片上的 ♡ 是否已喜欢 */
     favoriteKeys: Set<String> = emptySet(),
     /** 搜索结果直接点 ♡ → 加入 / 取消「我喜欢的」 */
     onToggleFavorite: (SearchBook, Boolean) -> Unit = { _, _ -> },
     extraBottomPadding: Dp = 0.dp
 ) {
-    val currentSource by viewModel.currentSource.collectAsState()
-    val aggregateMode by viewModel.aggregateMode.collectAsState()
+    val currentSource by viewModel.currentSource.collectAsStateWithLifecycle()
+    val aggregateMode by viewModel.aggregateMode.collectAsStateWithLifecycle()
     // 聚合搜索类别（v1.0.1）："comic" 漫画源 / "novel" 小说源，书源弹层分区选择、互斥过滤
-    val aggregateKind by viewModel.aggregateKind.collectAsState()
+    val aggregateKind by viewModel.aggregateKind.collectAsStateWithLifecycle()
     // 第十一轮第 6 条：多语言搜索开关状态（书源选择弹层内可控）
-    val multiLangSearch by viewModel.multiLanguageSearch.collectAsState()
+    val multiLangSearch by viewModel.multiLanguageSearch.collectAsStateWithLifecycle()
     val context = androidx.compose.ui.platform.LocalContext.current
-    val availableSources by viewModel.availableSources.collectAsState()
-    val uiState by viewModel.uiState.collectAsState()
+    val availableSources by viewModel.availableSources.collectAsStateWithLifecycle()
+    val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val searchResults = (uiState as? LibraryUiState.SearchResults)?.results ?: emptyList()
     val isSearching = uiState is LibraryUiState.Searching
-    val errorMessage by viewModel.errorMessage.collectAsState()
-    val downloadStatesState = viewModel.downloadStates.collectAsState()
+    val errorMessage by viewModel.errorMessage.collectAsStateWithLifecycle()
+    val downloadStatesState = viewModel.downloadStates.collectAsStateWithLifecycle()
     val downloadStates by downloadStatesState
-    val comicDownloading by viewModel.comicDownloading.collectAsState()
-    val comicDownloadProgress by viewModel.comicDownloadProgress.collectAsState()
-    val comicPaused by viewModel.comicPaused.collectAsState()
-    val comicDownloadTasks by viewModel.comicDownloadTasks.collectAsState()
-    val comicBook by viewModel.comicBook.collectAsState()
-    val comicChapters by viewModel.comicChapters.collectAsState()
-    val searchHistory by viewModel.searchHistory.collectAsState()
-    val formatPickerBook by viewModel.formatPickerBook.collectAsState()
-    val pendingFormats by viewModel.pendingFormats.collectAsState()
-    val formatLoading by viewModel.formatLoading.collectAsState()
+    val downloadedNovelKeys by viewModel.downloadedNovelKeys.collectAsStateWithLifecycle()
+    val comicDownloading by viewModel.comicDownloading.collectAsStateWithLifecycle()
+    val comicDownloadProgress by viewModel.comicDownloadProgress.collectAsStateWithLifecycle()
+    val comicPaused by viewModel.comicPaused.collectAsStateWithLifecycle()
+    val comicDownloadTasks by viewModel.comicDownloadTasks.collectAsStateWithLifecycle()
+    val comicBook by viewModel.comicBook.collectAsStateWithLifecycle()
+    val comicChapters by viewModel.comicChapters.collectAsStateWithLifecycle()
+    val searchHistory by viewModel.searchHistory.collectAsStateWithLifecycle()
+    val formatPickerBook by viewModel.formatPickerBook.collectAsStateWithLifecycle()
+    val pendingFormats by viewModel.pendingFormats.collectAsStateWithLifecycle()
+    val formatLoading by viewModel.formatLoading.collectAsStateWithLifecycle()
     // 封面加载器：ZLibrary 走专用 DoH/会话 Cookie 加载器，其余（MangaDex/JS 源/聚合）走通用加载器
     val imageLoader = remember(aggregateMode, currentSource?.id) {
         if (aggregateMode || currentSource?.id != "zlibrary") {
@@ -232,8 +236,25 @@ fun LibraryScreen(
     var loginLoading by remember { mutableStateOf(false) }
     var loginChecked by remember { mutableStateOf(false) }
     var showDownloadPanel by remember { mutableStateOf(false) }
+    var novelDetailBook by remember { mutableStateOf<SearchBook?>(null) }
+    var novelDetailLoading by remember { mutableStateOf(false) }
+    var novelDetailError by remember { mutableStateOf<String?>(null) }
     val hazeState = remember { HazeState() }
     val scope = rememberCoroutineScope()
+
+    LaunchedEffect(novelDetailBook?.sourceId, novelDetailBook?.id) {
+        val book = novelDetailBook ?: return@LaunchedEffect
+        novelDetailLoading = true
+        novelDetailError = null
+        try {
+            when (val result = viewModel.novelDetail(book)) {
+                is com.example.source.SourceResult.Success -> novelDetailBook = result.data
+                is com.example.source.SourceResult.Error -> novelDetailError = result.exception.message ?: "详情暂时无法加载"
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (e: Exception) { novelDetailError = e.message ?: "详情暂时无法加载" }
+        finally { novelDetailLoading = false }
+    }
 
     val session = remember {
         ZLibraryNativeSession(
@@ -282,7 +303,7 @@ fun LibraryScreen(
         val book = activeDownloadBook
         if (book != null) {
             kotlinx.coroutines.delay(15000)
-            val st = viewModel.downloadStates.value[book.id]
+            val st = viewModel.downloadStates.value[com.example.download.DownloadManager.taskId(book.sourceId, book.id)]
             if (st == null || st is DownloadState.Idle) {
                 nativeStatus = "未能获取下载链接（可能需要登录），可稍后重试"
             }
@@ -365,8 +386,8 @@ fun LibraryScreen(
         }
     }
 
-    val hasSeenWelcome by viewModel.hasSeenWelcome.collectAsState()
-    val isCurrentSourceLoggedIn by viewModel.isCurrentSourceLoggedIn.collectAsState()
+    val hasSeenWelcome by viewModel.hasSeenWelcome.collectAsStateWithLifecycle()
+    val isCurrentSourceLoggedIn by viewModel.isCurrentSourceLoggedIn.collectAsStateWithLifecycle()
 
     // Filter environment-only sources in production UI
     val visibleSources = remember(availableSources) {
@@ -376,6 +397,14 @@ fun LibraryScreen(
     var loginDialogSource by remember { mutableStateOf<BookSource?>(null) }
     // 搜索词跨导航保持（1.05 修复）：进详情页回来后搜索结果原样还在
     var searchQuery by rememberSaveable { mutableStateOf("") }
+    val detailSearchRequest by viewModel.detailSearchRequest.collectAsStateWithLifecycle()
+    LaunchedEffect(detailSearchRequest?.token) {
+        detailSearchRequest?.let { request ->
+            searchQuery = request.keyword
+            performSearch(request.keyword)
+            viewModel.consumeDetailSearch(request.token)
+        }
+    }
     var showSourceSheet by remember { mutableStateOf(false) }
     val focusManager = LocalFocusManager.current
 
@@ -411,6 +440,28 @@ fun LibraryScreen(
         )
     ) { mutableStateMapOf<String, Boolean>() }
     val aggResults = uiState as? LibraryUiState.AggregateResults
+    val hasAggregateBooks = aggResults?.groups?.any { it.books.isNotEmpty() } == true
+    // Only follow the first hit while waiting at the top. On navigation back, initialize
+    // from the restored results so this effect preserves the reader's saved position.
+    var hadAggregateBooks by remember { mutableStateOf(hasAggregateBooks) }
+    var waitingForFirstHitAtTop by remember { mutableStateOf(false) }
+    LaunchedEffect(hasAggregateBooks) {
+        if (!hasAggregateBooks) {
+            hadAggregateBooks = false
+            snapshotFlow {
+                staggeredGridState.firstVisibleItemIndex == 0 &&
+                    staggeredGridState.firstVisibleItemScrollOffset == 0 &&
+                    !staggeredGridState.isScrollInProgress
+            }.collect { waitingForFirstHitAtTop = it }
+        }
+        if (!hadAggregateBooks && waitingForFirstHitAtTop && aggregateKind == "comic" &&
+            pendingJumpSourceId == null && !staggeredGridState.isScrollInProgress &&
+            hasAggregateBooks
+        ) {
+            staggeredGridState.scrollToItem(0)
+        }
+        hadAggregateBooks = hasAggregateBooks
+    }
     val activeGroupIdx by remember(aggResults?.groups) {
         derivedStateOf {
             val groups = aggResults?.groups ?: return@derivedStateOf -1
@@ -442,10 +493,20 @@ fun LibraryScreen(
         ZLibraryLoginDialog(hazeState = hazeState,
             source = src,
             onDismiss = { loginDialogSource = null },
-            onSuccess = { 
+            onSuccess = {
                 loginDialogSource = null
                 viewModel.checkSourceLoginStatus()
-            }
+            },
+            // vomic 支持站内注册：登录窗口下方出现「注册新账号」（弹窗链驱动）
+            onRegister = if (src.id == "js_vomic") {
+                {
+                    val result = (src as? com.example.source.js.JsComicSource)?.register()
+                        ?: throw IllegalStateException("源不可用")
+                    if (result is com.example.source.SourceResult.Error) {
+                        throw Exception(result.exception.message ?: "注册失败")
+                    }
+                }
+            } else null
         )
     }
 
@@ -513,7 +574,7 @@ fun LibraryScreen(
         subtitle = "LIBRARY & SEARCH",
         titleColor = glassTitleColor(),
                 trailing = {
-                    val latestSt = activeDownloadBook?.let { downloadStates[it.id] }
+                    val latestSt = activeDownloadBook?.let { downloadStates[com.example.download.DownloadManager.taskId(it.sourceId, it.id)] }
                     val comicActive = comicDownloading.isNotEmpty()
                     IconButton(onClick = { showDownloadPanel = !showDownloadPanel }) {
                         Box(contentAlignment = Alignment.Center) {
@@ -686,6 +747,7 @@ fun LibraryScreen(
                         agg.groups.forEach { group ->
                             item(
                                 key = "agg_group_header_${group.sourceId}",
+                                contentType = "fullspan",
                                 span = StaggeredGridItemSpan.FullLine
                             ) {
                                 AggregateSourceHeader(
@@ -695,24 +757,20 @@ fun LibraryScreen(
                                     onClick = { showJumpSheet = true }
                                 )
                             }
-                            if (group.loading) {
-                                // 加载占位固定 4 个、不参与重排，无需 key。
-                                // 注意：LazyStaggeredGridScope 没有 items(count) 重载
-                                //（只有 items(List)），原先 items(4, key=...) 实际是匹配到了
-                                // LazyListScope 的版本 —— 正是两个同名 import 造成的错配。
-                                gridItems(List(4) { it }) { index ->
-                                    ShimmerBox(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .aspectRatio(STAGGER_RATIO_PALETTE[index % STAGGER_RATIO_PALETTE.size])
-                                    )
-                                }
-                            } else if (group.books.isNotEmpty()) {
+                            // 已有结果即显示，loading 仅表示后台仍在补充其它语言。
+                            if (group.books.isNotEmpty()) {
                                 val groupExpanded = expandedGroups[group.sourceId] == true
                                 val visibleBooks = if (groupExpanded) group.books
                                     else group.books.take(AGGREGATE_PREVIEW_COUNT)
-                                gridItems(visibleBooks, key = { "${group.sourceId}_${it.id}" }) { book ->
+                                gridItems(visibleBooks, key = { "${group.sourceId}_${it.id}" }, contentType = { "book" },
+                                    span = { book -> if (availableSources.any { it.id == book.sourceId && it.isNovelSource }) StaggeredGridItemSpan.FullLine else StaggeredGridItemSpan.SingleLane }) { book ->
                                     val bookSource = availableSources.firstOrNull { it.id == book.sourceId }
+                                    if (bookSource?.isNovelSource == true) {
+                                        NovelSearchCard(book, group.sourceName, if (book.sourceId == "zlibrary") ZLibraryCoverLoader.get(context) else imageLoader,
+                                            state = downloadStates[com.example.download.DownloadManager.taskId(book.sourceId, book.id)] ?: DownloadState.Idle,
+                                            downloaded = com.example.download.DownloadManager.taskId(book.sourceId, book.id) in downloadedNovelKeys,
+                                            onClick = { novelDetailBook = book })
+                                    } else {
                                     StaggeredComicCard(
                                         book = book,
                                         imageLoader = imageLoader,
@@ -732,19 +790,10 @@ fun LibraryScreen(
                                         modifier = if (searchFieldFocused) Modifier
                                         else Modifier.animateItemPlacement(),
                                         onClick = {
-                                            if (bookSource != null && bookSource.isNovelSource &&
-                                                !bookSource.capabilities.supportOnlineText
-                                            ) {
-                                                // 下载型小说源（Z-Library）：不走漫画章节页
-                                                //（会报"当前书源不支持漫画"），直接进下载流程
-                                                activeDownloadBook = book
-                                                showDownloadPanel = true
-                                                viewModel.startDownload(book)
-                                            } else {
-                                                onOpenComic(book)
-                                            }
+                                            onOpenComic(book)
                                         }
                                     )
+                                    }
                                 }
                                 // 展开按钮：还有隐藏结果时出现在第 6 条之后
                                 if (!groupExpanded && group.books.size > AGGREGATE_PREVIEW_COUNT) {
@@ -757,6 +806,14 @@ fun LibraryScreen(
                                             onExpand = { expandedGroups[group.sourceId] = true }
                                         )
                                     }
+                                }
+                            } else if (group.loading) {
+                                gridItems(List(4) { it }, contentType = { "skeleton" }) { index ->
+                                    ShimmerBox(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .aspectRatio(STAGGER_RATIO_PALETTE[index % STAGGER_RATIO_PALETTE.size])
+                                    )
                                 }
                             } else {
                                 item(
@@ -915,10 +972,14 @@ fun LibraryScreen(
                         columnItems(searchResults, key = { it.id }) { book ->
                             val st by remember(book.id) {
                                 derivedStateOf {
-                                    downloadStatesState.value[book.id] ?: DownloadState.Idle
+                                    downloadStatesState.value[com.example.download.DownloadManager.taskId(book.sourceId, book.id)] ?: DownloadState.Idle
                                 }
                             }
-                            LibraryBookCard(
+                            if (currentSource?.isNovelSource == true) {
+                                NovelSearchCard(book, currentSource?.name.orEmpty(), imageLoader, state = st,
+                                    downloaded = com.example.download.DownloadManager.taskId(book.sourceId, book.id) in downloadedNovelKeys,
+                                    onClick = { novelDetailBook = book })
+                            } else LibraryBookCard(
                                 book = book,
                                 downloadState = st,
                                 // 同上：输入法动画期间不做卡片位移动画，避免几十个动画器并发
@@ -944,9 +1005,9 @@ fun LibraryScreen(
                                         viewModel.startDownload(book)
                                     }
                                 },
-                                onPauseDownload = { viewModel.pauseDownload(book.id) },
-                                onResumeDownload = { viewModel.resumeDownload(book.id) },
-                                onCancelDownload = { viewModel.cancelDownload(book.id) }
+                                onPauseDownload = { viewModel.pauseDownload(com.example.download.DownloadManager.taskId(book.sourceId, book.id)) },
+                                onResumeDownload = { viewModel.resumeDownload(com.example.download.DownloadManager.taskId(book.sourceId, book.id)) },
+                                onCancelDownload = { viewModel.cancelDownload(com.example.download.DownloadManager.taskId(book.sourceId, book.id)) }
                             )
                         }
                     }
@@ -990,6 +1051,25 @@ fun LibraryScreen(
             }
         }
 
+        novelDetailBook?.let { book ->
+            val id = com.example.download.DownloadManager.taskId(book.sourceId, book.id)
+            NovelDetailSheet(book, availableSources.firstOrNull { it.id == book.sourceId }?.name.orEmpty(),
+                if (book.sourceId == "zlibrary") ZLibraryCoverLoader.get(context) else imageLoader,
+                novelDetailLoading, novelDetailError, downloadStates[id] ?: DownloadState.Idle,
+                hasLocal = id in downloadedNovelKeys,
+                onDismiss = { novelDetailBook = null }, onDownload = {
+                    scope.launch {
+                        val source = availableSources.firstOrNull { it.id == book.sourceId }
+                        if (source?.capabilities?.downloadRequiresLogin == true && !source.isLoggedIn()) {
+                            loginDialogSource = source
+                        } else if (book.sourceId == "zlibrary") viewModel.startDownload(book)
+                        else viewModel.startDownload(book, book.format)
+                    }
+                },
+                onRead = { scope.launch { viewModel.localNovel(book)?.let { local -> novelDetailBook = null; onOpenLocalNovel(local) } } },
+                onPause = { viewModel.pauseDownload(id) }, onResume = { viewModel.resumeDownload(id) }, onCancel = { viewModel.cancelDownload(id) })
+        }
+
         // 下载格式选择弹窗（Z-Library 多格式书源）
         formatPickerBook?.let { book ->
             FormatPickerDialog(
@@ -1021,7 +1101,7 @@ fun LibraryScreen(
                     label = "downloadPanelFade"
                 )
                 val book = activeDownloadBook
-                val st = book?.let { downloadStates[it.id] } ?: DownloadState.Idle
+                val st = book?.let { downloadStates[com.example.download.DownloadManager.taskId(it.sourceId, it.id)] } ?: DownloadState.Idle
                 val comicTasks = comicDownloadTasks.values.toList()
                 Box(
                     modifier = Modifier
@@ -1056,9 +1136,9 @@ fun LibraryScreen(
                             state = st,
                             hazeState = hazeState,
                             onDismiss = { showDownloadPanel = false },
-                            onPause = { book?.let { viewModel.pauseDownload(it.id) } },
-                            onResume = { book?.let { viewModel.resumeDownload(it.id) } },
-                            onCancel = { book?.let { viewModel.cancelDownload(it.id) } },
+                            onPause = { book?.let { viewModel.pauseDownload(com.example.download.DownloadManager.taskId(it.sourceId, it.id)) } },
+                            onResume = { book?.let { viewModel.resumeDownload(com.example.download.DownloadManager.taskId(it.sourceId, it.id)) } },
+                            onCancel = { book?.let { viewModel.cancelDownload(com.example.download.DownloadManager.taskId(it.sourceId, it.id)) } },
                             modifier = Modifier.fillMaxWidth()
                         )
                     }
@@ -1070,7 +1150,7 @@ fun LibraryScreen(
         if (showSourceSheet) {
             // v1.0.1：按源类型分区——聚合漫画（漫画源）/ 聚合小说（小说源）互斥展示
             val comicSources = remember(visibleSources) {
-                visibleSources.filter { !it.isNovelSource }
+                visibleSources.filter { it.isComicSource }
             }
             val novelSources = remember(visibleSources) {
                 visibleSources.filter { it.isNovelSource }
@@ -3242,16 +3322,16 @@ private fun AggregateExpandButton(
  * 每个源组在 StaggeredGrid 占用的 item 数：组头 + (shimmer×4 | 书卡[+展开按钮] | 错误卡)，
  * 与网格 emit 逻辑一一对应。折叠态只占前 [AGGREGATE_PREVIEW_COUNT] 张书卡 + 1 个展开按钮。
  */
-private fun aggregateGroupItemCount(
+internal fun aggregateGroupItemCount(
     group: LibraryUiState.AggregateGroup,
     expanded: Boolean = false
 ): Int = when {
-    group.loading -> 4
     group.books.isNotEmpty() -> {
         val cards = if (expanded) group.books.size
             else minOf(group.books.size, AGGREGATE_PREVIEW_COUNT)
         if (!expanded && group.books.size > AGGREGATE_PREVIEW_COUNT) cards + 1 else cards
     }
+    group.loading -> 4
     else -> 1
 }
 

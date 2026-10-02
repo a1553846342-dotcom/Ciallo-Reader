@@ -20,6 +20,9 @@ interface BookDao {
     @Query("SELECT * FROM books WHERE filePath = :filePath LIMIT 1")
     suspend fun getBookByFilePath(filePath: String): Book?
 
+    @Query("SELECT * FROM books WHERE sourceId = :sourceId AND comicId = :resourceId LIMIT 1")
+    suspend fun getBookBySourceResource(sourceId: String, resourceId: String): Book?
+
     @Query("SELECT * FROM books WHERE id = :id")
     suspend fun getBookById(id: Int): Book?
 
@@ -29,8 +32,14 @@ interface BookDao {
     @Update
     suspend fun updateBook(book: Book)
 
+    @Query("UPDATE books SET currentChapterIndex=:chapter,scrollOffset=:offset,isFinished=isFinished OR :finished,lastReadTime=:time WHERE id=:bookId")
+    suspend fun updateProgress(bookId:Int,chapter:Int,offset:Int,finished:Boolean,time:Long)
+
     @Delete
     suspend fun deleteBook(book: Book)
+
+    @Query("SELECT EXISTS(SELECT 1 FROM chapters WHERE bookId=:bookId AND length(content)>:limit)")
+    suspend fun hasOversizedChapter(bookId:Int,limit:Int): Boolean
 
     @Query("SELECT * FROM chapters WHERE bookId = :bookId ORDER BY chapterOrder ASC")
     fun getChaptersForBook(bookId: Int): Flow<List<Chapter>>
@@ -44,11 +53,27 @@ interface BookDao {
     @Query("SELECT * FROM chapters WHERE bookId = :bookId AND content LIKE '%' || :query || '%' ORDER BY chapterOrder ASC")
     suspend fun searchChapters(bookId: Int, query: String): List<Chapter>
 
+    @Query("SELECT * FROM chapters WHERE bookId = :bookId AND chapterOrder > :afterOrder AND instr(lower(content), lower(:query)) > 0 ORDER BY chapterOrder LIMIT 16")
+    suspend fun searchChaptersBatch(bookId: Int, query: String, afterOrder: Int): List<Chapter>
+
     @Query("SELECT * FROM chapters WHERE bookId = :bookId AND chapterOrder IN (:chapterOrders)")
     suspend fun getChaptersByOrders(bookId: Int, chapterOrders: List<Int>): List<Chapter>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertChapters(chapters: List<Chapter>)
+
+    @Transaction
+    suspend fun insertBookWithChapters(book: Book, chapters: List<Chapter>): Book {
+        val id = insertBook(book).toInt()
+        insertChapters(chapters.map { it.copy(bookId = id) })
+        return book.copy(id = id)
+    }
+
+    @Query("DELETE FROM bookmarks WHERE bookId = :bookId")
+    suspend fun deleteBookmarksForBook(bookId: Int)
+
+    @Query("DELETE FROM highlights WHERE bookId = :bookId")
+    suspend fun deleteHighlightsForBook(bookId: Int)
 
     @Query("DELETE FROM chapters WHERE bookId = :bookId")
     suspend fun deleteChaptersForBook(bookId: Int)
@@ -112,6 +137,12 @@ interface BookDao {
     @Query("SELECT * FROM reading_records ORDER BY dateStr DESC")
     fun getAllReadingRecordsFlow(): Flow<List<ReadingRecord>>
 
+    @Query("SELECT COALESCE(SUM(durationSeconds),0) FROM reading_records")
+    suspend fun totalRecordedSeconds(): Long
+
+    @Query("SELECT COALESCE(SUM(durationSeconds),0) FROM reading_records WHERE dateStr=:date")
+    suspend fun recordedSecondsForDate(date:String): Long
+
     // ---------------- 阅读会话（新统计口径） ----------------
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
@@ -134,6 +165,9 @@ interface BookDao {
 
     @Query("DELETE FROM reading_sessions WHERE bookId = :bookId")
     suspend fun deleteReadingSessionsForBook(bookId: Int)
+
+    @Query("UPDATE reading_sessions SET bookId = NULL WHERE bookId = :bookId")
+    suspend fun nullifyBookIdInReadingSessions(bookId: Int)
 
     @Query("SELECT * FROM reading_sessions ORDER BY startTimeMs DESC")
     fun getAllReadingSessionsFlow(): Flow<List<ReadingSession>>
@@ -202,9 +236,9 @@ data class AniListTitleEntity(
 )
 
 @Database(
-    entities = [Book::class, Chapter::class, Bookmark::class, Highlight::class, CategoryEntity::class, ReadingRecord::class, ReadingSession::class, com.example.download.DownloadTaskEntity::class, AniListTitleEntity::class, com.example.data.favorite.FavoriteEntity::class, com.example.data.favorite.ComicProgressEntity::class, com.example.data.favorite.ChapterReadEntity::class, com.example.data.favorite.FavoriteCategoryEntity::class],
-    version = 11,
-    exportSchema = false
+    entities = [Book::class, Chapter::class, Bookmark::class, Highlight::class, CategoryEntity::class, ReadingRecord::class, ReadingSession::class, com.example.download.DownloadTaskEntity::class, AniListTitleEntity::class, com.example.data.favorite.FavoriteEntity::class, com.example.data.favorite.ComicProgressEntity::class, com.example.data.favorite.ChapterReadEntity::class, com.example.data.favorite.FavoriteCategoryEntity::class, com.example.god.GodMomentEntity::class],
+    version = 12,
+    exportSchema = true
 )
 @TypeConverters(com.example.download.DownloadTypeConverters::class)
 abstract class AppDatabase : RoomDatabase() {
@@ -212,6 +246,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun downloadTaskDao(): com.example.download.DownloadTaskDao
     abstract fun anilistDao(): AniListDao
     abstract fun favoriteDao(): com.example.data.favorite.FavoriteDao
+    abstract fun godMomentDao(): com.example.god.GodMomentDao
 
     companion object {
         @Volatile
@@ -386,6 +421,63 @@ abstract class AppDatabase : RoomDatabase() {
         }
 
         /**
+         * v11 -> v12（漫画章节书签 + 神回）：给 comic_chapter_read 增加 bookmarked，
+         * 新增 god_moments 表 + (bookId, chapterId) 唯一索引。
+         *
+         * 说明：漫画的神回主键是**源作用域字符串**（bookId = "sourceId::comicId"，
+         * chapterId = 源章节 id），与本地小说库 books/chapters 的 Int 主键不同源，
+         * 因此不建 Room 外键；级联删除由 [com.example.god.GodMomentRepository]
+         * 的 deleteForBook / deleteForChapter 显式执行（含封面缓存文件清理）。
+         * 存量数据：章节阅读记录保留，旧记录的书签标记默认为 false。
+         */
+        val MIGRATION_11_12 = object : androidx.room.migration.Migration(11, 12) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                // 旧版章节阅读记录没有 bookmarked。仅在实体加字段而漏掉此处，
+                // Room 会在升级校验时报 schema mismatch，启动后的首次查库即闪退。
+                // DEFAULT 0 保留所有旧记录，并让它们默认处于未标书签状态。
+                val hasBookmarkColumn = db.query("PRAGMA table_info(`comic_chapter_read`)").use { cursor ->
+                    val nameColumn = cursor.getColumnIndexOrThrow("name")
+                    var found = false
+                    while (cursor.moveToNext()) {
+                        if (cursor.getString(nameColumn) == "bookmarked") {
+                            found = true
+                            break
+                        }
+                    }
+                    found
+                }
+                if (!hasBookmarkColumn) {
+                    db.execSQL("ALTER TABLE `comic_chapter_read` ADD COLUMN `bookmarked` INTEGER NOT NULL DEFAULT 0")
+                }
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `god_moments` (" +
+                        "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                        "`contentType` TEXT NOT NULL, " +
+                        "`bookId` TEXT NOT NULL, " +
+                        "`chapterId` TEXT NOT NULL, " +
+                        "`bookTitle` TEXT NOT NULL, " +
+                        "`chapterTitle` TEXT NOT NULL, " +
+                        "`chapterNumber` INTEGER NOT NULL, " +
+                        "`title` TEXT NOT NULL, " +
+                        "`titleIsCustom` INTEGER NOT NULL, " +
+                        "`rating` REAL NOT NULL, " +
+                        "`note` TEXT NOT NULL, " +
+                        "`coverPath` TEXT, " +
+                        "`coverSource` TEXT NOT NULL, " +
+                        "`cropParams` TEXT NOT NULL, " +
+                        "`createdAt` INTEGER NOT NULL, " +
+                        "`updatedAt` INTEGER NOT NULL)"
+                )
+                db.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS `index_god_moments_bookId_chapterId` " +
+                        "ON `god_moments` (`bookId`, `chapterId`)"
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_god_moments_rating` ON `god_moments` (`rating`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_god_moments_createdAt` ON `god_moments` (`createdAt`)")
+            }
+        }
+
+        /**
          * 第十轮：AniList 多语言标题库改为 APK 内置（assets/anilist_titles.tsv.gz，
          * 2.7 万行 / 4950 部热门作品），首次打开主库时一次性导入——用户零拉取、
          * 离线可用；运行时同步调度器已移除。
@@ -410,10 +502,13 @@ abstract class AppDatabase : RoomDatabase() {
                     "novel_reader.db"
                 )
                     .addMigrations(
+                        LegacyDatabaseMigration(1), LegacyDatabaseMigration(2),
+                        LegacyDatabaseMigration(3), LegacyDatabaseMigration(4),
                         MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8,
-                        MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11
+                        MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11,
+                        MIGRATION_11_12
                     )
-                    .fallbackToDestructiveMigration()
+                    
                     .build()
                 INSTANCE = instance
                 instance

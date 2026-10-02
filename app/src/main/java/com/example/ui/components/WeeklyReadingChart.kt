@@ -59,6 +59,7 @@ fun WeeklyReadingChart(
     books: List<Book> = emptyList(),
     recordCovers: Map<Int, String> = emptyMap(),
     recordBooks: Map<Int, com.example.source.SearchBook> = emptyMap(),
+    recordCoverHeaders: Map<Int, Map<String, String>> = emptyMap(),
     onDeleteRecord: (ReadingRecord) -> Unit = {},
     onOpenRecordDetail: (com.example.source.SearchBook) -> Unit = {},
     onOpenBook: (Book) -> Unit = {},
@@ -385,6 +386,7 @@ fun WeeklyReadingChart(
                 books = books,
                 recordCovers = recordCovers,
                 recordBooks = recordBooks,
+                recordCoverHeaders = recordCoverHeaders,
                 onDeleteRecord = onDeleteRecord,
                 onOpenRecordDetail = onOpenRecordDetail,
                 onOpenBook = onOpenBook
@@ -400,6 +402,7 @@ private fun DayCoverCarousel(
     books: List<Book>,
     recordCovers: Map<Int, String>,
     recordBooks: Map<Int, com.example.source.SearchBook>,
+    recordCoverHeaders: Map<Int, Map<String, String>>,
     onDeleteRecord: (ReadingRecord) -> Unit,
     onOpenRecordDetail: (com.example.source.SearchBook) -> Unit,
     onOpenBook: (Book) -> Unit
@@ -429,6 +432,7 @@ private fun DayCoverCarousel(
                 books = books,
                 recordCovers = recordCovers,
                 recordBooks = recordBooks,
+                recordCoverHeaders = recordCoverHeaders,
                 onDeleteRecord = onDeleteRecord,
                 onOpenRecordDetail = onOpenRecordDetail,
                 onOpenBook = onOpenBook
@@ -443,12 +447,13 @@ private fun DayCoverCard(
     books: List<Book>,
     recordCovers: Map<Int, String>,
     recordBooks: Map<Int, com.example.source.SearchBook>,
+    recordCoverHeaders: Map<Int, Map<String, String>>,
     onDeleteRecord: (ReadingRecord) -> Unit,
     onOpenRecordDetail: (com.example.source.SearchBook) -> Unit,
     onOpenBook: (Book) -> Unit
 ) {
     val book = books.firstOrNull { it.id == record.bookId }
-    val recordBook = recordBooks[record.id]
+    val recordBook = recordBooks[record.id]?.takeIf { it.sourceId.isNotBlank() }
     var showMenu by remember { mutableStateOf(false) }
     var showDetail by remember { mutableStateOf(false) }
     val remoteCover = recordBook?.cover ?: recordCovers[record.id]
@@ -494,10 +499,11 @@ private fun DayCoverCard(
                 }
             }
             if (coverData != null) {
-                AsyncImage(
-                    model = coverData,
+                ReadingRecordCover(
+                    cover = coverData,
+                    sourceId = recordBook?.sourceId,
+                    headers = recordCoverHeaders[record.id].orEmpty(),
                     contentDescription = record.bookTitle,
-                    contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize()
                 )
             } else {

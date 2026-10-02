@@ -29,6 +29,9 @@ object JsImageProcessor {
         entries.remove(url)
     }
 
+    /** Scrambled pages must never be displayed before their complete-image transform. */
+    fun hasTransform(url: String): Boolean = entries.containsKey(url)
+
     /** 同步执行（拦截器/下载器都在 IO 线程），失败时返回 null 表示保持原图。 */
     fun transform(url: String, bytes: ByteArray): ByteArray? {
         val entry = entries[url] ?: return null

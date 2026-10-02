@@ -84,7 +84,9 @@ sealed class ComicScrollStrategy {
     data class Webtoon(private val config: ComicReaderConfig) : ComicScrollStrategy() {
         override val spacingDp: Float get() = config.pageSpacingDp
         override val snapToPage: Boolean get() = config.webtoonSnap
-        override val prefetchWindow: Int get() = 2
+        // 在线阅读冷启动：窗口 2→4，提前两页取图/解码，滚动追图概率大降；
+        // 驻留预算按优先级序自动丢尾部，不会无界涨内存
+        override val prefetchWindow: Int get() = 4
         override val pixelProgress: Boolean get() = false
     }
 

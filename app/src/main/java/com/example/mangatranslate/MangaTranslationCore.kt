@@ -74,6 +74,7 @@ object TranslationCache {
         runCatching {
             val f = fileFor(context, key)
             if (!f.isFile) return null
+            if(f.length()>4L*1024*1024) { f.delete(); return null }
             val json = JSONObject(f.readText())
             val size = json.optJSONObject("size") ?: return null
             if (size.optInt("w") != pageWidth || size.optInt("h") != pageHeight) return null
@@ -281,6 +282,7 @@ object OverlayRenderer {
     private const val OUTLINE_COLOR = 0x14262626
 
     fun bake(base: Bitmap, translation: PageTranslation, textScale: Float): Bitmap {
+        PageMemoryBudget.check(base)
         val out = base.copy(Bitmap.Config.ARGB_8888, true)
         val canvas = Canvas(out)
         translation.regions
@@ -747,7 +749,7 @@ class TranslationCoordinator(
     /** 当前引擎标识（进缓存 key）：换引擎后同页自动重译，不读旧引擎结果。 */
     fun engineTag(): String = selectedEngine
     private val jobs = ConcurrentHashMap<String, Job>()
-    private val translateMutex = Mutex()
+    private val translateMutex = PageMemoryBudget.gate
     private val bakedKeys = ConcurrentHashMap.newKeySet<String>()
 
     /** 快速开关保护：release 后又来了新任务（重开翻译）时，待执行的会话关闭作废。 */
@@ -778,19 +780,23 @@ class TranslationCoordinator(
         if (bakedKeys.contains(cacheKey) || jobs.containsKey(cacheKey)) return
         releasePending = false // 新任务到达：翻译重新启用，作废挂起的会话关闭
         // 第十七轮：缓存 key 带引擎+源语言标识——切换引擎或"页面文字"语言后同页自动重译
-        val engineKey = "$translationKey@${engineTag()}-${forcedLang ?: "auto"}"
+        val engine = selectedEngine
+        val modelTag = if(engine == "ai") llmTranslator.cacheFingerprint() else "online-v1"
+        val enginePrefix = "$translationKey@$engine-${forcedLang ?: "auto"}-$modelTag-v2"
         jobs[cacheKey] = scope.launch {
             val t0 = android.os.SystemClock.elapsedRealtime()
             try {
                 busyKeys.value = busyKeys.value + cacheKey
                 val base = loadBase() ?: return@launch
                 if (bakedKeys.contains(cacheKey)) return@launch
+                PageMemoryBudget.check(base)
+                val engineKey = "$enginePrefix@${PageMemoryBudget.fingerprint(base)}"
                 val t1 = android.os.SystemClock.elapsedRealtime()
                 val cached = TranslationCache.read(appContext, engineKey, base.width, base.height)
                 val translation = cached ?: translateMutex.withLock {
                     // 串行 OCR（CPU 密集），缓存 JSON 仍可命中并发写
                     TranslationCache.read(appContext, engineKey, base.width, base.height)
-                        ?: (if (selectedEngine == "ai") translator.translatePage(base, forcedLang)
+                        ?: (if (engine == "ai") translator.translatePage(base, forcedLang)
                             else translator.translatePageOnline(base, forcedLang)).also {
                             if (it.hasUsableText) TranslationCache.write(appContext, engineKey, it)
                         }

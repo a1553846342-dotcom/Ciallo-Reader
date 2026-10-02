@@ -2,14 +2,14 @@ package com.example.library
 
 import android.content.Context
 import coil.ImageLoader
-import com.example.source.zlibrary.network.SystemProxyResolver
+import com.example.source.js.JsCookieJar
 import java.util.concurrent.TimeUnit
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
 
 /**
- * 通用封面加载器：只带浏览器 UA，不附加任何站点专用 Referer/Cookie，
- * 供 MangaDex、JS 源等非 ZLibrary 封面使用。
+ * 通用封面加载器：使用浏览器 UA 和已登录源的同域 Cookie。
+ * 站点专用 Referer 由封面请求自身提供。
  */
 object GenericCoverLoader {
     @Volatile
@@ -22,26 +22,27 @@ object GenericCoverLoader {
     }
 
     private fun buildLoader(context: Context): ImageLoader {
-        val clientBuilder = OkHttpClient.Builder()
+        val clientBuilder = com.example.source.SharedHttpTransport.builder()
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(15, TimeUnit.SECONDS)
             .protocols(listOf(Protocol.HTTP_1_1))
             .addInterceptor { chain ->
                 val req = chain.request()
-                chain.proceed(
-                    req.newBuilder()
-                        .header(
-                            "User-Agent",
-                            "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.5359.128 Mobile Safari/537.36"
-                        )
-                        .build()
-                )
+                val cookie = JsCookieJar.cookieHeader(context, req.url.toString())
+                val builder = req.newBuilder()
+                if (cookie.isNotBlank() && req.header("Cookie").isNullOrBlank()) {
+                    builder.header("Cookie", cookie)
+                }
+                if (req.header("User-Agent").isNullOrBlank()) {
+                    builder.header(
+                        "User-Agent",
+                        "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.5359.128 Mobile Safari/537.36"
+                    )
+                }
+                chain.proceed(builder.build())
             }
-        SystemProxyResolver.resolve(context)?.let { clientBuilder.proxy(it) }
-        // JS 源代理路由：命中配置域名（如 picacg）的封面走显式/系统代理，其余直连
-        clientBuilder.proxySelector(com.example.source.js.JsSourceProxy.selector(context))
         return ImageLoader.Builder(context)
-            .okHttpClient(clientBuilder.build())
+            .okHttpClient(com.example.source.js.JsSourceProxy.failoverClient(context, clientBuilder.build()))
             .crossfade(true)
             .build()
     }

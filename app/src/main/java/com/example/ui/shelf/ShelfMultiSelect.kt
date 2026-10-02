@@ -191,6 +191,18 @@ class ShelfSelectionState {
      */
     private var anchorKey: String? = null
 
+    /**
+     * 滑动连选**上一次命中**的条目（边缘触发用）。
+     *
+     * 锚点保护只救得了第一本：手指划到第二本 B 后停在它上面，轻微抖动的每个
+     * move 事件都会再次命中 B —— 电平触发的 slideAcross 会把 B 在"选中/取消"
+     * 之间来回切（用户报的"第二本一直在选中和未选中之间跳跃闪烁"）。
+     * 连选必须只在命中条目**变化**时切换（见宿主跟踪循环），这个字段就是
+     * 上一次命中的记录：进入多选时置为锚点，退出时清空。
+     */
+    internal var lastSlideKey: String? = null
+        internal set
+
     /** 最近一次由长按自动选中的时刻（条目自身的 onClick 要忽略紧随其后的 up，避免二次反选） */
     private var lastAutoSelectAt: Long = 0L
 
@@ -316,6 +328,7 @@ class ShelfSelectionState {
         slideVisited.clear()
         slideVisited.add(key)
         anchorKey = key
+        lastSlideKey = key
         pressedKey = null
     }
 
@@ -344,6 +357,7 @@ class ShelfSelectionState {
         dragging = emptyList()
         slideVisited.clear()
         anchorKey = null
+        lastSlideKey = null
         hoverTarget = null
         edgeScroll = 0f
         resetDragHitState()
@@ -609,6 +623,9 @@ internal fun Modifier.shelfGestures(
                 state.markAutoSelect()
             }
         }
+        // 连选起点 = 长按的这一本：不初始化的话，进入跟踪循环后的第一个抖动帧
+        // 会再次命中它并 slideAcross 把它划掉（select() 已把它记进 slideVisited）
+        state.lastSlideKey = key
 
         // 继续跟踪：滑动连选 或 拖拽
         // ⚠️ 「滑动连选」必须等手指真的离开长按点才开始：
@@ -627,9 +644,17 @@ internal fun Modifier.shelfGestures(
                 if ((change.position - start).getDistance() > slideSlop) {
                     val root = change.position + sink.hostOffset()
                     val hit = state.hitTestItem(root)
+                    // ⚠️ 连选必须**边缘触发**：只在命中条目与上一次不同时才切换。
+                    // 手指停在第二本上轻微抖动时，每个 move 事件都会命中同一本 ——
+                    // 电平触发的 slideAcross 会把它在"选中/取消"之间来回切
+                    //（用户报的"第二本一直闪"；第一本有锚点保护所以不闪）。
+                    // 划过新的 → 选中；划回已划过的 → 取消，语义不变。
                     // 滑动连选同样按板块独立：手指从书架的书滑到「我喜欢的」卡片上时
                     // 不能把它也划进名单（这正是用户说的"两个栏目混在一起"）。
-                    if (hit != null && state.accepts(hit)) state.slideAcross(hit)
+                    if (hit != state.lastSlideKey) {
+                        state.lastSlideKey = hit
+                        if (hit != null && state.accepts(hit)) state.slideAcross(hit)
+                    }
                 }
             }
             event.changes.forEach { it.consume() }

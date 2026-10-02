@@ -22,7 +22,7 @@ class ZLibraryHttpClient(
     }
 
     val okHttpClient: OkHttpClient by lazy {
-        val builder = OkHttpClient.Builder()
+        val builder = com.example.source.SharedHttpTransport.builder()
             .dns(ZLibraryDns.INSTANCE)
             .cookieJar(cookieJar)
             .connectTimeout(8, TimeUnit.SECONDS)
@@ -114,7 +114,7 @@ class ZLibraryHttpClient(
             respHeaderMap[response.headers.name(i)] = response.headers.value(i)
         }
         val setCookieList = response.headers("Set-Cookie")
-        val bodySnippet = response.peekBody(1000 * 1024).string()
+        val bodySnippet = ""
 
         ZLibraryNetworkLogger.logResponse(
             code = response.code,
@@ -155,7 +155,7 @@ class ZLibraryHttpClient(
             respHeaderMap[response.headers.name(i)] = response.headers.value(i)
         }
         val setCookieList = response.headers("Set-Cookie")
-        val bodySnippet = response.peekBody(1000 * 1024).string()
+        val bodySnippet = ""
 
         ZLibraryNetworkLogger.logResponse(
             code = response.code,

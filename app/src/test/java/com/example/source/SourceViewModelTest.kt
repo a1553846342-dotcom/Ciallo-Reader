@@ -96,7 +96,7 @@ class SourceViewModelTest {
             kotlinx.coroutines.delay(50)
         }
         assertTrue(allSources.any { it.id == "vm_test_source" })
-        assertTrue(viewModel.importStatus.value?.contains("ViewModel测试书源") == true)
+        assertTrue(viewModel.importStatus.value?.contains("成功导入 1 个书源") == true)
 
         // 2. Set as active source
         viewModel.setActiveSource("vm_test_source")

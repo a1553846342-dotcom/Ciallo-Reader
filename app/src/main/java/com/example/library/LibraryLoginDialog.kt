@@ -41,7 +41,8 @@ import com.example.ui.components.rememberIridescentColors
 import com.example.ui.components.rememberThemedGlassBackdrop
 import com.example.ui.components.AppLiquidButton
 import com.example.ui.components.DialogLiquidGlass
-import com.example.ui.adaptive.AdaptiveSpec
+import com.example.ui.adaptive.AdaptiveSpec
+import com.example.ui.components.AppToast
 
 /**
  * 居中毛玻璃登录卡片：复用玻璃拟态半透明卡片 + Spring 弹性入场动画，
@@ -245,7 +246,7 @@ fun LibraryLoginDialog(
                                     Intent(Intent.ACTION_VIEW, Uri.parse(url))
                                 )
                             }.onFailure {
-                                android.widget.Toast.makeText(context, "无法打开注册页面", android.widget.Toast.LENGTH_SHORT).show()
+                                AppToast.makeText(context, "无法打开注册页面", android.widget.Toast.LENGTH_SHORT).show()
                             }
                         },
                         modifier = Modifier.align(Alignment.CenterHorizontally)

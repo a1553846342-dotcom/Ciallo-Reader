@@ -45,7 +45,7 @@ import com.example.ui.components.AcrylicBottomOverlay
 import com.example.ui.components.GlassCard
 import com.example.ui.components.SegmentedPillSelector
 import com.example.ui.components.TabScreenHeader
-import com.example.ui.components.rememberHeaderCollapsed
+import com.example.ui.components.rememberHeaderCollapsedSource
 import com.example.ui.components.ReadingCalendarCard
 import com.example.ui.components.ReadingTrendCard
 import com.example.ui.components.WeeklyReadingChart
@@ -74,6 +74,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.layout.widthIn
 import com.example.ui.adaptive.AdaptiveSpec
 import com.example.ui.design.DesignTokens
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -86,18 +87,32 @@ fun StatisticsScreen(
     onDeleteRecord: (ReadingRecord) -> Unit = {},
     recordCovers: Map<Int, String> = emptyMap(),
     recordBooks: Map<Int, com.example.source.SearchBook> = emptyMap(),
+    recordCoverHeaders: Map<Int, Map<String, String>> = emptyMap(),
+    onResolveRecordCoverHeaders: (List<ReadingRecord>) -> Unit = {},
     onResolveRecordCovers: (List<ReadingRecord>) -> Unit = {},
     onOpenRecordDetail: (com.example.source.SearchBook) -> Unit = {},
     onOpenBook: (Book) -> Unit = {},
     dailyGoalMinutes: Int = 60,
-    onGoalChange: (Int) -> Unit = {}
+    onGoalChange: (Int) -> Unit = {},
+    /* ── 神回排行榜（紧随核心数据卡片之后） ── */
+    godMoments: List<com.example.god.GodMomentEntity> = emptyList(),
+    godStyle: com.example.god.GodRankingStyle = com.example.god.GodRankingStyle.PODIUM,
+    godGyroEnabled: Boolean = true,
+    onOpenGodRanking: () -> Unit = {},
+    onGodMomentClick: (com.example.god.GodMomentEntity) -> Unit = {},
+    onEditGodMoment: (com.example.god.GodMomentEntity) -> Unit = {},
+    onDeleteGodMoment: (com.example.god.GodMomentEntity) -> Unit = {},
 ) {
-    val totalReadTimeSeconds by totalReadTimeSecondsFlow.collectAsState()
+    val totalReadTimeSeconds by totalReadTimeSecondsFlow.collectAsStateWithLifecycle()
     val finishedCount = books.count { it.isFinished }
 
     // 已删除书籍的封面补抓
     LaunchedEffect(readingRecords) {
         onResolveRecordCovers(readingRecords)
+    }
+
+    LaunchedEffect(readingRecords, recordBooks) {
+        onResolveRecordCoverHeaders(readingRecords)
     }
 
     val dailyTotals = remember(readingRecords) {
@@ -116,12 +131,12 @@ fun StatisticsScreen(
     ) {
         // 滚动联动折叠头部：此前 LazyColumn 无 state 可挂，先补 state（代理B方案挂点）
         val statisticsListState = rememberLazyListState()
-        val statsHeaderCollapsed = rememberHeaderCollapsed(statisticsListState)
+        val statsHeaderCollapsedSource = rememberHeaderCollapsedSource(statisticsListState)
         Scaffold(
             containerColor = Color.Transparent,
             topBar = {
                 TabScreenHeader(
-                    collapsed = statsHeaderCollapsed,
+                    collapsedSource = statsHeaderCollapsedSource,
                     modifier = Modifier.statusBarsPadding(),
                     title = "阅读统计",
                     subtitle = "STATISTICS & INSIGHTS",
@@ -166,6 +181,20 @@ LazyColumn(
                             finishedCount = finishedCount,
                             dailyGoalMinutes = dailyGoalMinutes,
                             onGoalChange = onGoalChange
+                        )
+                    }
+
+                    // ---------- 神回排行榜（核心数据卡片之后） ----------
+                    item(key = "stats_god_ranking") {
+                        com.example.god.GodRankingCard(
+                            moments = godMoments,
+                            style = godStyle,
+                            gyroEnabled = godGyroEnabled,
+                            reduceMotion = com.example.god.rememberReduceMotion(),
+                            onOpenAll = onOpenGodRanking,
+                            onItemClick = onGodMomentClick,
+                            onEdit = onEditGodMoment,
+                            onDelete = onDeleteGodMoment,
                         )
                     }
 
@@ -239,6 +268,7 @@ LazyColumn(
                             books = books,
                             recordCovers = recordCovers,
                             recordBooks = recordBooks,
+                            recordCoverHeaders = recordCoverHeaders,
                             onDeleteRecord = onDeleteRecord,
                             onOpenRecordDetail = onOpenRecordDetail,
                             onOpenBook = onOpenBook
@@ -257,6 +287,11 @@ LazyColumn(
             records = readingRecords.filter { it.dateStr == date }.let { mergeDuplicateReadingRecords(it) },
             sessions = readingSessions.filter { it.dateStr == date }.sortedBy { it.startTimeMs },
             recordCovers = recordCovers,
+            recordBooks = recordBooks,
+            recordCoverHeaders = recordCoverHeaders,
+            books = books,
+            onOpenRecordDetail = onOpenRecordDetail,
+            onOpenBook = onOpenBook,
             onDeleteRecord = onDeleteRecord,
             onDismiss = { selectedDate = null }
         )
@@ -668,6 +703,11 @@ private fun DayDetailSheet(
     records: List<ReadingRecord>,
     sessions: List<ReadingSession>,
     recordCovers: Map<Int, String>,
+    recordBooks: Map<Int, com.example.source.SearchBook>,
+    recordCoverHeaders: Map<Int, Map<String, String>>,
+    books: List<Book>,
+    onOpenRecordDetail: (com.example.source.SearchBook) -> Unit,
+    onOpenBook: (Book) -> Unit,
     onDeleteRecord: (ReadingRecord) -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -694,18 +734,25 @@ private fun DayDetailSheet(
             }
 
             records.forEach { record ->
+                val localBook = books.firstOrNull { it.id == record.bookId }
+                val recordBook = recordBooks[record.id]?.takeIf { it.sourceId.isNotBlank() }
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(vertical = 6.dp),
+                        .padding(vertical = 6.dp)
+                        .clickable(enabled = localBook != null || recordBook != null) {
+                            if (localBook != null) onOpenBook(localBook)
+                            else if (recordBook != null) onOpenRecordDetail(recordBook)
+                        },
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    val cover = recordCovers[record.id]
+                    val cover = localBook?.coverUri ?: recordCovers[record.id]
                     if (cover != null) {
-                        AsyncImage(
-                            model = cover,
-                            contentDescription = null,
-                            contentScale = ContentScale.Crop,
+                        com.example.ui.components.ReadingRecordCover(
+                            cover = cover,
+                            sourceId = recordBooks[record.id]?.sourceId,
+                            headers = recordCoverHeaders[record.id].orEmpty(),
+                            contentDescription = record.bookTitle,
                             modifier = Modifier
                                 .size(40.dp)
                                 .clip(RoundedCornerShape(8.dp))

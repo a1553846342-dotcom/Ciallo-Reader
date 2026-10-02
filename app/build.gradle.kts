@@ -35,8 +35,8 @@ android {
     applicationId = "com.aistudio.novelreader.kxmpzq"
     minSdk = 24
     targetSdk = 35
-    versionCode = 198
-    versionName = "1.1.0"
+    versionCode = 201
+    versionName = "1.2.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -146,6 +146,16 @@ android {
   testOptions { unitTests { isIncludeAndroidResources = true } }
 }
 
+// P5 防回归：需要 Compose 可组合项编译指标（跳过率/可重启性）时用
+// `gradlew assembleDebug -PcomposeMetrics=true`，输出到 build/compose-metrics 与
+// build/compose-reports。平时不开，不影响正常构建速度。
+if (project.findProperty("composeMetrics") == "true") {
+  composeCompiler {
+    metricsDestination.set(layout.buildDirectory.dir("compose-metrics").get().asFile)
+    reportsDestination.set(layout.buildDirectory.dir("compose-reports").get().asFile)
+  }
+}
+
 dependencies {
   implementation(platform(libs.androidx.compose.bom))
   implementation(libs.androidx.activity.compose)
@@ -155,7 +165,11 @@ dependencies {
   implementation(libs.androidx.compose.ui)
   implementation(libs.androidx.compose.ui.graphics)
   implementation(project(":liquidglass-compose"))
+  // 神回设置（排行榜风格 / 提示胶囊 / 陀螺仪视差）：小型 KV，与既有
+  // SharedPreferences 体系并存，互不干扰。
+  implementation(libs.androidx.datastore.preferences)
   implementation(libs.androidx.core.ktx)
+  implementation(libs.androidx.core.splashscreen)
   implementation(libs.androidx.security.crypto)
   implementation(libs.androidx.work.runtime.ktx)
   implementation(libs.androidx.lifecycle.runtime.compose)
@@ -204,3 +218,6 @@ dependencies {
 }
 
 
+
+// Keep the actual Room schema under version control for subsequent migrations.
+ksp { arg("room.schemaLocation", "$projectDir/schemas") }

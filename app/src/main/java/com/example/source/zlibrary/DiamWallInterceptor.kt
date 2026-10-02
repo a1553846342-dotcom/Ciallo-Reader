@@ -17,7 +17,7 @@ class DiamWallInterceptor(private val cookieJar: okhttp3.CookieJar) : Intercepto
 
         while (followUpCount < 8) {
             val code = response.code
-            Log.d("DiamWall", "Response code: $code for ${request.url}\n" + response.peekBody(1024).string())
+            Log.d("DiamWall", "Response code: $code for ${request.url.host}")
 
             // Loop guard: DiamWall's 307→503 challenge dance legitimately revisits the
             // same URL (first visit 307, second visit the challenge page, third visit
@@ -64,7 +64,7 @@ class DiamWallInterceptor(private val cookieJar: okhttp3.CookieJar) : Intercepto
                         .path("/")
                         .build()
                     cookieJar.saveFromResponse(request.url, listOf(cookie))
-                    Log.d("DiamWall", "Extracted dwid cookie: $dwid")
+                    Log.d("DiamWall", "Challenge cookie received")
                 }
                 // DiamWall also sets _dwa=0 on the challenge page
                 val dwaMatch = Regex("""document\.cookie="_dwa=([^;]+);""").find(bodyString)
@@ -77,7 +77,7 @@ class DiamWallInterceptor(private val cookieJar: okhttp3.CookieJar) : Intercepto
                         .path("/")
                         .build()
                     cookieJar.saveFromResponse(request.url, listOf(cookie))
-                    Log.d("DiamWall", "Extracted _dwa cookie: $dwa")
+                    Log.d("DiamWall", "Challenge cookie received")
                 }
                 
                 // Parse PoW
@@ -96,7 +96,7 @@ class DiamWallInterceptor(private val cookieJar: okhttp3.CookieJar) : Intercepto
                             .build()
                         val iframeResponse = chain.proceed(iframeRequest)
                         powHtml = iframeResponse.peekBody(1024 * 1024).string()
-                        Log.d("DiamWall", "Iframe HTML: $powHtml")
+                        Log.d("DiamWall", "Challenge iframe received")
                         iframeResponse.close()
                     }
                 }
@@ -125,16 +125,10 @@ class DiamWallInterceptor(private val cookieJar: okhttp3.CookieJar) : Intercepto
                     val target2 = byte2Match.groupValues[1].substring(2).toInt(16)
                     Log.d("DiamWall", "Solving c_token PoW token=$powToken n1=$n1 targets=(${target1.toString(16)},${target2.toString(16)})")
 
-                    val md = MessageDigest.getInstance("SHA-1")
-                    var nonce = 0L
-                    var digest: ByteArray
-                    while (true) {
-                        digest = md.digest((powToken + nonce).toByteArray())
-                        val b1 = digest[n1].toInt() and 0xFF
-                        val b2 = digest[n1 + 1].toInt() and 0xFF
-                        if (b1 == target1 && b2 == target2) break
-                        nonce++
-                    }
+                    val nonce = solveBounded("sha1|$powToken|$n1|$target1|$target2", "SHA-1",
+                        { chain.call().isCanceled() }, { nonce -> powToken + nonce }) { digest ->
+                        (digest[n1].toInt() and 0xFF) == target1 && (digest[n1 + 1].toInt() and 0xFF) == target2
+                    } ?: return response
 
                     val cookieHost = request.url.host
                     cookieJar.saveFromResponse(
@@ -159,22 +153,9 @@ class DiamWallInterceptor(private val cookieJar: okhttp3.CookieJar) : Intercepto
                     
                     if (tokenMatch != null && diffMatch != null) {
                         val token = tokenMatch.groupValues[1]
-                        val diff = diffMatch.groupValues[1].toInt()
-                        val prefix = "0".repeat(diff)
-                        Log.d("DiamWall", "Solving PoW for token $token with diff $diff")
-                        
-                        var nonce = 0
-                        val md = MessageDigest.getInstance("SHA-256")
-                        while (true) {
-                            val input = "$token:$nonce".toByteArray()
-                            val hashBytes = md.digest(input)
-                            val hashHex = hashBytes.joinToString("") { "%02x".format(it) }
-                            if (hashHex.startsWith(prefix)) {
-                                break
-                            }
-                            nonce++
-                        }
-                        
+                        val diff = diffMatch.groupValues[1].toIntOrNull() ?: return response
+                        val nonce = solveSha256(token, diff) { chain.call().isCanceled() } ?: return response
+
                         val originalUrl = request.url.encodedPath + (request.url.encodedQuery?.let { "?$it" } ?: "")
                         val verifyUrl = request.url.newBuilder()
                             .encodedPath("/__ab/verify")
@@ -208,7 +189,7 @@ class DiamWallInterceptor(private val cookieJar: okhttp3.CookieJar) : Intercepto
                                 .path("/")
                                 .build()
                             cookieJar.saveFromResponse(request.url, listOf(cookie))
-                            Log.d("DiamWall", "Extracted dwid cookie from redirect: $dwid")
+                            Log.d("DiamWall", "Redirect cookie received")
                         }
                         
                         request = request.newBuilder().url(newUrl).build()
@@ -226,4 +207,41 @@ class DiamWallInterceptor(private val cookieJar: okhttp3.CookieJar) : Intercepto
         
         return response
     }
+
+    companion object {
+        private val solveLock = java.util.concurrent.locks.ReentrantLock()
+        private val solved = LinkedHashMap<String, Long>()
+
+        internal fun solveSha256(token: String, difficulty: Int, cancelled: () -> Boolean = { false }): Long? {
+            if (difficulty !in 0..6) return null
+            return solveBounded("sha256|$token|$difficulty", "SHA-256", cancelled, { "$token:$it" }) { hash ->
+                (0 until difficulty).all { nibble ->
+                    val byte = hash[nibble / 2].toInt() and 0xff
+                    if (nibble % 2 == 0) byte ushr 4 == 0 else byte and 15 == 0
+                }
+            }
+        }
+
+        private fun solveBounded(key: String, algorithm: String, cancelled: () -> Boolean,
+            input: (Long) -> String, matches: (ByteArray) -> Boolean): Long? {
+            if (cancelled()) return null
+            val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5)
+            if (!solveLock.tryLock(5, java.util.concurrent.TimeUnit.SECONDS)) return null
+            try {
+                if (cancelled()) return null
+                solved[key]?.let { return it }
+                val digest = MessageDigest.getInstance(algorithm)
+                for (nonce in 0L until 1_000_000L) {
+                    if (nonce % 256L == 0L && (cancelled() || Thread.currentThread().isInterrupted || System.nanoTime() >= deadline)) return null
+                    if (matches(digest.digest(input(nonce).toByteArray()))) {
+                        if (solved.size >= 64) solved.remove(solved.keys.first())
+                        solved[key] = nonce
+                        return nonce
+                    }
+                }
+                return null
+            } finally { solveLock.unlock() }
+        }
+    }
+
 }

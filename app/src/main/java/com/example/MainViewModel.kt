@@ -5,16 +5,51 @@ import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.*
+import com.example.source.isComicSource
+import com.example.source.withComicDetail
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val database = AppDatabase.getDatabase(application)
     val prefs = PreferencesManager(application)
-    val backupManager = BackupManager(application, prefs)
+    // 懒初始化：等下面的 godRepository 就绪后再建（备份导出要带上神回元数据）
+    val backupManager by lazy { BackupManager(application, prefs, godRepository) }
     val ttsManager = TtsManager(application)
+    private val readingTimeMutex = kotlinx.coroutines.sync.Mutex()
     val downloadManager = com.example.download.DownloadManager(application)
     val repository = BookRepository(application, database.bookDao())
+
+    /* ══════════════ 神回（GodMoment） ══════════════
+     * 与 GodMomentViewModel 共享同一个 Room 库：统计页 / 全屏排行榜用这里的
+     * StateFlow，阅读器内的窗口用 GodMomentViewModel —— 两处读写同一张表，
+     * 增删改后自动同步。 */
+    val godRepository = com.example.god.GodMomentRepository(
+        application,
+        database.godMomentDao(),
+    )
+    val godSettings = com.example.god.GodMomentSettingsStore(application)
+    /**
+     * 神回流：用 WhileSubscribed 而不是 Eagerly —— Eagerly 会在 ViewModel
+     * 构造的瞬间就去查库，一旦数据库侧有任何异常，未捕获异常会直接把进程带崩
+     * （表现为"一打开就闪退"）。改为有人订阅才查，且上游已带 catch 兜底。
+     */
+    val godMoments: StateFlow<List<com.example.god.GodMomentEntity>> =
+        godRepository.observeAll()
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /** 删除单个神回（含封面缓存文件清理） */
+    fun deleteGodMoment(moment: com.example.god.GodMomentEntity) {
+        viewModelScope.launch { godRepository.delete(moment.id) }
+    }
 
     /* ══════════════ 「我喜欢的」在线收藏（三态解耦） ══════════════
      * 收藏 / 阅读进度 / 下载 三张数据互不耦合：
@@ -29,7 +64,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         dao = database.favoriteDao(),
         comicSourceOf = { sourceId -> comicSourceProvider?.invoke(sourceId) },
         scope = viewModelScope,
-    )
+    ).also { it.catalogContext = application.applicationContext }
 
     /** 收藏列表（Room Flow） */
     val favorites: StateFlow<List<com.example.data.favorite.FavoriteEntity>> = favoriteRepository.favorites
@@ -62,10 +97,111 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         category: String = com.example.data.favorite.FAV_DEFAULT_CATEGORY,
         chapters: List<com.example.source.ComicChapter> = emptyList(),
     ) {
-        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            if (next) favoriteRepository.add(book, category, chapters)
-            else favoriteRepository.remove(book.sourceId, book.id)
+        if (!next) {
+            viewModelScope.launch(Dispatchers.IO) { favoriteRepository.remove(book.sourceId, book.id) }
+            return
         }
+        if (favoriteAddJob?.isActive == true || _favoriteAddRequest.value != null) {
+            val key = "${book.sourceId}::${book.id}"
+            if (_favoriteAddRequest.value?.book?.let { "${it.sourceId}::${it.id}" } != key &&
+                favoriteAddQueue.none { "${it.book.sourceId}::${it.book.id}" == key }) {
+                favoriteAddQueue.add(QueuedFavorite(book, category, chapters))
+            }
+            return
+        }
+        favoriteAddJob = viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val source = comicSourceProvider?.invoke(book.sourceId)
+                if (source?.isComicSource != true || favoriteRepository.isFavorite(book.sourceId, book.id)) {
+                    favoriteRepository.add(book, category, chapters)
+                    return@launch
+                }
+                val existing = favoriteRepository.favoritesSnapshot().filter { it.sourceId != book.sourceId }
+                if (existing.isEmpty()) {
+                    favoriteRepository.add(book, category, chapters)
+                    return@launch
+                }
+                val titleDao = database.anilistDao()
+                val titles = listOf(book.title) + book.comicInfo?.alternateTitles.orEmpty()
+                val mediaIds = titles.flatMap { title -> titleDao.findMediaIds(
+                    com.example.source.anilist.TitleNormalizer.normalize(title),
+                    com.example.source.anilist.TitleNormalizer.compact(title),
+                ) }.distinct()
+                val aliases = if (mediaIds.size == 1) titleDao.getRawTitlesFor(mediaIds) else emptyList()
+                val candidates = com.example.data.favorite.ComicFavoriteMatching.candidates(book, existing, aliases)
+                if (candidates.isEmpty()) {
+                    favoriteRepository.add(book, category, chapters)
+                    return@launch
+                }
+                _favoriteAddRequest.value = com.example.data.favorite.FavoriteAddRequest(
+                    book, category, chapters, existing, candidates,
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _favoriteActionMessage.value = e.message ?: "收藏失败，请重试"
+            }
+        }.also { job -> job.invokeOnCompletion { viewModelScope.launch(Dispatchers.Main) { processFavoriteAddQueue() } } }
+    }
+
+    private data class QueuedFavorite(val book: com.example.source.SearchBook, val category: String,
+        val chapters: List<com.example.source.ComicChapter>)
+    private val favoriteAddQueue = java.util.concurrent.ConcurrentLinkedQueue<QueuedFavorite>()
+    private fun processFavoriteAddQueue() {
+        if (_favoriteAddRequest.value != null || favoriteAddJob?.isActive == true) return
+        favoriteAddQueue.poll()?.let { toggleFavorite(it.book, true, it.category, it.chapters) }
+    }
+    private var favoriteAddJob: Job? = null
+    private val _favoriteAddRequest = MutableStateFlow<com.example.data.favorite.FavoriteAddRequest?>(null)
+    val favoriteAddRequest = _favoriteAddRequest.asStateFlow()
+    private val _favoriteActionMessage = MutableStateFlow<String?>(null)
+    val favoriteActionMessage = _favoriteActionMessage.asStateFlow()
+    fun clearFavoriteActionMessage() { _favoriteActionMessage.value = null }
+    fun dismissFavoriteAdd() {
+        if (_favoriteAddRequest.value?.busy == true) return
+        favoriteAddJob?.cancel()
+        _favoriteAddRequest.value = null
+        processFavoriteAddQueue()
+    }
+
+    fun confirmFavoriteAdd(replace: com.example.data.favorite.FavoriteEntity?) {
+        val request = _favoriteAddRequest.value?.takeUnless { it.busy } ?: return
+        _favoriteAddRequest.value = request.copy(busy = true, error = null)
+        favoriteAddJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                if (replace == null) {
+                    favoriteRepository.add(request.book, request.category, request.chapters)
+                    _favoriteActionMessage.value = "已收进「我喜欢的」♡"
+                } else {
+                    val source = comicSourceProvider?.invoke(request.book.sourceId)
+                    var book = request.book
+                    val chapters = request.chapters.ifEmpty {
+                        when (val result = kotlinx.coroutines.withTimeout(30_000) { source?.getChapters(book.id) }) {
+                            is com.example.source.SourceResult.Success -> result.data
+                            is com.example.source.SourceResult.Error -> throw IllegalStateException(result.exception.message)
+                            else -> throw IllegalStateException("新来源暂不可用，请稍后重试")
+                        }
+                    }
+                    val detail = kotlinx.coroutines.withTimeoutOrNull(15_000) { source?.getDetail(book.id) }
+                    if (detail is com.example.source.SourceResult.Success) book = book.withComicDetail(detail.data)
+                    val report = favoriteRepository.replaceFavorite(
+                        com.example.data.favorite.ComicKey(replace.sourceId, replace.comicId), book, chapters,
+                    )
+                    _favoriteActionMessage.value = buildString {
+                        append("已替换收藏，迁移 ${report.migrated} 话阅读标记与书签")
+                        if (report.unmatched > 0 || !report.resumeMatched) append("；未匹配记录仍保留在旧来源")
+                        append("。新版本从对应话的第一页续读")
+                    }
+                }
+                _favoriteAddRequest.value = null
+            } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+                _favoriteAddRequest.value = request.copy(error = "来源响应超时，旧收藏已保留，可重试或选择并存")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _favoriteAddRequest.value = request.copy(error = e.message ?: "操作失败，旧收藏已保留")
+            }
+        }.also { job -> job.invokeOnCompletion { viewModelScope.launch(Dispatchers.Main) { processFavoriteAddQueue() } } }
     }
 
     /* ───────── 「我喜欢的」的分类（与书架分类完全独立） ───────── */
@@ -144,6 +280,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** 进入章节列表时记录"已见"快照（之后新增的章节显示「新」）。 */
+    /** 详情页左滑/右滑该话卡片：切读书签（持久化到章节读状态表）。 */
+    fun setChapterBookmark(sourceId: String, comicId: String, chapterId: String, chapterIndex: Int, bookmarked: Boolean) {
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching {
+                favoriteRepository.setChapterBookmark(sourceId, comicId, chapterId, chapterIndex, bookmarked)
+            }.onFailure {
+                android.util.Log.e("MainViewModel", "章节书签写入失败", it)
+            }
+        }
+    }
+
     fun markComicSeen(sourceId: String, comicId: String, chapters: List<com.example.source.ComicChapter>) {
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             favoriteRepository.markSeen(sourceId, comicId, chapters)
@@ -226,6 +373,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _screenOrientationLock = MutableStateFlow(prefs.screenOrientationLock)
     val screenOrientationLock: StateFlow<Int> = _screenOrientationLock.asStateFlow()
 
+    private val _hapticsEnabled = MutableStateFlow(prefs.hapticsEnabled)
+    val hapticsEnabled: StateFlow<Boolean> = _hapticsEnabled.asStateFlow()
+
     private val _colorPrimaryIndex = MutableStateFlow(prefs.colorPrimaryIndex)
     val colorPrimaryIndex: StateFlow<Int> = _colorPrimaryIndex.asStateFlow()
 
@@ -263,6 +413,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _screenOrientationLock.value = mode
     }
 
+    fun updateHapticsEnabled(enabled: Boolean) {
+        prefs.hapticsEnabled = enabled
+        _hapticsEnabled.value = enabled
+    }
+
     fun updateColorTheme(primary: Int, secondary: Int) {
         prefs.colorPrimaryIndex = primary
         prefs.colorSecondaryIndex = secondary
@@ -294,6 +449,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val streakDays: StateFlow<Int> = _streakDays.asStateFlow()
 
     init {
+        com.example.source.zlibrary.network.ZLibraryDns.INSTANCE.watchNetwork(application)
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             repository.checkAndSeedDefaultBooks()
         }
@@ -304,6 +460,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             // 存量超大章节自动拆分（与本地导入书一致，修复旧下载书的打开卡顿/闪退）
             repository.splitOversizedChaptersInLibrary()
+            repository.cleanupOrphanFiles()
         }
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             val streak = prefs.calculateStreak()
@@ -355,6 +512,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _chapters = MutableStateFlow<List<Chapter>>(emptyList())
     val chapters: StateFlow<List<Chapter>> = _chapters
+    private val _readerLoading = MutableStateFlow(false)
+    val readerLoading: StateFlow<Boolean> = _readerLoading
+    private val _readerLoadError = MutableStateFlow<String?>(null)
+    val readerLoadError: StateFlow<String?> = _readerLoadError
 
     private val _bookmarks = MutableStateFlow<List<Bookmark>>(emptyList())
     val bookmarks: StateFlow<List<Bookmark>> = _bookmarks
@@ -375,30 +536,40 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var chapterMapping: LogicalChapterBook? = null
     private var lastLoadedBookId: Int? = null
     private var lastLoadedChapterIndex: Int? = null
+    private val _loadedChapterIndices = MutableStateFlow<Set<Int>>(emptySet())
+    val loadedChapterIndices: StateFlow<Set<Int>> = _loadedChapterIndices
+    private var readerSelectionToken = 0
+    private var readerSelectionJob: Job? = null
+    private var readerContentJob: Job? = null
+    private var bookmarkCollectJob: Job? = null
+    private var highlightCollectJob: Job? = null
+    private var selectedSourceBook: Book? = null
 
     private fun loadActiveChaptersContent(bookId: Int, currentLogicalIdx: Int) {
-        viewModelScope.launch {
+        readerContentJob?.cancel()
+        val token = readerSelectionToken
+        val mapping = chapterMapping
+        val metadata = cachedMetadataList
+        val needsCurrentChapter = currentLogicalIdx !in _loadedChapterIndices.value
+        _readerLoading.value = needsCurrentChapter
+        readerContentJob = viewModelScope.launch {
             try {
-                val mapping = chapterMapping
-                if (cachedMetadataList.isEmpty() || mapping == null) {
-                    _chapters.value = emptyList()
-                    return@launch
-                }
+                check(metadata.isNotEmpty() && mapping != null) { "没有可读取的章节" }
 
                 val targetLogical = listOf(currentLogicalIdx - 1, currentLogicalIdx, currentLogicalIdx + 1)
-                    .filter { it >= 0 && it < cachedMetadataList.size }
+                    .filter { it >= 0 && it < metadata.size }
 
                 val targetOrders = targetLogical
-                    .flatMap { mapping.logicalToPhysicalOrders[it].asIterable() }
+                    .flatMap { mapping!!.logicalToPhysicalOrders[it].asIterable() }
                     .distinct()
 
                 val activeParts = repository.getChaptersByOrders(bookId, targetOrders).associateBy { it.chapterOrder }
 
-                val merged = cachedMetadataList.mapIndexed { logicalIdx, chapter ->
+                val merged = metadata.mapIndexed { logicalIdx, chapter ->
                     if (logicalIdx !in targetLogical) {
                         chapter
                     } else {
-                        val parts = mapping.logicalToPhysicalOrders[logicalIdx]
+                        val parts = mapping!!.logicalToPhysicalOrders[logicalIdx]
                             .map { activeParts[it] }
                             .filterNotNull()
                         if (parts.isEmpty()) {
@@ -409,53 +580,135 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
 
+                check(currentLogicalIdx in merged.indices &&
+                    mapping.logicalToPhysicalOrders[currentLogicalIdx].all { it in activeParts }) {
+                    "当前章节数据缺失，请重试加载"
+                }
+                if (token != readerSelectionToken || _selectedBook.value?.id != bookId ||
+                    lastLoadedChapterIndex != currentLogicalIdx) return@launch
                 _chapters.value = merged
+                _loadedChapterIndices.value = targetLogical.filter { logicalIdx ->
+                    mapping.logicalToPhysicalOrders[logicalIdx].all { it in activeParts }
+                }.toSet()
+                _readerLoadError.value = null
+                _readerLoading.value = false
                 android.util.Log.d("BookImport", "[MainViewModel] Lazy loaded content for logical chapters: $targetLogical, physical: $targetOrders")
+            } catch (e: CancellationException) {
+                throw e
             } catch (t: Throwable) {
+                if(t is CancellationException) throw t
                 android.util.Log.e("BookImport", "[MainViewModel] Error lazy loading active chapters content", t)
+                if (token == readerSelectionToken && _selectedBook.value?.id == bookId &&
+                    lastLoadedChapterIndex == currentLogicalIdx && needsCurrentChapter) {
+                    _readerLoadError.value = t.localizedMessage ?: "章节加载失败"
+                    _readerLoading.value = false
+                }
             }
         }
     }
 
     fun selectBook(book: Book) {
+        searchJob?.cancel()
+        _searchResults.value = emptyList()
+        _isSearching.value = false
+        readerSelectionToken++
+        readerSelectionJob?.cancel()
+        readerContentJob?.cancel()
+        bookmarkCollectJob?.cancel()
+        highlightCollectJob?.cancel()
+        selectedSourceBook = book
+        cachedMetadataList = emptyList()
+        chapterMapping = null
+        lastLoadedBookId = null
+        lastLoadedChapterIndex = null
+        _loadedChapterIndices.value = emptySet()
+        _chapters.value = emptyList()
+        _bookmarks.value = emptyList()
+        _highlights.value = emptyList()
+        _readerLoadError.value = null
+        _readerLoading.value = true
         _selectedBook.value = book
-        viewModelScope.launch {
+        val token = readerSelectionToken
+        readerSelectionJob = viewModelScope.launch {
             try {
                 android.util.Log.d("BookImport", "[MainViewModel] Selecting book: ${book.title}, isComic: ${book.isComic}")
                 if (book.isComic) {
                     // For comics, load all chapters directly since their content is just image file paths (very small)
+                    if (token != readerSelectionToken) return@launch
                     chapterMapping = null
                     collectAnnotations(book.id)
                     repository.getChaptersForBook(book.id).collect {
+                        if (token != readerSelectionToken) return@collect
                         _chapters.value = it
+                        _readerLoading.value = false
                     }
                 } else {
                     // For novels, use lazy loading
-                    val metadata = repository.getChaptersMetadataList(book.id)
+                    // 老书首次打开时懒迁移内嵌图片（EPUB/FB2/DOCX/MOBI）：
+                    // 成功返回带图新章节的书，失败/无需迁移返回 null 继续用原书
+                    val migratedBook = try {
+                        repository.migrateInlineImagesIfNeeded(book)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Throwable) {
+                        null
+                    }
+                    val effectiveBook = migratedBook ?: book
+                    val metadata = repository.getChaptersMetadataList(effectiveBook.id)
                     val logical = ChapterMerger.buildLogicalChapters(metadata)
+                    check(logical.chapters.isNotEmpty()) { "这本书没有可读取的章节" }
+                    if (token != readerSelectionToken || _selectedBook.value?.id != book.id) return@launch
                     cachedMetadataList = logical.chapters
                     chapterMapping = logical
-                    lastLoadedBookId = book.id
+                    lastLoadedBookId = effectiveBook.id
 
-                    val physicalStart = book.currentChapterIndex.coerceAtLeast(0)
+                    val physicalStart = effectiveBook.currentChapterIndex.coerceAtLeast(0)
                     val logicalStart = logical.logicalIndexOf(physicalStart)
-                    val logicalOffset = logical.logicalOffsetOf(physicalStart, book.scrollOffset)
+                        .coerceIn(0, logical.chapters.lastIndex)
+                    val logicalOffset = logical.logicalOffsetOf(physicalStart, effectiveBook.scrollOffset)
                     lastLoadedChapterIndex = logicalStart
-                    _selectedBook.value = book.copy(
+                    _selectedBook.value = effectiveBook.copy(
                         currentChapterIndex = logicalStart,
                         scrollOffset = logicalOffset
                     )
-                    collectAnnotations(book.id)
-                    loadActiveChaptersContent(book.id, logicalStart)
+                    collectAnnotations(effectiveBook.id)
+                    loadActiveChaptersContent(effectiveBook.id, logicalStart)
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (t: Throwable) {
                 android.util.Log.e("BookImport", "[MainViewModel] Error selecting book ${book.title}", t)
+                if (token == readerSelectionToken) {
+                    _readerLoadError.value = t.localizedMessage ?: "书籍加载失败"
+                    _readerLoading.value = false
+                }
             }
         }
     }
 
-    private fun collectAnnotations(bookId: Int) {
+    fun retrySelectedBook() {
+        val source = selectedSourceBook ?: return
+        val token = readerSelectionToken
         viewModelScope.launch {
+            val fresh = database.bookDao().getBookById(source.id) ?: source
+            if (token == readerSelectionToken && _selectedBook.value?.id == source.id) {
+                selectBook(fresh)
+            }
+        }
+    }
+
+    /** 切章立刻启动正文读取，不能等待进度写库完成。 */
+    fun ensureActiveChapter(bookId: Int, logicalIndex: Int) {
+        if (_selectedBook.value?.id != bookId || lastLoadedBookId != bookId ||
+            logicalIndex !in cachedMetadataList.indices || lastLoadedChapterIndex == logicalIndex) return
+        lastLoadedChapterIndex = logicalIndex
+        _readerLoadError.value = null
+        _selectedBook.value = _selectedBook.value?.copy(currentChapterIndex = logicalIndex, scrollOffset = 0)
+        loadActiveChaptersContent(bookId, logicalIndex)
+    }
+
+    private fun collectAnnotations(bookId: Int) {
+        bookmarkCollectJob = viewModelScope.launch {
             repository.getBookmarksForBook(bookId).collect { list ->
                 val mapping = chapterMapping
                 _bookmarks.value = if (mapping == null) {
@@ -474,7 +727,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
-        viewModelScope.launch {
+        highlightCollectJob = viewModelScope.launch {
             repository.getHighlightsForBook(bookId).collect { list ->
                 val mapping = chapterMapping
                 _highlights.value = if (mapping == null) {
@@ -528,35 +781,58 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _importStatusMessage.value = null
     }
 
+    private val progressSaveJobs = java.util.concurrent.ConcurrentHashMap<Int, Job>()
     fun updateProgress(bookId: Int, chapterIndex: Int, scrollOffset: Int, isFinished: Boolean) {
-        viewModelScope.launch {
-            // Reader uses logical (merged) chapter indexes; persist the first physical part so
-            // restoring the book maps back to exactly the same position.
-            val physicalIndex = chapterMapping?.physicalIndexFor(chapterIndex) ?: chapterIndex
-            repository.updateBookProgress(bookId, physicalIndex, scrollOffset, isFinished)
-
-            // For lazy loaded novels, load contents of new active window if index changed
-            if (lastLoadedBookId == bookId && lastLoadedChapterIndex != chapterIndex) {
-                lastLoadedChapterIndex = chapterIndex
-                _selectedBook.value?.let { currentBook ->
-                    if (currentBook.id == bookId && !currentBook.isComic) {
-                        _selectedBook.value = currentBook.copy(
-                            currentChapterIndex = chapterIndex,
-                            scrollOffset = scrollOffset,
-                            isFinished = isFinished
-                        )
-                        loadActiveChaptersContent(bookId, chapterIndex)
-                    }
-                }
-            }
+        if (_selectedBook.value?.id != bookId) return
+        val physicalIndex=chapterMapping?.physicalIndexFor(chapterIndex) ?: chapterIndex
+        val epoch = ContentMutationGate.epoch
+        progressSaveJobs.remove(bookId)?.cancel()
+        val job=viewModelScope.launch(Dispatchers.IO) {
+            if(!isFinished) delay(400)
+            repository.updateBookProgress(bookId,physicalIndex,scrollOffset,isFinished,epoch)
         }
+        progressSaveJobs[bookId]=job
+        job.invokeOnCompletion { progressSaveJobs.remove(bookId,job) }
     }
 
+    /**
+     * 删书级联神回：Room 侧漫画主键是源作用域字符串（无法建 Int 外键），
+     * 所以在这里显式清理 —— 先删神回记录，再删书（含其封面缓存文件）。
+     */
     fun deleteBook(book: Book) {
         viewModelScope.launch {
             repository.deleteBook(book)
         }
     }
+
+    /* ── 多选删除的撤销窗口 ──
+     * 提交必须挂在 Activity 级作用域上：挂在 rememberCoroutineScope 上时，
+     * 8 秒内离开该界面协程就被取消，删除被静默丢弃（界面显示已删、实际什么都没删）。
+     * 每批一个独立 token，连续删多批互不覆盖。 */
+    private val deletionScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val pendingDeleteTokens: MutableSet<String> =
+        java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+    /** 8 秒后仍未撤销则真正落盘删除；onCommitted 在主线程回调（用于把该批从"软删除"列表移除）。 */
+    fun scheduleBooksDeletion(books: List<Book>, token: String, onCommitted: () -> Unit = {}) {
+        pendingDeleteTokens.add(token)
+        deletionScope.launch {
+            delay(8_000)
+            if (pendingDeleteTokens.remove(token)) {
+                books.forEach {
+                    runCatching { repository.deleteBook(it) }
+                }
+                withContext(Dispatchers.Main) { onCommitted() }
+            }
+        }
+    }
+
+    fun cancelBooksDeletion(token: String) {
+        pendingDeleteTokens.remove(token)
+    }
+
+    /** 删除前预估这批书占用的磁盘字节（书体/封面/匹配的下载任务文件，含漫画目录递归）。 */
+    suspend fun booksDiskBytes(books: List<Book>): Long = repository.booksDiskBytes(books)
 
     fun deleteReadingRecord(id: Int) {
         viewModelScope.launch {
@@ -668,15 +944,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     /* ── 隐私模式操作（第七轮第 6.3/6.4/6.5 条） ── */
 
     /** 首次开启：设置 6 位 PIN 并启用。返回 false = PIN 非法。 */
-    fun enablePrivacyMode(pin: String): Boolean {
-        val ok = privacy.enableWithPin(pin)
+    suspend fun enablePrivacyMode(pin: String): Boolean {
+        val ok = withContext(Dispatchers.Default) { privacy.enableWithPin(pin) }
         if (ok) _privacyModeEnabled.value = true
         return ok
     }
 
     /** 关闭隐私模式（先验证 PIN）。返回 false = PIN 错误。 */
-    fun disablePrivacyMode(pin: String): Boolean {
-        val ok = privacy.disable(pin)
+    suspend fun disablePrivacyMode(pin: String): Boolean {
+        val ok = withContext(Dispatchers.Default) { privacy.disable(pin) }
         if (ok) {
             _privacyModeEnabled.value = false
             _unlockedCategoryIds.value = emptySet()
@@ -684,10 +960,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return ok
     }
 
-    fun verifyPrivacyPin(pin: String): Boolean = privacy.verifyPin(pin)
+    suspend fun verifyPrivacyPin(pin: String): Boolean = withContext(Dispatchers.Default) { privacy.verifyPin(pin) }
 
     /** 修改 PIN（先验证旧 PIN） */
-    fun changePrivacyPin(oldPin: String, newPin: String): Boolean = privacy.changePin(oldPin, newPin)
+    suspend fun changePrivacyPin(oldPin: String, newPin: String): Boolean = withContext(Dispatchers.Default) { privacy.changePin(oldPin, newPin) }
 
     /** 切换某分类的密码保护标记（仅在隐私模式开启时允许——6.4 总开关约束） */
     fun setCategoryProtected(categoryId: Int, isProtected: Boolean) {
@@ -702,9 +978,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** 进入受保护分类：验证 PIN，成功则本次进程内解锁该分类 */
-    fun unlockCategory(categoryId: Int, pin: String): Boolean {
+    suspend fun unlockCategory(categoryId: Int, pin: String): Boolean {
         if (!_privacyModeEnabled.value) return false
-        if (!privacy.verifyPin(pin)) return false
+        if (!withContext(Dispatchers.Default) { privacy.verifyPin(pin) }) return false
         _unlockedCategoryIds.value = _unlockedCategoryIds.value + categoryId
         return true
     }
@@ -742,92 +1018,90 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         prefs.favoritesProtected = enabled
     }
 
-    fun recordTime(seconds: Long, title: String? = null) {
-        if (seconds <= 0) return
-        // 第七轮第 6.5 条：无痕浏览——受保护分类内的阅读时长不计入任何统计源
-        // （阅读进度走独立的进度保存链路，不受此门控影响）
-        if (isIncognitoReading()) return
+    fun recordTime(seconds: Long, title: String? = null, onlineBook: com.example.source.SearchBook? = null) {
+        if (seconds <= 0 || isIncognitoReading()) return
+        val epoch = ContentMutationGate.epoch
+        val currentBook = if (onlineBook == null) _selectedBook.value else null
+        val recordTitle = currentBook?.title ?: title ?: "在线阅读"
+        val end = System.currentTimeMillis()
+        val bounded = seconds.coerceAtMost(24L * 60 * 60)
+        val slices = ReadingTimeSlices.split(end - bounded * 1000, end, bounded)
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            prefs.totalReadTimeSeconds += seconds
-            val todayStr = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault()).format(java.util.Date())
-            val currentDaily = prefs.getDailyReadTime(todayStr)
-            prefs.setDailyReadTime(todayStr, currentDaily + seconds)
-
-            _totalReadTimeSeconds.value = prefs.totalReadTimeSeconds
-            // 今日数据源实时更新（跨天时 todayStr 已是新一天，累加落在新键上）
-            _todayReadSeconds.value = currentDaily + seconds
-            val newStreak = prefs.calculateStreak()
-            _streakDays.value = newStreak
-        }
-
-        // Also record to reading_records database table
-        val currentBook = _selectedBook.value
-        val recordTitle = currentBook?.title ?: title
-        if (recordTitle != null) {
-            viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                try {
-                    val todayStr = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault()).format(java.util.Date())
-                    // 本地书按 bookId 聚合；在线阅读/在线漫画没有本地 bookId，按书名聚合，
-                    // 避免同一本书在同一天反复插入多条记录导致周几阅读记录重复显示。
-                    val record = if (currentBook != null) {
-                        database.bookDao().getReadingRecordForBookAndDate(currentBook.id, todayStr)
-                    } else {
-                        database.bookDao().getReadingRecordForTitleAndDate(recordTitle, todayStr)
-                    }
-                    if (record != null) {
-                        database.bookDao().insertReadingRecord(
-                            record.copy(durationSeconds = record.durationSeconds + seconds)
-                        )
-                    } else {
-                        database.bookDao().insertReadingRecord(
-                            ReadingRecord(
-                                bookId = currentBook?.id,
-                                bookTitle = recordTitle,
-                                dateStr = todayStr,
-                                durationSeconds = seconds
-                            )
-                        )
-                    }
-                } catch (e: Exception) {
-                    android.util.Log.e("MainViewModel", "Error saving reading record to DB", e)
+            readingTimeMutex.lock()
+            try {
+                if(!repository.addReadingTime(currentBook?.id, recordTitle, slices, epoch, prefs)) return@launch
+                for (slice in slices) {
+                    val record = if (currentBook != null) database.bookDao().getReadingRecordForBookAndDate(currentBook.id, slice.date)
+                        else database.bookDao().getReadingRecordForTitleAndDate(recordTitle, slice.date)
+                    if (currentBook != null) com.example.library.ReadingRecordMetadata.remember(getApplication(), currentBook, record?.id)
+                    else onlineBook?.let { com.example.library.ReadingRecordMetadata.remember(getApplication(), it, recordId = record?.id) }
                 }
-            }
+                val total = database.bookDao().totalRecordedSeconds() + prefs.legacyUnattributedSeconds
+                prefs.totalReadTimeSeconds = total
+                for (slice in slices) prefs.setDailyReadTime(slice.date, database.bookDao().recordedSecondsForDate(slice.date))
+                _totalReadTimeSeconds.value = total
+                val today = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date())
+                _todayReadSeconds.value = database.bookDao().recordedSecondsForDate(today)
+                _streakDays.value = prefs.calculateStreak()
+            } finally { readingTimeMutex.unlock() }
         }
     }
 
+    private var searchJob: kotlinx.coroutines.Job? = null
+
     fun searchFullText(query: String) {
+        // 输入框逐字符触发：取消上一轮搜索 + 300ms 防抖，否则"插"的慢结果
+        // 会晚于"插图"返回并覆盖结果列表 —— 列表里混进不含完整关键词的条目，
+        // 点进去自然没有关键词（用户实测的"检索结果没有关键词"即此因）
+        searchJob?.cancel()
         if (query.isBlank()) {
             _searchResults.value = emptyList()
-            return
-        }
-        _isSearching.value = true
-        val bookId = _selectedBook.value?.id ?: run {
             _isSearching.value = false
             return
         }
-        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+        val bookId = _selectedBook.value?.id ?: return
+        val token = readerSelectionToken
+        val mapping = chapterMapping
+        _isSearching.value = true
+        searchJob = viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            kotlinx.coroutines.delay(300)
             try {
-                // Search directly in DB to avoid loading the whole book into memory
-                val matchedChapters = database.bookDao().searchChapters(bookId, query)
-                val results = mutableListOf<SearchResultItem>()
-                val mapping = chapterMapping
-                matchedChapters.forEach { chapter ->
-                    val pos = chapter.content.indexOf(query, ignoreCase = true)
-                    if (pos >= 0) {
-                        val start = (pos - 15).coerceAtLeast(0)
-                        val end = (pos + query.length + 25).coerceAtMost(chapter.content.length)
-                        val snippet = "..." + chapter.content.substring(start, end) + "..."
-                        val logicalIndex = mapping?.logicalIndexOf(chapter.chapterOrder) ?: chapter.chapterOrder
-                        val logicalTitle = mapping?.chapters?.getOrNull(logicalIndex)?.title ?: chapter.title
-                        results.add(SearchResultItem(logicalIndex, logicalTitle, snippet))
+                val matches = ArrayList<Chapter>()
+                var afterOrder = -1
+                var resultCount = 0
+                while (resultCount < com.example.data.SearchLocator.MAX_RESULTS) {
+                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                    val batch = database.bookDao().searchChaptersBatch(bookId, query, afterOrder)
+                    if (batch.isEmpty()) break
+                    // Keep only chapters needed for the result cap.
+                    for (chapter in batch) {
+                        matches.add(chapter)
+                        resultCount += com.example.data.SearchLocator.countOccurrences(
+                            chapter.content, query)
+                        if (resultCount >= com.example.data.SearchLocator.MAX_RESULTS) break
                     }
+                    afterOrder = batch.last().chapterOrder
                 }
+                val results = com.example.data.SearchLocator.buildResults(matches, query,
+                    logicalIndexOf = { order -> mapping?.logicalIndexOf(order) ?: order },
+                    logicalTitleOf = { idx -> mapping?.chapters?.getOrNull(idx)?.title })
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                if (token != readerSelectionToken || _selectedBook.value?.id != bookId) return@launch
                 _searchResults.value = results
-            } catch (t: Throwable) {
-                android.util.Log.e("BookImport", "Error searching full text", t)
-            } finally {
                 _isSearching.value = false
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) {
+                if (token == readerSelectionToken && _selectedBook.value?.id == bookId) {
+                    android.util.Log.e("BookImport", "Error searching full text", e)
+                    _isSearching.value = false
+                }
             }
         }
     }
+
+    override fun onCleared() {
+        ttsManager.release()
+        super.onCleared()
+    }
+
 }

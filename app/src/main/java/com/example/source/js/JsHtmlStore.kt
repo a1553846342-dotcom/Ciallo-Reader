@@ -14,9 +14,13 @@ import org.jsoup.nodes.TextNode
 class JsHtmlStore {
     // JS 侧 HtmlDocument._key 从 0 开始，这里必须一致，否则第一个文档永远查不到
     private var nextId = 0
-    private val docs = HashMap<Int, Document>()
+    private val docs = LinkedHashMap<Int, Document>(16, 0.75f, true)
     private val elements = HashMap<Int, Element>()
     private val nodes = HashMap<Int, Node>()
+    private val documentIds = java.util.IdentityHashMap<Document, Int>()
+    private val handleIds = java.util.IdentityHashMap<Node, Int>()
+    private val owners = HashMap<Int, Int>()
+    private val sizes = HashMap<Int, Long>()
 
     private fun next(): Int = nextId++
 
@@ -25,18 +29,41 @@ class JsHtmlStore {
      * 不能与元素 id 共用自增计数器，否则后续文档全部错位。
      */
     fun parse(jsKey: Int, html: String): Int {
-        if (docs.size > 200) {
-            docs.clear()
-            elements.clear()
-            nodes.clear()
-        }
+        require(html.length <= 2 * 1024 * 1024) { "书源 HTML 超过 2Mi 字符" }
+        dispose(jsKey)
         val doc = Jsoup.parse(html)
+        val size = html.length * 2L + doc.getAllElements().size * 512L
+        require(size <= 4L * 1024 * 1024) { "书源 HTML 解析内存预算不足" }
         docs[jsKey] = doc
+        documentIds[doc] = jsKey
+        sizes[jsKey] = size
+        // Every selected element keeps its entire Jsoup document alive. Bound the
+        // retained documents AND release their handles, rather than clearing docs alone.
+        while (docs.size > 8 || (docs.size > 1 && sizes.values.sum() > 4L * 1024 * 1024)) {
+            dispose(docs.keys.first())
+        }
         return jsKey
     }
 
     fun dispose(docId: Int) {
-        docs.remove(docId)
+        docs.remove(docId)?.let { documentIds.remove(it) }
+        sizes.remove(docId)
+        val handles = owners.filterValues { it == docId }.keys
+        handles.forEach { id ->
+            nodes.remove(id)?.let { handleIds.remove(it) }
+            elements.remove(id)
+            owners.remove(id)
+        }
+    }
+
+    fun clear() {
+        docs.clear()
+        elements.clear()
+        nodes.clear()
+        documentIds.clear()
+        handleIds.clear()
+        owners.clear()
+        sizes.clear()
     }
 
     fun querySelector(docId: Int, query: String): Int? {
@@ -131,17 +158,24 @@ class JsHtmlStore {
     }
 
     private fun elementId(el: Element): Int {
-        elements.entries.firstOrNull { it.value === el }?.let { return it.key }
+        handleIds[el]?.let { return it }
         val id = next()
         elements[id] = el
+        retain(id, el)
         return id
     }
 
     private fun nodeId(n: Node): Int {
-        nodes.entries.firstOrNull { it.value === n }?.let { return it.key }
+        handleIds[n]?.let { return it }
         if (n is Element) return elementId(n)
         val id = next()
-        nodes[id] = n
+        retain(id, n)
         return id
+    }
+
+    private fun retain(id: Int, node: Node) {
+        nodes[id] = node
+        handleIds[node] = id
+        node.ownerDocument()?.let { documentIds[it] }?.let { owners[id] = it }
     }
 }

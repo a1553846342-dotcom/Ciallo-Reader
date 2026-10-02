@@ -176,6 +176,7 @@ internal fun PanelSlider(
     steps: Int = 0,
     enabled: Boolean = true,
     modifier: Modifier = Modifier,
+    reverse: Boolean = false,
 ) {
     val fraction = if (valueRange.endInclusive > valueRange.start) {
         ((value - valueRange.start) / (valueRange.endInclusive - valueRange.start)).coerceIn(0f, 1f)
@@ -191,11 +192,12 @@ internal fun PanelSlider(
         modifier
             .fillMaxWidth()
             .height(30.dp)
-            .pointerInput(valueRange, steps, enabled) {
+            .pointerInput(valueRange, steps, enabled, reverse) {
                 if (!enabled) return@pointerInput
                 val slop = viewConfiguration.touchSlop
                 fun posToValue(x: Float): Float {
-                    val f = snap((x / size.width).coerceIn(0f, 1f))
+                    val physical = (x / size.width).coerceIn(0f, 1f)
+                    val f = snap(if (reverse) 1f - physical else physical)
                     return valueRange.start + f * (valueRange.endInclusive - valueRange.start)
                 }
                 awaitEachGesture {
@@ -240,7 +242,7 @@ internal fun PanelSlider(
         val ringColor = MintPrimary.copy(alpha = 0.18f)
         Canvas(Modifier.fillMaxSize()) {
             val cy = size.height / 2f
-            val cx = trackWidth * fraction
+            val cx = trackWidth * (if (reverse) 1f - fraction else fraction)
             // 轨道
             drawRoundRect(
                 color = Color(0x2EFFFFFF),
@@ -252,8 +254,8 @@ internal fun PanelSlider(
             drawRoundRect(
                 color = if (enabled) fillEnabled else fillDisabled,
                 cornerRadius = CornerRadius(trackH / 2),
-                topLeft = Offset(0f, cy - trackH / 2),
-                size = Size(cx.coerceAtLeast(trackH), trackH),
+                topLeft = Offset(if (reverse) cx else 0f, cy - trackH / 2),
+                size = Size((trackWidth * fraction).coerceAtLeast(trackH), trackH),
             )
             // 光环（克制：低透明度描边圈，不做发光；禁用时收起）
             if (enabled) {

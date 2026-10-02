@@ -55,7 +55,7 @@ class ComicSettingsStore(context: Context) {
                 PRESET_CLASSIC, "老漫画", "RZ",
                 ComicReaderConfig(
                     mode = ComicMode.SINGLE,
-                    direction = ComicDirection.RTL,
+                    direction = ComicDirection.LTR,
                     fit = ComicFit.FIT_WIDTH,
                     cropMode = ComicCropMode.AUTO,
                     enhanceMode = ComicEnhanceMode.CAS,
@@ -221,18 +221,23 @@ class ComicSettingsStore(context: Context) {
             savePresets(builtins())
             return
         }
-        // 补齐可能缺失的内置预设（版本升级场景）
-        val arr = runCatching { JSONArray(raw) }.getOrNull() ?: return
-        val existing = mutableSetOf<String>()
+        // Decode directly: loadPresets() calls this method and would recurse when
+        // an upgrade needs to restore a missing built-in entry.
+        val arr = runCatching { JSONArray(raw) }.getOrNull() ?: run {
+            savePresets(builtins())
+            return
+        }
+        val existing = mutableListOf<ComicPreset>()
         for (i in 0 until arr.length()) {
-            runCatching { arr.getJSONObject(i).optString("id") }.getOrNull()?.let { existing.add(it) }
+            runCatching { ComicPreset.fromJson(arr.getJSONObject(i)) }.getOrNull()?.let(existing::add)
         }
-        val missing = builtins().filter { it.id !in existing }
-        if (missing.isNotEmpty()) {
-            val list = loadPresets().toMutableList()
-            list.addAll(0, missing)
-            savePresets(list)
-        }
+        // Built-ins are immutable; migrate old directions/glyphs, preserving
+        // favorites, custom presets, the default selection and per-book settings.
+        val defaults = builtins().associateBy { it.id }
+        val migrated = existing.map { old -> defaults[old.id]?.copy(favorite = old.favorite) ?: old }
+        val missing = defaults.values.filter { candidate -> migrated.none { it.id == candidate.id } }
+        val merged = missing + migrated
+        if (merged != existing || existing.size != arr.length()) savePresets(merged)
     }
 
     /* ── 每本漫画独立配置 / 状态 ── */

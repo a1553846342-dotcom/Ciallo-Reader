@@ -177,6 +177,7 @@ class ZLibraryEapiClient(
             cover = b.optString("cover", "").ifBlank { null },
             format = b.optString("extension", "epub").lowercase(),
             language = b.optString("language", "").ifBlank { null },
+            description = b.optString("description", "").takeIf(String::isNotBlank)?.let { org.jsoup.Jsoup.parse(it).text() },
             downloadUrl = dl?.let { if (it.startsWith("http")) it else "https://$domain$it" },
             eapiId = eapiId,
             eapiHash = eapiHash

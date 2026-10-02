@@ -14,6 +14,7 @@ import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -86,6 +87,7 @@ class ComicZoomState(
     /** 双击检测（per-cell，避免跨页误判） */
     internal var lastTapTime by mutableLongStateOf(0L)
     internal var lastTapPos by mutableStateOf(Offset.Zero)
+    internal var pendingTapJob: Job? = null
 
     /** 是否存在可平移空间（放大或内容超出容器） */
     val canPan: Boolean
@@ -218,15 +220,18 @@ class ComicZoomState(
         val f = focal ?: Offset(cx, cy)
         val pCX = if (startScale > 0f) (f.x - cx - startOffX) / startScale else 0f
         val pCY = if (startScale > 0f) (f.y - cy - startOffY) / startScale else 0f
-        val tOffX = f.x - cx - pCX * tScale
-        val tOffY = f.y - cy - pCY * tScale
+        val targetLimitX = max(0f, (contentSize.width * tScale - containerSize.width) / 2f)
+        val targetLimitY = max(0f, (contentSize.height * tScale - containerSize.height) / 2f)
+        val tOffX = (f.x - cx - pCX * tScale).coerceIn(-targetLimitX, targetLimitX)
+        val tOffY = (f.y - cy - pCY * tScale).coerceIn(-targetLimitY, targetLimitY)
         val anim = Animatable(0f)
+        // 只约束最终位置，和缩放倍率共用一个进度：逐帧按当时的边界夹紧，
+        // 会让非中心焦点漂移，并把回弹途中被双击打断的偏移瞬间拉回边界。
         anim.animateTo(1f, tween(220)) {
             val v = this.value
             scale = startScale + (tScale - startScale) * v
             offsetX = startOffX + (tOffX - startOffX) * v
             offsetY = startOffY + (tOffY - startOffY) * v
-            clampOffsets()
         }
         clampOffsets()
     }
@@ -387,6 +392,12 @@ fun Modifier.comicZoomable(
     val scope = rememberCoroutineScope()
     val latestConfig by rememberUpdatedState(config)
     val latestCallbacks by rememberUpdatedState(callbacks)
+    DisposableEffect(state) {
+        onDispose {
+            state.pendingTapJob?.cancel()
+            state.releaseJob?.cancel()
+        }
+    }
     this
         .onSizeChanged { state.containerSize = Size(it.width.toFloat(), it.height.toFloat()) }
         .pointerInput(state) {
@@ -397,9 +408,12 @@ fun Modifier.comicZoomable(
             val doubleTapRadius = 48.dp.toPx()
             awaitEachGesture {
                 val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Main)
+                if (down.isConsumed) return@awaitEachGesture
+                state.pendingTapJob?.cancel()
                 // 新手势打断上一次松手动画（fling/回弹）
                 state.releaseJob?.cancel()
                 state.releaseJob = null
+                state.releaseAnimating = false
                 state.gestureActive = true
 
                 var pointers = 1
@@ -416,14 +430,19 @@ fun Modifier.comicZoomable(
                 var lastPos = down.position
                 // QuickZoom：第二击按住上下拖
                 var quickZoomCandidate = latestConfig.doubleTapZoom &&
-                    System.currentTimeMillis() - state.lastTapTime < doubleTapWindow &&
+                    state.lastTapTime > 0L &&
+                    down.uptimeMillis - state.lastTapTime in 0..doubleTapWindow &&
                     (down.position - state.lastTapPos).getDistance() < doubleTapRadius
                 var quickZoomActive = false
-                if (quickZoomCandidate) state.lastTapTime = 0L
+                if (quickZoomCandidate) {
+                    state.lastTapTime = 0L
+                    state.pendingTapJob?.cancel()
+                }
                 val velocityTracker = VelocityTracker()
                 velocityTracker.addPosition(down.uptimeMillis, down.position)
-                // 与 System.currentTimeMillis() 同一时基
-                val downTime = System.currentTimeMillis()
+                // All tap timing uses pointer event timestamps, including injected/queued events.
+                val downTime = down.uptimeMillis
+                var gestureEndTime = downTime
 
                 // 长按计时（外部 scope，避免受限挂起限制）
                 var longPressJob: Job? = if (quickZoomCandidate) null else scope.launch {
@@ -447,6 +466,7 @@ fun Modifier.comicZoomable(
                 try {
                     while (true) {
                         val event = awaitPointerEvent(PointerEventPass.Main)
+                        gestureEndTime = event.changes.firstOrNull()?.uptimeMillis ?: gestureEndTime
                         pointers = event.changes.count { it.pressed }
                         if (pointers == 0) {
                             event.changes.firstOrNull()?.let { lastPos = it.position }
@@ -454,12 +474,16 @@ fun Modifier.comicZoomable(
                         }
 
                         if (pointers >= 2) {
+                            state.lastTapTime = 0L
                             transformMode = true
                             quickZoomCandidate = false
                             quickZoomActive = false
                             longPressJob?.cancel()
                             val zoomChange = event.calculateZoom()
                             val panChange = event.calculatePan()
+                            event.changes.firstOrNull { it.id == down.id }?.let {
+                                velocityTracker.addPosition(it.uptimeMillis, it.position)
+                            }
                             if (zoomChange != 1f || panChange != Offset.Zero) {
                                 val focal = event.calculateCentroid(true)
                                 state.updateTransform(zoomChange, panChange, focal)
@@ -475,8 +499,17 @@ fun Modifier.comicZoomable(
                             continue
                         }
 
-                        val change = event.changes.firstOrNull() ?: break
+                        val change = event.changes.firstOrNull { it.pressed } ?: break
                         velocityTracker.addPosition(change.uptimeMillis, change.position)
+
+                        // 首末页外翻等父层已接管拖动：positionChange() 会变成 0，
+                        // 仍须取消长按计时，避免拖了 380ms 后误开长按放大。
+                        if (change.isConsumed && !holdZoomConsuming && !transformMode) {
+                            moved = true
+                            state.lastTapTime = 0L
+                            longPressJob?.cancel()
+                            continue
+                        }
 
                         if (holdZoomConsuming) {
                             // 长按放大/长按面板期间消费全部指针（多指同持不漏事件）
@@ -506,6 +539,7 @@ fun Modifier.comicZoomable(
                         totalDragY += delta.y
                         if (!moved && (abs(totalDragX) > slop || abs(totalDragY) > slop)) {
                             moved = true
+                            state.lastTapTime = 0L
                             longPressJob?.cancel()
                         }
 
@@ -528,7 +562,7 @@ fun Modifier.comicZoomable(
                             // telephoto：向下拖放大，每 px +0.4%，焦点锁定双击点
                             if (delta.y != 0f) {
                                 state.updateTransform(
-                                    zoom = 1f + delta.y * 0.004f,
+                                    zoom = kotlin.math.exp(delta.y * 0.004f),
                                     pan = Offset.Zero,
                                     focal = down.position,
                                 )
@@ -571,8 +605,7 @@ fun Modifier.comicZoomable(
                             val lx = state.panLimitX()
                             val ly = state.panLimitY()
                             val realZoom = state.scale > 1.02f
-                            // TTB 单页：竖直是翻页主轴（VerticalPager）；其余模式（含 TTB+双页）水平是主轴
-                            val pageAxisIsX = !(latestConfig.direction == ComicDirection.TTB && latestConfig.mode == ComicMode.SINGLE)
+                            val pageAxisIsX = latestConfig.direction != ComicDirection.TTB
                             val atHEdge = lx > 0.5f && (
                                 (delta.x > 0 && state.offsetX >= lx - 0.5f) ||
                                     (delta.x < 0 && state.offsetX <= -lx + 0.5f)
@@ -647,15 +680,16 @@ fun Modifier.comicZoomable(
                 }
 
                 // 手指抬起：tap / double-tap 判定
-                val pressDuration = System.currentTimeMillis() - downTime
+                val pressDuration = gestureEndTime - downTime
                 val tapEligible = !moved && !transformMode && !holdZoomConsuming && !quickZoomActive
                 // 双击第二击按住较久后抬起仍应完成双击档位切换（tapMaxDuration 只约束单击）
                 if (tapEligible && (pressDuration < tapMaxDuration || quickZoomCandidate)) {
-                    val now = System.currentTimeMillis()
+                    val now = gestureEndTime
                     val isDouble = quickZoomCandidate ||
-                        (now - state.lastTapTime < doubleTapWindow &&
+                        (state.lastTapTime > 0L && now - state.lastTapTime in 0..doubleTapWindow &&
                             (lastPos - state.lastTapPos).getDistance() < doubleTapRadius)
                     if (isDouble) {
+                        state.pendingTapJob?.cancel()
                         state.lastTapTime = 0L
                         state.lastTapPos = Offset.Zero
                         if (latestConfig.doubleTapZoom) {
@@ -675,7 +709,15 @@ fun Modifier.comicZoomable(
                     } else {
                         state.lastTapTime = now
                         state.lastTapPos = lastPos
-                        latestCallbacks.onTapZone(lastPos, Size(size.width.toFloat(), size.height.toFloat()))
+                        val tapPos = lastPos
+                        val tapSize = Size(size.width.toFloat(), size.height.toFloat())
+                        if (latestConfig.doubleTapZoom) {
+                            state.pendingTapJob?.cancel()
+                            state.pendingTapJob = scope.launch {
+                                delay(doubleTapWindow)
+                                latestCallbacks.onTapZone(tapPos, tapSize)
+                            }
+                        } else latestCallbacks.onTapZone(tapPos, tapSize)
                     }
                 }
             }
@@ -688,11 +730,14 @@ fun Modifier.comicZoomable(
  */
 fun Modifier.comicEdgeSwipe(enabled: Boolean, zoomed: () -> Boolean = { false }, onTrigger: () -> Unit): Modifier =
     if (!enabled) this else composed {
+        val latestZoomed by rememberUpdatedState(zoomed)
+        val latestTrigger by rememberUpdatedState(onTrigger)
         pointerInput(Unit) {
             val edge = 24.dp.toPx()
             val slop = viewConfiguration.touchSlop
             awaitEachGesture {
                 val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                if (latestZoomed() || down.isConsumed) return@awaitEachGesture
                 if (down.position.x > edge && down.position.x < size.width - edge) return@awaitEachGesture
                 val fromLeft = down.position.x <= edge
                 var dx = 0f
@@ -700,10 +745,11 @@ fun Modifier.comicEdgeSwipe(enabled: Boolean, zoomed: () -> Boolean = { false },
                 var active = false
                 while (true) {
                     val event = awaitPointerEvent(PointerEventPass.Initial)
+                    if (event.changes.count { it.pressed } > 1 || latestZoomed()) return@awaitEachGesture
                     val change = event.changes.firstOrNull { it.id == down.id } ?: break
                     if (!change.pressed) break
                     // 放大态（双指/长按开始后）由缩放手势接管，边缘关闭让位
-                    if (active && zoomed()) {
+                    if (active && latestZoomed()) {
                         active = false
                         return@awaitEachGesture
                     }
@@ -715,7 +761,7 @@ fun Modifier.comicEdgeSwipe(enabled: Boolean, zoomed: () -> Boolean = { false },
                     }
                     if (active) change.consume()
                 }
-                if (active && abs(dx) > 64.dp.toPx() && !zoomed()) onTrigger()
+                if (active && abs(dx) > 64.dp.toPx() && !latestZoomed()) latestTrigger()
             }
         }
     }

@@ -28,11 +28,12 @@ object Fb2Parser {
         context: Context,
         uri: Uri,
         fileName: String,
-        bookDao: BookDao
+        bookDao: BookDao,
+        targetBookId: Int? = null
     ): Result<Book> = withContext(Dispatchers.IO) {
         try {
             Log.d(TAG, "[Fb2Parser] Starting FB2 import for $fileName")
-            val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+            val bytes = context.contentResolver.openInputStream(uri)?.use { it.readImportBytes() }
                 ?: return@withContext Result.failure(Exception("无法读取 FB2 文件"))
             val text = decodeFb2Text(bytes)
             if (!text.contains("<FictionBook", ignoreCase = true)) {
@@ -45,6 +46,7 @@ object Fb2Parser {
                 ?: fileName.substringBeforeLast('.').ifBlank { fileName }
             val author = doc.selectFirst("author")?.text()?.trim()?.ifBlank { null } ?: "未知作者"
 
+
             val initialBook = Book(
                 title = title,
                 author = author,
@@ -52,7 +54,28 @@ object Fb2Parser {
                 contentType = "NOVEL",
                 totalChapters = 0
             )
-            val bookId = bookDao.insertBook(initialBook).toInt()
+            // targetBookId 非空 = 老书补图片迁移：不新建书、失败不删书（调用方事务收尾）
+            val bookId = targetBookId ?: bookDao.insertBook(initialBook).toInt()
+
+            // 内嵌图片：<binary id/content-type> 全部提取到持久目录，正文占位符按 id 引用
+            val fb2ImageDir = File(context.filesDir, "fb2_images/$bookId")
+            val binaryImages = HashMap<String, Fb2Image>()
+            doc.select("binary").forEach { bin ->
+                val binId = bin.attr("id").trim()
+                val base64 = bin.text().replace(Regex("\\s"), "")
+                if (binId.isBlank() || base64.isBlank()) return@forEach
+                runCatching {
+                    val bytes = android.util.Base64.decode(base64, android.util.Base64.DEFAULT)
+                    val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+                    if (opts.outWidth <= 0 || opts.outHeight <= 0) return@forEach
+                    val ext = detectImageExt(bytes) ?: "jpg"
+                    if (!fb2ImageDir.exists()) fb2ImageDir.mkdirs()
+                    val f = File(fb2ImageDir, "$binId.$ext")
+                    f.writeBytes(bytes)
+                    binaryImages[binId] = Fb2Image(f.absolutePath, opts.outWidth, opts.outHeight)
+                }
+            }
 
             // 只取第一个 <body>（正文），跳过 notes/comments 等附加 body
             val body = doc.select("body").firstOrNull()
@@ -65,10 +88,25 @@ object Fb2Parser {
                     val sectionTitle = section.select("title").firstOrNull()?.text()?.trim()
                         ?.ifBlank { null }
                         ?: "第 ${index + 1} 章"
-                    val contentText = section.select("p")
-                        .filter { it.parent()?.tagName() != "title" }
-                        .joinToString("\n\n") { it.text().trim() }
-                        .trim()
+                    // 按文档顺序遍历 p 与 image：文本与内嵌图片占位符交错排列
+                    val contentParts = mutableListOf<String>()
+                    section.select("p, image").forEach { el ->
+                        when (el.tagName().lowercase()) {
+                            "image" -> {
+                                val href = (el.attr("l:href").ifBlank { el.attr("href") }).trimStart('#')
+                                binaryImages[href]?.let { img ->
+                                    contentParts.add("[IMG:${img.path}|${img.w}|${img.h}]")
+                                }
+                            }
+                            else -> {
+                                if (el.parent()?.tagName() != "title") {
+                                    val text = el.text().trim()
+                                    if (text.isNotEmpty()) contentParts.add(text)
+                                }
+                            }
+                        }
+                    }
+                    val contentText = contentParts.joinToString("\n\n").trim()
                     if (contentText.isNotEmpty()) {
                         addChaptersWithSplit(chapters, bookId, order, sectionTitle, contentText)
                         order = chapters.size
@@ -81,7 +119,7 @@ object Fb2Parser {
                     ?.trim()
                     ?: ""
                 if (flatText.isNotEmpty()) {
-                    flatText.chunked(5000).forEachIndexed { index, part ->
+                    flatText.let { splitChapterText(it, 5000) }.forEachIndexed { index, part ->
                         chapters.add(
                             Chapter(
                                 bookId = bookId,
@@ -95,7 +133,8 @@ object Fb2Parser {
             }
 
             if (chapters.isEmpty()) {
-                bookDao.deleteBook(initialBook.copy(id = bookId))
+                if (targetBookId == null) bookDao.deleteBook(initialBook.copy(id = bookId))
+                File(context.filesDir, "fb2_images/$bookId").deleteRecursively()
                 return@withContext Result.failure(Exception("FB2 文件中未找到有效正文内容"))
             }
 
@@ -132,12 +171,15 @@ object Fb2Parser {
             Log.d(TAG, "[Fb2Parser] Successfully imported '${finalBook.title}' with ${chapters.size} chapters.")
             Result.success(finalBook)
         } catch (t: Throwable) {
+            if (t is kotlinx.coroutines.CancellationException) throw t
             Log.e(TAG, "[Fb2Parser] Error during FB2 import", t)
             Result.failure(Exception(t.localizedMessage ?: "FB2 解析失败"))
         }
     }
 
-    private fun decodeFb2Text(bytes: ByteArray): String {
+    private data class Fb2Image(val path: String, val w: Int, val h: Int)
+
+private fun decodeFb2Text(bytes: ByteArray): String {
         val sample = bytes.copyOf(minOf(bytes.size, 2048))
         val header = String(sample, StandardCharsets.ISO_8859_1)
         val encMatch = Regex(
@@ -187,15 +229,32 @@ object Fb2Parser {
             )
             return
         }
-        content.chunked(MAX_CHAPTER_LENGTH).forEachIndexed { index, part ->
+        // 拆分点优先取换行，避免把 [IMG:...] 内嵌图片占位符从中间截断
+        var start = 0
+        while (start < content.length) {
+            val end = minOf(content.length, start + MAX_CHAPTER_LENGTH)
+            if (end >= content.length) {
+                chapters.add(
+                    Chapter(
+                        bookId = bookId,
+                        chapterOrder = startOrder + chapters.size,
+                        title = title,
+                        content = content.substring(start)
+                    )
+                )
+                break
+            }
+            val nl = content.lastIndexOf('\n', end)
+            val cut = if (nl > start + MAX_CHAPTER_LENGTH / 2) nl + 1 else end
             chapters.add(
                 Chapter(
                     bookId = bookId,
-                    chapterOrder = startOrder + index,
-                    title = if (index == 0) title else "$title (续${index + 1})",
-                    content = part
+                    chapterOrder = startOrder + chapters.size,
+                    title = if (start == 0) title else "$title (续${chapters.size - startOrder + 1})",
+                    content = content.substring(start, cut)
                 )
             )
+            start = cut
         }
     }
 

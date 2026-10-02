@@ -16,7 +16,7 @@ data class ReadingSession(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val bookId: Int?,
     val bookTitle: String,
-    /** 会话开始时间的本地日期 yyyy-MM-dd（跨天会话按开始日归属）。 */
+    /** 会话开始时间的本地日期 yyyy-MM-dd（跨天会话按本地午夜拆分）。 */
     val dateStr: String,
     val startTimeMs: Long,
     val endTimeMs: Long,

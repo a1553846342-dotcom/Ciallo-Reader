@@ -41,11 +41,33 @@ object OrtSessions {
     }
 
     val env: OrtEnvironment by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { OrtEnvironment.getEnvironment() }
-    private val cache = ConcurrentHashMap<String, OrtSession>()
-    private val lock = Any()
+    @PublishedApi
+    internal val cache = ConcurrentHashMap<String, OrtSession>()
+    @PublishedApi
+    internal val lock = Any()
+
+    /** 全局推理在飞计数：closeAll 必须等它归零，否则会关掉正在推理的 session（native abort = 闪退）。 */
+    @PublishedApi
+    internal val globalInFlight = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** 包住每次 ONNX 推理调用。 */
+    inline fun <T> track(session: OrtSession, block: () -> T): T {
+        synchronized(lock) {
+            check(cache.values.any { it === session }) { "翻译会话已释放，请重新开启翻译" }
+            globalInFlight.incrementAndGet()
+        }
+        try {
+            return block()
+        } finally {
+            synchronized(lock) {
+                globalInFlight.decrementAndGet()
+                (lock as java.lang.Object).notifyAll()
+            }
+        }
+    }
 
     fun getOrCreate(modelFile: File, key: String): OrtSession =
-        cache.getOrPut(key) { createSession(modelFile) }
+        synchronized(lock) { cache.getOrPut("${modelFile.canonicalPath}|${modelFile.lastModified()}|$key") { createSession(modelFile) } }
 
     private fun createSession(modelFile: File): OrtSession {
         val options = OrtSession.SessionOptions().apply {
@@ -58,9 +80,28 @@ object OrtSessions {
         return options.use { env.createSession(modelFile.absolutePath, it) }
     }
 
-    /** 释放全部 session（阅读器退出时；下次使用自动重建）。 */
+    /**
+     * 释放全部 session（阅读器退出时；下次使用自动重建）。
+     *
+     * 之前这里与 getOrCreate 不互斥、且关闭守卫只看旧 translator 的在飞计数：快速退出再
+     * 重进阅读器（或重开翻译）时，旧的延迟 closeAll 会把新一次推理正在用的 session 关掉，
+     * ONNX native 直接 abort（"显示正在翻译后闪退"的根因）。现在与 getOrCreate 同锁，
+     * 并等全局在飞推理归零后才关闭；推理卡死 60s 则放弃关闭保会话。
+     */
     fun closeAll() {
         synchronized(lock) {
+            val deadline = System.currentTimeMillis() + 60_000
+            while (globalInFlight.get() > 0 && System.currentTimeMillis() < deadline) {
+                try {
+                    (lock as java.lang.Object).wait(150)
+                } catch (_: InterruptedException) {
+                    return
+                }
+            }
+            if (globalInFlight.get() > 0) {
+                android.util.Log.w("MTPerf", "closeAll: inference still in flight, skip session close")
+                return
+            }
             cache.values.forEach { runCatching { it.close() } }
             cache.clear()
         }
@@ -73,7 +114,8 @@ class PaddleDetector(modelFile: File) {
     private val inputName: String = session.inputInfo.keys.first()
 
     @Synchronized
-    fun detectLines(bitmap: Bitmap): List<RectF> {
+    // track 包住整页推理（含分块）：关闭会话前必须等全部在飞推理结束，否则 native abort
+    fun detectLines(bitmap: Bitmap): List<RectF> = OrtSessions.track(session) {
         if (bitmap.width < MIN_CROP_SIZE || bitmap.height < MIN_CROP_SIZE) return emptyList()
         val srcW = bitmap.width
         val srcH = bitmap.height
@@ -324,7 +366,7 @@ class PaddleRecognizer(modelFile: File, charsetLines: List<String>) {
     data class RecResult(val text: String, val score: Float)
 
     @Synchronized
-    fun recognize(bitmap: Bitmap): RecResult {
+    fun recognize(bitmap: Bitmap): RecResult = OrtSessions.track(session) {
         val imgH = IMG_H
         val imgW = IMG_W
         val h = bitmap.height

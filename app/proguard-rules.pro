@@ -31,6 +31,16 @@
 -keep class com.example.source.js.** { *; }
 -keep class org.chromium.net.** { *; }
 
+# DataStore（神回设置项：排行榜风格 / 提示胶囊 / 陀螺仪视差）
+# 它是神回引入的新依赖。datastore-core 内部通过 okio + 协程做文件读写，
+# 且 DataStore 单例 / Serializer 走的是成套的类引用；R8 若裁掉其中任一类，
+# 首次访问 DataStore 时会 NoClassDefFoundError（表现为冷启动即崩）。
+# 这几个包体积极小，整包 keep 对 APK 体积基本无影响。
+-keep class androidx.datastore.** { *; }
+-keep class okio.** { *; }
+-dontwarn androidx.datastore.**
+-dontwarn okio.**
+
 # onnxruntime：native 层通过 JNI 按名/签名回调构造 Java 对象
 # （NodeInfo/ValueInfo 等），混淆改名后 NoSuchMethodError 直接 SIGABRT。
 # Java API 体积很小（大头是 27MB 的 .so），整包 keep 无瘦身代价。

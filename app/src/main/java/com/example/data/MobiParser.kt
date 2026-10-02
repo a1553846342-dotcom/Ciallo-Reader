@@ -39,11 +39,12 @@ object MobiParser {
         context: Context,
         uri: Uri,
         fileName: String,
-        bookDao: BookDao
+        bookDao: BookDao,
+        targetBookId: Int? = null
     ): Result<Book> = withContext(Dispatchers.IO) {
         try {
             Log.d(TAG, "[MobiParser] Starting MOBI import for $fileName, uri: $uri")
-            val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+            val bytes = context.contentResolver.openInputStream(uri)?.use { it.readImportBytes() }
                 ?: return@withContext Result.failure(Exception("无法读取 MOBI 文件"))
 
             val parsed = parseMobi(bytes)
@@ -62,8 +63,9 @@ object MobiParser {
                 contentType = "NOVEL",
                 totalChapters = 0
             )
-            val bookId = bookDao.insertBook(initialBook).toInt()
-            Log.d(TAG, "[MobiParser] Inserted initial book record with ID: $bookId")
+            // targetBookId 非空 = 老书补图片迁移：不新建书、失败不删书（调用方事务收尾）
+            val bookId = targetBookId ?: bookDao.insertBook(initialBook).toInt()
+            Log.d(TAG, "[MobiParser] Using book record ID: $bookId")
 
             // DRM 保护：占位入库，章节标题给出明确提示，不尝试解析
             if (parsed.encryptionType != 0) {
@@ -84,9 +86,11 @@ object MobiParser {
             }
 
             val html = parsed.html ?: ""
-            val chapters = splitHtmlIntoChapters(html, bookId)
+            // 内嵌图片：<img recindex="N"> → 落盘图片占位符
+            val htmlWithImages = embedMobiImages(html, parsed.records, parsed.firstImageIndex, bookId, context)
+            val chapters = splitHtmlIntoChapters(htmlWithImages, bookId)
             if (chapters.isEmpty()) {
-                bookDao.deleteBook(initialBook.copy(id = bookId))
+                if (targetBookId == null) bookDao.deleteBook(initialBook.copy(id = bookId))
                 return@withContext Result.failure(Exception("MOBI 文件中未找到有效正文内容"))
             }
 
@@ -117,6 +121,7 @@ object MobiParser {
             Log.d(TAG, "[MobiParser] Successfully imported '${finalBook.title}' with ${chapters.size} chapters.")
             Result.success(finalBook)
         } catch (t: Throwable) {
+            if (t is kotlinx.coroutines.CancellationException) throw t
             Log.e(TAG, "[MobiParser] Error during MOBI import", t)
             Result.failure(Exception(t.localizedMessage ?: "MOBI 解析失败"))
         }
@@ -153,7 +158,9 @@ object MobiParser {
         val encryptionType: Int,
         val html: String?,
         val coverBytes: ByteArray?,
-        val failureReason: String?
+        val failureReason: String?,
+        val records: List<ByteArray> = emptyList(),
+        val firstImageIndex: Int = 0
     )
 
     internal fun parseMobi(bytes: ByteArray): ParsedMobi? {
@@ -220,6 +227,7 @@ object MobiParser {
         val decompressed: ByteArray = try {
             decompressText(records, active, startRecord)
         } catch (t: Throwable) {
+            if (t is kotlinx.coroutines.CancellationException) throw t
             Log.e(TAG, "[MobiParser] Text decompression failed", t)
             return ParsedMobi(
                 title,
@@ -233,7 +241,7 @@ object MobiParser {
 
         val html = decodeMobiText(decompressed, active.textEncoding)
         val cover = extractCover(records, active, startRecord)
-        return ParsedMobi(title, author, 0, html, cover, null)
+        return ParsedMobi(title, author, 0, html, cover, null, records, active.firstImageIndex)
     }
 
     private fun parseMobiHeader(record: ByteArray, recordIndex: Int): MobiHeader? {
@@ -351,6 +359,7 @@ object MobiParser {
                 val out = ByteArrayOutputStream()
                 for (i in startRecord..endRecord) {
                     out.write(trimTrailing(records[i], header))
+                    require(out.size() <= 64 * 1024 * 1024) { "MOBI正文过大" }
                 }
                 out.toByteArray()
             }
@@ -369,6 +378,7 @@ object MobiParser {
                     var rec = trimTrailing(records[i], header)
                     if (useSkip2 && rec.size > 2) rec = rec.copyOfRange(2, rec.size)
                     out.write(decodePalmDoc(rec))
+                    require(out.size() <= 64 * 1024 * 1024) { "MOBI正文过大" }
                 }
                 out.toByteArray()
             }
@@ -378,6 +388,7 @@ object MobiParser {
                 val out = ByteArrayOutputStream()
                 for (i in startRecord..endRecord) {
                     out.write(huff.unpack(trimTrailing(records[i], header)))
+                    require(out.size() <= 64 * 1024 * 1024) { "MOBI正文过大" }
                 }
                 out.toByteArray()
             }
@@ -484,6 +495,8 @@ object MobiParser {
         private val mincode = ArrayList<Long>()
         private val maxcode = ArrayList<Long>()
         private val dictionary = ArrayList<Slice>()
+        private val expanding = HashSet<Int>()
+        private var cachedBytes = 0L
 
         init {
             initialize()
@@ -558,7 +571,7 @@ object MobiParser {
             }
             val phrases = readU32(data, 8).toInt()
             val bits = readU32(data, 12).toInt()
-            if (bits < 0 || bits > 31) throw IllegalStateException("无效的 CDIC bits: $bits")
+            if (bits < 0 || bits > 16) throw IllegalStateException("无效的 CDIC bits: $bits")
             val n = minOf(1 shl bits, phrases - dictionary.size)
             for (i in 0 until n) {
                 val offset = readU16(data, 16 + i * 2)
@@ -577,7 +590,8 @@ object MobiParser {
             return Slice(sliceData, if (blen and 0x8000 != 0) 1 else 0)
         }
 
-        fun unpack(input: ByteArray): ByteArray {
+        fun unpack(input: ByteArray, depth: Int = 0): ByteArray {
+            require(depth <= 64) { "HUFF短语递归过深" }
             var out = ByteArray(4096)
             var op = 0
             var bitsleft = input.size * 8
@@ -608,10 +622,14 @@ object MobiParser {
                 if (r !in dictionary.indices) break
                 var slice = dictionary[r]
                 if (slice.flag == 0) {
-                    val newData = unpack(slice.data)
+                    require(expanding.add(r)) { "HUFF短语循环引用" }
+                    val newData = try { unpack(slice.data, depth + 1) } finally { expanding.remove(r) }
+                    cachedBytes += newData.size
+                    require(cachedBytes <= 32L * 1024 * 1024) { "HUFF字典膨胀过大" }
                     slice = Slice(newData, 1)
                     dictionary[r] = slice
                 }
+                require(op.toLong() + slice.data.size <= 8L * 1024 * 1024) { "HUFF记录膨胀过大" }
                 if (op + slice.data.size > out.size) {
                     out = out.copyOf(maxOf(out.size * 2, op + slice.data.size))
                 }
@@ -767,6 +785,48 @@ object MobiParser {
         """(?is)<(h[1-6])([^>]*)>(.*?)</\1>"""
     )
 
+    /**
+     * 把正文 HTML 里的 <img recindex="N"> 替换为落盘图片占位符 [IMG:路径|宽|高]。
+     * 图片记录定位：records[firstImageIndex + N]（带多个候选回退，与封面提取同源）。
+     */
+    private fun embedMobiImages(
+        html: String,
+        records: List<ByteArray>,
+        firstImageIndex: Int,
+        bookId: Int,
+        context: Context
+    ): String {
+        if (!html.contains("recindex", ignoreCase = true)) return html
+        val imageDir = File(context.filesDir, "mobi_images/$bookId")
+        if (!imageDir.exists()) imageDir.mkdirs()
+
+        val imgRegex = Regex("""<img[^>]*recindex="?(\d+)"?[^>]*>""", setOf(RegexOption.IGNORE_CASE))
+        var seq = 0
+        return imgRegex.replace(html) { m ->
+            val rec = m.groupValues[1].toIntOrNull() ?: return@replace m.value
+            val candidates = listOf(
+                firstImageIndex + rec,
+                firstImageIndex + rec - 1,
+                startRecordFallback(rec, records.size),
+                rec
+            ).filter { it in records.indices }.distinct()
+            val bytes = candidates.mapNotNull { idx ->
+                records.getOrNull(idx)?.takeIf { looksLikeImage(it) }
+            }.firstOrNull() ?: return@replace m.value
+            val normalized = normalizeImage(bytes) ?: return@replace m.value
+
+            seq++
+            val ext = detectImageExt(normalized) ?: "jpg"
+            val f = File(imageDir, "img_${rec}.$ext")
+            f.writeBytes(normalized)
+            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(f.absolutePath, opts)
+            "[IMG:${f.absolutePath}|${opts.outWidth.coerceAtLeast(1)}|${opts.outHeight.coerceAtLeast(1)}]"
+        }
+    }
+
+    private fun startRecordFallback(rec: Int, size: Int): Int = -1
+
     internal fun splitHtmlIntoChapters(html: String, bookId: Int): List<Chapter> {
         if (html.isBlank()) return emptyList()
 
@@ -856,7 +916,7 @@ object MobiParser {
             )
             return
         }
-        val parts = content.chunked(MAX_CHAPTER_LENGTH)
+        val parts = content.let { splitChapterText(it) }
         parts.forEachIndexed { index, part ->
             chapters.add(
                 Chapter(

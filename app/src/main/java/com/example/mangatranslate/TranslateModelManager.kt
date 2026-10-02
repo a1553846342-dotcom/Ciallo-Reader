@@ -1,6 +1,9 @@
 package com.example.mangatranslate
 
 import android.content.Context
+import com.example.source.executeCancellable
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -27,25 +30,28 @@ object TranslateModelManager {
         val urls: List<String>,
         val minBytes: Long,
         val label: String,
+        val sha256: String? = null,
     )
 
     val detModel = ModelSpec(
         fileName = "ppocr_det.onnx",
         urls = listOf(
-            "https://hf-mirror.com/PaddlePaddle/PP-OCRv6_small_det_onnx/resolve/main/inference.onnx",
-            "https://huggingface.co/PaddlePaddle/PP-OCRv6_small_det_onnx/resolve/main/inference.onnx",
+            "https://hf-mirror.com/PaddlePaddle/PP-OCRv6_small_det_onnx/resolve/28fe5895c24fd108c19eb3e8479f4ab385fbfc62/inference.onnx",
+            "https://huggingface.co/PaddlePaddle/PP-OCRv6_small_det_onnx/resolve/28fe5895c24fd108c19eb3e8479f4ab385fbfc62/inference.onnx",
         ),
         minBytes = 9_000_000L,
         label = "文字检测模型",
+        sha256 = "d73e0058b7a8086bbd57f3d10b8bcd4ff95363f67e06e2762b5e814fe9c9410e",
     )
     val recModel = ModelSpec(
         fileName = "ppocr_rec.onnx",
         urls = listOf(
-            "https://hf-mirror.com/PaddlePaddle/PP-OCRv6_small_rec_onnx/resolve/main/inference.onnx",
-            "https://huggingface.co/PaddlePaddle/PP-OCRv6_small_rec_onnx/resolve/main/inference.onnx",
+            "https://hf-mirror.com/PaddlePaddle/PP-OCRv6_small_rec_onnx/resolve/b8f84f0b80c529de40b4fbb3544b84fa7233a513/inference.onnx",
+            "https://huggingface.co/PaddlePaddle/PP-OCRv6_small_rec_onnx/resolve/b8f84f0b80c529de40b4fbb3544b84fa7233a513/inference.onnx",
         ),
         minBytes = 19_000_000L,
         label = "文字识别模型",
+        sha256 = "5435fd747c9e0efe15a96d0b378d5bd157e9492ed8fd80edf08f30d02fa24634",
     )
 
     /**
@@ -76,6 +82,7 @@ object TranslateModelManager {
         ),
         minBytes = 4_000_000L,
         label = "气泡分割模型",
+        sha256 = "a01ad9477fac2b8815c2308c827c0a60a898f457a6692717201123911ba819c0",
     )
 
     sealed interface DownloadState {
@@ -88,9 +95,12 @@ object TranslateModelManager {
     private val _state = MutableStateFlow<DownloadState>(DownloadState.NotDownloaded)
     val state: StateFlow<DownloadState> = _state
     private val mutex = Mutex()
+    private val verified = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+    private val verificationScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + Dispatchers.IO)
+    private val checking = java.util.concurrent.atomic.AtomicBoolean(false)
 
     private val client by lazy {
-        OkHttpClient.Builder()
+        com.example.source.SharedHttpTransport.builder()
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .build()
@@ -103,13 +113,46 @@ object TranslateModelManager {
     fun recFile(context: Context): File = File(modelDir(context), recModel.fileName)
     fun bubbleFile(context: Context): File = File(modelDir(context), bubbleModel.fileName)
 
-    fun isReady(context: Context): Boolean =
-        detFile(context).isFileAndBig(detModel.minBytes) &&
-            recFile(context).isReadySize(recModel.minBytes) &&
-            bubbleFile(context).isFileAndBig(bubbleModel.minBytes)
-
+    fun isReady(context: Context): Boolean {
+        val specs = listOf(detModel, recModel, bubbleModel)
+        val files = specs.map { File(modelDir(context), it.fileName) }
+        if (files.zip(specs).any { (file, spec) -> !file.isFileAndBig(spec.minBytes) }) return false
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            val ready = files.zip(specs).all { (file, spec) -> verified[file.signature(spec)] == true }
+            if (!ready && checking.compareAndSet(false, true)) {
+                val app = context.applicationContext
+                verificationScope.launchVerification(app)
+            }
+            return ready
+        }
+        return files.zip(specs).all { (file, spec) -> file.isVerified(spec) }
+    }
+    private fun kotlinx.coroutines.CoroutineScope.launchVerification(context: Context) = launch {
+        try {
+            mutex.withLock {
+                _state.value = if (isReady(context)) DownloadState.Ready else DownloadState.NotDownloaded
+            }
+        } finally { checking.set(false) }
+    }
     private fun File.isFileAndBig(min: Long): Boolean = isFile && length() >= min
-    private fun File.isReadySize(min: Long): Boolean = isFileAndBig(min)
+    private fun File.signature(spec: ModelSpec) = "$absolutePath:${length()}:${lastModified()}:${spec.sha256}"
+    private fun File.isVerified(spec: ModelSpec): Boolean {
+        if (!isFileAndBig(spec.minBytes)) return false
+        val key = signature(spec)
+        verified[key]?.let { return it }
+        val valid = spec.sha256 == null || runCatching { sha256(this) == spec.sha256 }.getOrDefault(false)
+        if (verified.size > 32) verified.clear()
+        verified[key] = valid
+        return valid
+    }
+    private fun sha256(file: File): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(64 * 1024)
+            while (true) { val read = input.read(buffer); if (read < 0) break; digest.update(buffer, 0, read) }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
 
     fun totalBytes(context: Context): Long =
         (detFile(context).takeIf { it.isFile }?.length() ?: 0L) +
@@ -134,7 +177,7 @@ object TranslateModelManager {
             var doneBytes = 0L
             for (spec in listOf(detModel, recModel, bubbleModel)) {
                 val target = File(modelDir(appContext), spec.fileName)
-                if (target.isFileAndBig(spec.minBytes)) {
+                if (target.isVerified(spec)) {
                     doneBytes += target.length()
                     continue
                 }
@@ -166,16 +209,13 @@ object TranslateModelManager {
                 lastError = attempt
                 continue
             }
-            if (tmp.length() < spec.minBytes) {
+            if (!tmp.isVerified(spec)) {
                 lastError = "${spec.label}下载不完整（${"%.1f".format(tmp.length() / 1e6)}MB < ${spec.minBytes / 1_000_000}MB）"
                 runCatching { tmp.delete() }
                 continue
             }
             if (target.exists()) target.delete()
-            if (!tmp.renameTo(target)) {
-                tmp.copyTo(target, overwrite = true)
-                runCatching { tmp.delete() }
-            }
+            if (!tmp.renameTo(target)) return@withContext "模型文件保存失败，请重试"
             onProgress(1f)
             return@withContext null
         }
@@ -183,7 +223,7 @@ object TranslateModelManager {
     }
 
     /** 单源尝试：返回 null = 下载成功；否则失败原因（tmp 已清理）。 */
-    private fun attemptDownload(
+    private suspend fun attemptDownload(
         url: String,
         spec: ModelSpec,
         tmp: File,
@@ -195,7 +235,7 @@ object TranslateModelManager {
                 .url(validateUrl(url))
                 .header("User-Agent", "Mozilla/5.0 (Linux; Android) CialloReader/1.0")
                 .build()
-            client.newCall(request).execute().use { response ->
+            client.newCall(request).executeCancellable().use { response ->
                 if (!response.isSuccessful) return "HTTP ${response.code}（${url.substringAfter("//").take(28)}…）"
                 val body = response.body ?: return "空响应体"
                 tmp.outputStream().use { out ->
@@ -204,7 +244,10 @@ object TranslateModelManager {
                         var read: Int
                         var written = 0L
                         val declared = body.contentLength()
+                        require(declared <= 128L * 1024 * 1024) { "模型文件过大" }
                         while (ins.read(buf).also { read = it } != -1) {
+                            kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                            require(written + read <= 128L * 1024 * 1024) { "模型文件过大" }
                             out.write(buf, 0, read)
                             written += read
                             val frac = if (declared > 0) written.toFloat() / declared
@@ -212,6 +255,7 @@ object TranslateModelManager {
                             onProgress(frac)
                             _state.value = DownloadState.Downloading(spec.label, frac)
                         }
+                        require(declared <= 0 || written == declared) { "模型下载不完整" }
                         out.flush()
                     }
                 }
@@ -219,6 +263,7 @@ object TranslateModelManager {
             }
         } catch (e: Exception) {
             runCatching { tmp.delete() }
+            if (e is kotlinx.coroutines.CancellationException) throw e
             return e.message ?: e.javaClass.simpleName
         }
     }
@@ -244,8 +289,14 @@ object TranslateModelManager {
         return raw
     }
 
-    fun deleteModels(context: Context) {
-        modelDir(context).listFiles()?.forEach { runCatching { it.delete() } }
-        _state.value = DownloadState.NotDownloaded
+    fun deleteModels(context: Context): Boolean {
+        if (!mutex.tryLock()) return false
+        try {
+            if (OrtSessions.globalInFlight.get() > 0) return false
+            val deleted = modelDir(context).listFiles().orEmpty().map { !it.exists() || it.delete() }.all { it }
+            verified.clear()
+            if (deleted || !isReady(context)) _state.value = DownloadState.NotDownloaded
+            return deleted
+        } finally { mutex.unlock() }
     }
 }

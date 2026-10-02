@@ -1,5 +1,6 @@
 package com.example.source.importer
 
+import com.example.data.readImportBytes
 import android.content.Context
 import android.net.Uri
 import com.example.source.*
@@ -49,7 +50,7 @@ object SourceImporter {
         val skippedCount: Int get() = skipped.size
     }
 
-    private val urlClient = OkHttpClient.Builder()
+    private val urlClient = com.example.source.SharedHttpTransport.builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(20, TimeUnit.SECONDS)
         .followRedirects(true)
@@ -76,7 +77,7 @@ object SourceImporter {
                     ?: return@withContext SourceResult.Error(SourceException.ParseError("无法打开选择的文件"))
 
                 val jsonStr = inputStream.use { stream ->
-                    BufferedReader(InputStreamReader(stream)).readText()
+                    stream.readImportBytes(2*1024*1024).toString(Charsets.UTF_8)
                 }
 
                 val batch = parseBatch(jsonStr)
@@ -88,6 +89,7 @@ object SourceImporter {
                     )
                 }
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 SourceResult.Error(SourceException.ParseError("读取文件失败: ${e.message}"))
             }
         }
@@ -98,10 +100,11 @@ object SourceImporter {
                 val inputStream = context.contentResolver.openInputStream(uri)
                     ?: return@withContext BatchImportResult(emptyList(), listOf("文件" to "无法打开选择的文件"))
                 val jsonStr = inputStream.use { stream ->
-                    BufferedReader(InputStreamReader(stream)).readText()
+                    stream.readImportBytes(2*1024*1024).toString(Charsets.UTF_8)
                 }
                 parseBatch(jsonStr)
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 BatchImportResult(emptyList(), listOf("文件" to "读取失败: ${e.message}"))
             }
         }
@@ -116,19 +119,21 @@ object SourceImporter {
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
                 )
                 .build()
-            val response = urlClient.newCall(request).execute()
+            urlClient.newCall(request).executeCancellable().use { response ->
             if (!response.isSuccessful) {
                 return@withContext BatchImportResult(
                     emptyList(),
                     listOf(url to "网络请求失败 HTTP ${response.code}")
                 )
             }
-            val body = response.body?.string() ?: ""
+            val body = response.body?.byteStream()?.use { it.readImportBytes(2 * 1024 * 1024).toString(Charsets.UTF_8) } ?: ""
             if (body.isBlank()) {
                 return@withContext BatchImportResult(emptyList(), listOf(url to "返回内容为空"))
             }
             parseBatch(body)
+            }
         } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
             BatchImportResult(emptyList(), listOf(url to "网络导入失败: ${e.message}"))
         }
     }
@@ -146,8 +151,10 @@ object SourceImporter {
         val skipped = mutableListOf<Pair<String, String>>()
 
         try {
+            com.example.source.parser.RuleBudget.json(jsonStr)
             if (trimmed.startsWith("[")) {
                 val array = JSONArray(trimmed)
+                require(array.length()<=1000) { "一次最多导入 1000 个书源" }
                 for (i in 0 until array.length()) {
                     val obj = array.optJSONObject(i) ?: continue
                     convertOne(obj)?.let { converted ->
@@ -171,6 +178,7 @@ object SourceImporter {
         } catch (e: JSONException) {
             return BatchImportResult(emptyList(), listOf("输入" to "JSON 语法错误: ${e.message}"))
         } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
             return BatchImportResult(emptyList(), listOf("输入" to "解析失败: ${e.message}"))
         }
         return BatchImportResult(imported, skipped)
@@ -334,6 +342,7 @@ object SourceImporter {
         } catch (e: JSONException) {
             return SourceResult.Error(SourceException.ParseError("JSON解析语法错误: ${e.message}"))
         } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
             return SourceResult.Error(SourceException.ParseError("解析书源失败: ${e.message}"))
         }
     }
@@ -453,6 +462,7 @@ object SourceImporter {
         return try {
             JSONObject(str)
         } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
             null
         }
     }
@@ -469,6 +479,7 @@ object SourceImporter {
                 val opt = try {
                     JSONObject(candidate)
                 } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                     null
                 }
                 if (opt != null) {
@@ -535,6 +546,7 @@ object SourceImporter {
         val result = try {
             SimpleArithmetic(tokens).evaluate()
         } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
             null
         } ?: return null
         return result.toString()
@@ -545,6 +557,7 @@ object SourceImporter {
         private var pos = 0
 
         fun evaluate(): Long? {
+            if(expr.length>256 || expr.count { it=='(' }>32) return null
             val value = expression() ?: return null
             return if (pos == expr.length) value else null
         }
@@ -564,7 +577,8 @@ object SourceImporter {
             if (peek() == '(') {
                 pos++
                 val v = expression() ?: return null
-                if (peek() == ')') pos++
+                if (peek() != ')') return null
+                pos++
                 return v
             }
             return number()
@@ -576,7 +590,7 @@ object SourceImporter {
                 when (peek()) {
                     '*' -> {
                         pos++
-                        value *= factor() ?: return null
+                        value = Math.multiplyExact(value, factor() ?: return null)
                     }
                     '/' -> {
                         pos++
@@ -595,11 +609,11 @@ object SourceImporter {
                 when (peek()) {
                     '+' -> {
                         pos++
-                        value += term() ?: return null
+                        value = Math.addExact(value, term() ?: return null)
                     }
                     '-' -> {
                         pos++
-                        value -= term() ?: return null
+                        value = Math.subtractExact(value, term() ?: return null)
                     }
                     else -> return value
                 }
@@ -612,6 +626,7 @@ object SourceImporter {
         return try {
             parseHeaders(JSONObject(headerJson))
         } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
             emptyMap()
         }
     }

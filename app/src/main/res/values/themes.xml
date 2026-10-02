@@ -25,4 +25,27 @@
         <item name="android:navigationBarColor">@android:color/transparent</item>
         <item name="android:forceDarkAllowed">false</item>
     </style>
+
+    <!--
+      P2-1：系统级冷启动闪屏（androidx.core:core-splashscreen）。
+      此前冷启动这段时间里窗口是裸主题背景：进程起来 → Application/DB/引擎初始化 →
+      Compose 首帧，中间那一两百毫秒到几百毫秒用户看到的是「白屏/黑屏一下」，
+      在低端机上就是「点了图标没反应」的观感。系统启动窗口由 SurfaceFlinger 直接绘制，
+      不依赖进程，点图标的第一帧就有内容。
+      背景色取 Compose 侧开屏页的同一支底色（0xFF0F141C），交接处不会出现色差闪烁。
+      Android 12+ 由系统自己的 SplashScreen 实现接管，12 以下由该库回填，行为一致。
+    -->
+    <color name="splash_background">#FF0F141C</color>
+
+    <style name="Theme.MyApplication.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/splash_background</item>
+        <!-- 用户反馈：开屏壁纸前的吉祥物图标卡片不好看，改为透明占位（不可省略，省略会回退启动图标） -->
+        <item name="windowSplashScreenAnimatedIcon">@drawable/splash_icon_transparent</item>
+        <item name="windowSplashScreenIconBackgroundColor">@color/splash_background</item>
+        <!-- 交还给正常主题：Activity 的 setContent 在其之上运行 -->
+        <item name="postSplashScreenTheme">@style/Theme.MyApplication</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:forceDarkAllowed">false</item>
+    </style>
 </resources>

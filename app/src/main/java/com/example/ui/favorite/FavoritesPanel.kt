@@ -300,9 +300,15 @@ fun FavoriteCard(
     )
     val latestNum = ComicReadingLogic.chapterNumber(fav.latestChapterTitle.orEmpty())
     val readNum = (item.progress?.lastChapterIndex ?: -1).let { if (it >= 0) it + 1 else 0 }
+    // 「有更新」= 快照 id 与已见快照不同。⚠️ 要再加一道话数兜底：
+    // 有的源每次拉取 chapterId 都不同（URL 带时间戳/hash），裸 id 比较会让
+    // 已经读到最新话数的漫画永远亮着「更新」角标。标题能解析出话数、且用户
+    // 已读到该话数（latestNum ≤ readNum）→ 不算更新；解析不到话数退回 id 比较
+    //（缺章源里 order 序号 ≤ 话数，readNum 偏小只会少兜底、不会误压制真更新）。
     val hasUpdate = fav.latestChapterId != null &&
         item.progress?.seenTopChapterId != null &&
-        fav.latestChapterId != item.progress.seenTopChapterId
+        fav.latestChapterId != item.progress.seenTopChapterId &&
+        !(latestNum != null && readNum > 0 && latestNum <= readNum)
     val unread = if (latestNum != null && readNum > 0) (latestNum - readNum).coerceAtLeast(0) else 0
     val dead = !fav.sourceAlive
 

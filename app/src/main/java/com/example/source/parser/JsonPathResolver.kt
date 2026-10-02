@@ -82,6 +82,7 @@ object JsonPathResolver {
     }
 
     private fun parseRoot(jsonStr: String): Any? {
+        RuleBudget.json(jsonStr)
         val trimmed = jsonStr.trim()
         return when {
             trimmed.startsWith("[") -> try { JSONArray(trimmed) } catch (e: Exception) { null }
@@ -91,6 +92,7 @@ object JsonPathResolver {
     }
 
     private fun parseSegments(path: String): List<String> {
+        RuleBudget.validate(path)
         var p = path.trim()
         if (p.isBlank() || p == "$") return emptyList()
         if (p.startsWith("@json:")) p = p.removePrefix("@json:").trim()
@@ -118,6 +120,7 @@ object JsonPathResolver {
         var current = inputs
         for (segment in segments) {
             current = resolveSegmentAll(current, segment)
+            require(current.size<=10_000) { "JSONPath 结果过多" }
             if (current.isEmpty()) return emptyList()
         }
         return current
@@ -128,28 +131,19 @@ object JsonPathResolver {
 
         // 递归下降：返回所有嵌套值（对象、数组、标量）
         if (segment == "**") {
-            fun collect(value: Any) {
-                when (value) {
-                    is JSONObject -> {
-                        out.add(value)
-                        val keys = value.keys()
-                        while (keys.hasNext()) {
-                            val key = keys.next()
-                            val v = value.opt(key)
-                            if (v != null && v != JSONObject.NULL) collect(v)
-                        }
-                    }
-                    is JSONArray -> {
-                        out.add(value)
-                        for (i in 0 until value.length()) {
-                            val v = value.opt(i)
-                            if (v != null && v != JSONObject.NULL) collect(v)
-                        }
-                    }
-                    else -> out.add(value)
+            val pending=java.util.ArrayDeque<Pair<Any,Int>>()
+            inputs.forEach { pending.addLast(it to 0) }
+            while(pending.isNotEmpty()) {
+                require(out.size<10_000) { "JSONPath 遍历节点过多" }
+                val (value,depth)=pending.removeFirst()
+                require(depth<=64) { "JSONPath 嵌套过深" }
+                out.add(value)
+                when(value) {
+                    is JSONObject -> value.keys().forEach { key -> value.opt(key)?.takeIf { it!=JSONObject.NULL }?.let { pending.addLast(it to depth+1) } }
+                    is JSONArray -> for(i in 0 until value.length()) value.opt(i)?.takeIf { it!=JSONObject.NULL }?.let { pending.addLast(it to depth+1) }
                 }
+                require(pending.size<=10_000) { "JSONPath 遍历节点过多" }
             }
-            for (item in inputs) collect(item)
             return out
         }
 

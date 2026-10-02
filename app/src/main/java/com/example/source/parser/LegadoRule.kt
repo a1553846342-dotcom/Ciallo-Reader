@@ -43,6 +43,7 @@ object LegadoRule {
 
     /** 按列表规则选取元素。支持 - 倒序、|| 回退、&& 合并。 */
     fun selectElements(root: Element, rawRule: String): List<Element> {
+        RuleBudget.validate(rawRule)
         var rule = rawRule.trim()
         if (rule.isBlank()) return emptyList()
         var reverse = false
@@ -62,6 +63,7 @@ object LegadoRule {
 
     /** 求值规则，返回全部匹配值（用于 && 合并 / 列表值）。 */
     fun evalValues(root: Element, rawRule: String): List<String> {
+        RuleBudget.validate(rawRule)
         var rule = rawRule.trim()
         if (rule.isBlank()) return emptyList()
         if (isJsonRule(rule)) return emptyList()
@@ -301,9 +303,9 @@ object LegadoRule {
     private fun applyRegexReplacement(value: String, info: RegexReplacement?): String {
         if (info == null) return value
         return try {
-            value.replace(Regex(info.regex), info.replacement)
-        } catch (e: Exception) {
-            value
+            Regex(info.regex).replace(RuleBudget.text(value), info.replacement)
+        } catch (e: StackOverflowError) {
+            throw IllegalArgumentException("书源正则回溯过深", e)
         }
     }
 

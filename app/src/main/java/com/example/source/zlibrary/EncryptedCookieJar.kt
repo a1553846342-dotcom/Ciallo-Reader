@@ -12,6 +12,7 @@ class EncryptedCookieJar(private val credentialStorage: ZLibraryCredentialStorag
         loadFromStorage()
     }
 
+    @Synchronized
     private fun loadFromStorage() {
         val rawCookies = credentialStorage.getCookies() ?: return
         val domain = credentialStorage.getDomain()
@@ -27,24 +28,25 @@ class EncryptedCookieJar(private val credentialStorage: ZLibraryCredentialStorag
                         .value(value)
                         .domain(domain)
                         .build()
-                    cookieMap[name] = cookie
+                    cookieMap["${cookie.domain}|${cookie.path}|${cookie.name}"] = cookie
                 }
             }
         }
     }
 
+    @Synchronized
     override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
         if (cookies.isEmpty()) return
         var userId: String? = null
         var userKey: String? = null
 
         cookies.forEach { cookie ->
-            cookieMap[cookie.name] = cookie
+            cookieMap["${cookie.domain}|${cookie.path}|${cookie.name}"] = cookie
             if (cookie.name == "remix_userid") userId = cookie.value
             if (cookie.name == "remix_userkey") userKey = cookie.value
         }
 
-        val cookieString = cookieMap.values.joinToString("; ") { "${it.name}=${it.value}" }
+        val cookieString = cookieMap.values.filter { it.matches(url) && it.expiresAt >= System.currentTimeMillis() }.joinToString("; ") { "${it.name}=${it.value}" }
         credentialStorage.saveCredentials(
             userId = userId ?: credentialStorage.getUserId(),
             userKey = userKey ?: credentialStorage.getUserKey(),
@@ -53,6 +55,7 @@ class EncryptedCookieJar(private val credentialStorage: ZLibraryCredentialStorag
         )
     }
 
+    @Synchronized
     override fun loadForRequest(url: HttpUrl): List<Cookie> {
         val storageDomain = credentialStorage.getDomain()
         // 空串 = 尚未恢复用户选择（仅启动空窗/单测），退回账号保存时的域名
@@ -65,9 +68,7 @@ class EncryptedCookieJar(private val credentialStorage: ZLibraryCredentialStorag
         // 不再用“账号保存时的域名”一刀切拦截（否则切换节点后 c_token 等
         // 验证 Cookie 永远带不回去，导致 DiamWall 重试永远 503）。
         val list = cookieMap.values.filter { cookie ->
-            val cd = cookie.domain
-            requestHost.equals(cd, ignoreCase = true) ||
-                requestHost.endsWith(".$cd", ignoreCase = true)
+            cookie.expiresAt >= System.currentTimeMillis() && cookie.matches(url)
         }.toMutableList()
 
         val remixUserKey = credentialStorage.getUserKey()
@@ -89,8 +90,9 @@ class EncryptedCookieJar(private val credentialStorage: ZLibraryCredentialStorag
         return list
     }
 
+    @Synchronized
     fun syncFromRawCookieString(rawCookieString: String, domain: String) {
-        cookieMap.clear()
+        cookieMap.entries.removeAll { it.value.expiresAt < System.currentTimeMillis() }
         var userId: String? = null
         var userKey: String? = null
 
@@ -105,7 +107,7 @@ class EncryptedCookieJar(private val credentialStorage: ZLibraryCredentialStorag
                         .value(value)
                         .domain(domain)
                         .build()
-                    cookieMap[name] = cookie
+                    cookieMap["${cookie.domain}|${cookie.path}|${cookie.name}"] = cookie
                     if (name == "remix_userid") userId = value
                     if (name == "remix_userkey") userKey = value
                 }

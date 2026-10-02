@@ -41,6 +41,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AutoStories
+import androidx.compose.material.icons.filled.StarOutline
 import androidx.compose.material.icons.filled.ChevronLeft
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.MoreHoriz
@@ -72,6 +73,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.ui.theme.MintPrimary
+import com.example.god.GodGold
 import com.kashif_e.backdrop.Backdrop
 import com.kashif_e.backdrop.backdrops.LayerBackdrop
 import com.kashif_e.backdrop.drawPlainBackdrop
@@ -147,6 +149,7 @@ fun ComicReaderChrome(
     onJumpToChapter: ((Int) -> Unit)?,
     onPrevChapter: (() -> Unit)?,
     onNextChapter: (() -> Unit)?,
+    onGodMoment: (() -> Unit)? = null,
     chapterNavLabel: String,
     pages: List<ComicPageRef>,
     loader: ComicPageLoader,
@@ -175,6 +178,7 @@ fun ComicReaderChrome(
             store = store,
             onApplyPresetConfig = { onConfigChange(it) },
             onExit = onExit,
+            onGodMoment = onGodMoment,
             onOpenPanel = { onPanelChange(it) },
             // 新反馈条目6：三点菜单"旋转本页 90°"入口已移除（按用户要求）；
             // 旋转能力本体保留在设置面板·图像 Tab（"整本旋转/旋转本页 +90°"），
@@ -216,13 +220,15 @@ fun ComicReaderChrome(
             // 气泡水平位置跟随进度滑块拇指（±130dp 内偏移，避免贴边裁切）
             val fraction = (thumbPreviewRaw.toFloat() / (pages.size - 1).coerceAtLeast(1))
                 .coerceIn(0f, 1f)
+            val visualFraction = if (config.direction == ComicDirection.RTL &&
+                config.mode != ComicMode.WEBTOON && config.mode != ComicMode.CONTINUOUS) 1f - fraction else fraction
             ComicThumbPreview(
                 page = pages[thumbPreviewRaw],
                 rawShown = thumbPreviewRaw,
                 loader = loader,
                 modifier = Modifier
                     .padding(bottom = 316.dp)
-                    .offset(x = ((fraction - 0.5f) * 260f).dp),
+                    .offset(x = ((visualFraction - 0.5f) * 260f).dp),
             )
         }
     }
@@ -303,6 +309,7 @@ private fun ComicTopBar(
     onExit: () -> Unit,
     onOpenPanel: (ComicPanel) -> Unit,
     onToggleMerge: () -> Unit,
+    onGodMoment: (() -> Unit)?,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     // 收藏预设快捷应用（第 27 条）：长按"阅读设置"按钮直接弹出收藏列表一键应用
@@ -318,7 +325,7 @@ private fun ComicTopBar(
             .padding(horizontal = 6.dp, vertical = 8.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            ChromeIconButton(Icons.AutoMirrored.Filled.ArrowBack, "返回", onExit)
+            ChromeIconButton(Icons.AutoMirrored.Filled.ArrowBack, "返回", onClick = onExit)
             Spacer(Modifier.width(4.dp))
             Column(Modifier.weight(1f)) {
                 Text(
@@ -331,6 +338,9 @@ private fun ComicTopBar(
                 )
             }
             ChromeIconButton(Icons.Filled.AutoStories, "目录") { onOpenPanel(ComicPanel.TOC) }
+            if (onGodMoment != null) {
+                ChromeIconButton(Icons.Filled.StarOutline, "标记神回", tint = GodGold.DarkStart, onClick = onGodMoment)
+            }
             // 长按 = 收藏预设快捷应用（第 27 条）；点击 = 打开设置面板
             Box {
                 Box(
@@ -363,7 +373,7 @@ private fun ComicTopBar(
                     favorites.forEach { p ->
                         DropdownMenuItem(
                             text = { Text(p.name, color = TextPrimary) },
-                            leadingIcon = { Text(p.emoji.take(2), color = MintPrimary, fontSize = 12.sp) },
+                            leadingIcon = { Text(p.emoji, color = MintPrimary, fontSize = 12.sp) },
                             onClick = {
                                 favMenuOpen = false
                                 onApplyPresetConfig(p.config)
@@ -424,6 +434,8 @@ private fun ComicBottomBar(
     var dragging by remember { mutableStateOf(false) }
     var dragTarget by remember { mutableFloatStateOf(currentSpread.toFloat()) }
     val sliderEnabled = spreadCount > 1
+    val reverse = config.direction == ComicDirection.RTL &&
+        config.mode !in setOf(ComicMode.WEBTOON, ComicMode.CONTINUOUS)
 
     Column(
         Modifier
@@ -457,12 +469,12 @@ private fun ComicBottomBar(
                 fontSize = 11.sp
             )
             Spacer(Modifier.width(6.dp))
-            ChromeIconButton(Icons.Filled.ChevronLeft, "上一页") { onGoPrev() }
+            ChromeIconButton(if (reverse) Icons.Filled.ChevronRight else Icons.Filled.ChevronLeft, "上一页") { onGoPrev() }
             ChromeIconButton(
                 if (autoRead) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                 if (autoRead) "暂停自动阅读" else "开始自动阅读"
             ) { onAutoReadToggle() }
-            ChromeIconButton(Icons.Filled.ChevronRight, "下一页") { onGoNext() }
+            ChromeIconButton(if (reverse) Icons.Filled.ChevronLeft else Icons.Filled.ChevronRight, "下一页") { onGoNext() }
         }
 
         // 第七轮第 3 条：底栏进度滑条同步迁移到面板统一滑条（同一套视觉语言）
@@ -480,6 +492,7 @@ private fun ComicBottomBar(
                 onThumbPreview(-1)
             },
             enabled = sliderEnabled,
+            reverse = reverse,
             valueRange = 0f..(spreadCount - 1).coerceAtLeast(1).toFloat(),
         )
 
@@ -556,7 +569,12 @@ internal fun ComicThumbPreview(
 /* ══════════════ 通用控件 ══════════════ */
 
 @Composable
-internal fun ChromeIconButton(icon: ImageVector, desc: String, onClick: () -> Unit) {
+internal fun ChromeIconButton(
+    icon: ImageVector,
+    desc: String,
+    tint: Color = TextPrimary.copy(alpha = 0.92f),
+    onClick: () -> Unit,
+) {
     Box(
         Modifier
             .size(44.dp)
@@ -564,7 +582,7 @@ internal fun ChromeIconButton(icon: ImageVector, desc: String, onClick: () -> Un
             .clickableNoRipple(onClick),
         contentAlignment = Alignment.Center
     ) {
-        Icon(icon, desc, tint = TextPrimary.copy(alpha = 0.92f), modifier = Modifier.size(22.dp))
+        Icon(icon, desc, tint = tint, modifier = Modifier.size(22.dp))
     }
 }
 

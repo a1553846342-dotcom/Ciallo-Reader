@@ -441,56 +441,27 @@ class ComicNewFeedbackTest {
     }
 
     @Test
-    fun `CURL 占位纹理 - 未加载页绘制加载指示图形`() {
-        // 终审 B 路判定 CURL 占位是"无信号的纯色纸面"，与验收"显示加载中状态"不符；
-        // 返工 = composeSpread/composeUnit 占位路径绘制暗环+亮弧转圈图形。
+    fun `CURL 占位纹理保持纸底并请求补纹理`() {
+        // 加载动画由 Compose 统一提供；GL 不重复绘制静态圈。
         val controller = ComicHarismController().apply {
             config = ComicReaderConfig()
-            layout = ComicLayout(
-                spreads = listOf(
-                    ComicSpread(0, listOf(slot("p0", 0))),
-                    ComicSpread(1, listOf(slot("p1", 1))),
-                ),
-                rawToSpread = emptyMap(),
-            )
+            currentSpreadHint = 0
+            layout = ComicLayout(listOf(
+                ComicSpread(0, listOf(slot("p0", 0))),
+                ComicSpread(1, listOf(slot("p1", 1))),
+            ), emptyMap())
         }
         val bmp = controller.composeSpread(0, 400, 600)!!
-        assertEquals("占位纹理尺寸", 400, bmp.width)
-        val bgLuma = (pageBgInt(controller.config!!) shr 16) and 0xFF
-        assertTrue(
-            "角落应保持纸底色（图形不越界）",
-            Math.abs(((bmp.getPixel(2, 2) shr 16) and 0xFF) - bgLuma) <= 6,
-        )
-        // 环带扫描：亮弧段（-75° 起扫 255°）应显著亮于纸底；环上任意点至少有暗环
-        // radius = min(400,600)/9 ≈ 44，stroke ≈ 10.7 → 环带 34..55，采样取 44
-        var bright = 0
-        var dim = 0
-        for (deg in 0 until 360 step 5) {
-            val rad = Math.toRadians(deg.toDouble())
-            val x = (200 + 44 * Math.cos(rad)).toInt()
-            val y = (300 + 44 * Math.sin(rad)).toInt()
-            if (x !in 0 until bmp.width || y !in 0 until bmp.height) continue
-            val l = (bmp.getPixel(x, y) shr 16) and 0xFF
-            if (l >= bgLuma + 80) bright++
-            else if (l >= bgLuma + 8) dim++
-        }
-        assertTrue("亮弧像素应 ≥24 个采样点，实际 $bright（加载指示可见性）", bright >= 24)
-        assertTrue("暗环像素应 ≥8 个采样点，实际 $dim", dim >= 8)
-
-        // composeUnit（双页单纹理路径）同样绘制指示图形
+        assertEquals(400, bmp.width)
+        assertEquals(bmp.getPixel(2, 2), bmp.getPixel(200, 300))
+        assertTrue(controller.pendingRetexture)
+        controller.pendingRetexture = false
         controller.twoPage = true
         controller.reversed = true
         controller.flatUnits = buildCurlFlatUnits(controller.layout!!)
-        val unit = controller.composeUnit(1, 200, 300)!!
-        var unitBright = 0
-        for (deg in 0 until 360 step 5) {
-            val rad = Math.toRadians(deg.toDouble())
-            val x = (100 + 22 * Math.cos(rad)).toInt()
-            val y = (150 + 22 * Math.sin(rad)).toInt()
-            if (x !in 0 until unit.width || y !in 0 until unit.height) continue
-            if (((unit.getPixel(x, y) shr 16) and 0xFF) >= bgLuma + 70) unitBright++
-        }
-        assertTrue("composeUnit 占位亮弧像素应 ≥24，实际 $unitBright", unitBright >= 24)
+        val unit = controller.composeUnit(0, 200, 300)!!
+        assertEquals(unit.getPixel(2, 2), unit.getPixel(100, 150))
+        assertTrue(controller.pendingRetexture)
     }
 
     @Test

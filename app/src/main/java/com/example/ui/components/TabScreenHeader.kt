@@ -76,7 +76,38 @@ fun rememberHeaderCollapsed(state: LazyStaggeredGridState, forceCollapsed: Boole
 }
 
 /**
- * @param collapsed   是否收起（由 [rememberHeaderCollapsed] 派生）
+ * 折叠信号的「lambda 版」：返回一个**不在本页订阅滚动状态**的求值函数，
+ * 真正的读取发生在 [TabScreenHeader] 内部（它自己用 derivedStateOf 包一层）。
+ *
+ * 为什么要有这个版本：[rememberHeaderCollapsed] 返回的是 Boolean，页面体一旦解包，
+ * 折叠状态每次翻转都会重组**整个页面**composable（书库/书架页动辄 3000+ 行函数体）。
+ * 改成把 lambda 传下去之后，页面体零订阅，重组范围只剩头部那一小块。
+ * 与 LibraryScreen 的 `headerFractionSource` 同一手法（那边早就是 lambda 了）。
+ */
+@Composable
+fun rememberHeaderCollapsedSource(state: LazyListState, forceCollapsed: () -> Boolean = { false }): () -> Boolean {
+    val thresholdPx = with(LocalDensity.current) { 20.dp.toPx() }
+    return { state.firstVisibleItemIndex > 0 || state.firstVisibleItemScrollOffset > thresholdPx || forceCollapsed() }
+}
+
+/** 网格版折叠信号，语义同 [rememberHeaderCollapsedSource]。 */
+@Composable
+fun rememberHeaderCollapsedSource(state: LazyGridState, forceCollapsed: () -> Boolean = { false }): () -> Boolean {
+    val thresholdPx = with(LocalDensity.current) { 20.dp.toPx() }
+    return { state.firstVisibleItemIndex > 0 || state.firstVisibleItemScrollOffset > thresholdPx || forceCollapsed() }
+}
+
+/** 瀑布流版折叠信号，语义同 [rememberHeaderCollapsedSource]。 */
+@Composable
+fun rememberHeaderCollapsedSource(state: LazyStaggeredGridState, forceCollapsed: () -> Boolean = { false }): () -> Boolean {
+    val thresholdPx = with(LocalDensity.current) { 20.dp.toPx() }
+    return { state.firstVisibleItemIndex > 0 || state.firstVisibleItemScrollOffset > thresholdPx || forceCollapsed() }
+}
+
+/**
+ * @param collapsed   是否收起（由 [rememberHeaderCollapsed] 派生；传了 [collapsedSource] 时忽略）
+ * @param collapsedSource 折叠信号的 lambda 版（[rememberHeaderCollapsedSource]）。传入时本页不再订阅
+ *                  滚动状态，折叠态在头部内部 derivedStateOf 求值 —— 重组范围收缩到头部。
  * @param titleColor  标题色（各页传 glassTitleColor()，与背景明暗联动）
  * @param titleVisible false 时不组合标题列（书架页搜索展开态占用整行）
  * @param leading     标题前的槽位（如设置页返回键）
@@ -84,7 +115,8 @@ fun rememberHeaderCollapsed(state: LazyStaggeredGridState, forceCollapsed: Boole
  */
 @Composable
 fun TabScreenHeader(
-    collapsed: Boolean,
+    collapsed: Boolean = false,
+    collapsedSource: (() -> Boolean)? = null,
     modifier: Modifier = Modifier,
     title: String? = null,
     subtitle: String? = null,
@@ -93,15 +125,21 @@ fun TabScreenHeader(
     leading: (@Composable RowScope.() -> Unit)? = null,
     trailing: (@Composable RowScope.() -> Unit)? = null
 ) {
-    val outerV by animateDpAsState(if (collapsed) 6.dp else 10.dp, tween(220), label = "hdrOuterV")
-    val innerV by animateDpAsState(if (collapsed) 7.dp else 12.dp, tween(220), label = "hdrInnerV")
-    val titleSize by animateFloatAsState(if (collapsed) 19f else 24f, tween(220), label = "hdrTitle")
-    val subAlpha by animateFloatAsState(if (collapsed) 0f else 1f, tween(180), label = "hdrSubAlpha")
+    // 折叠态在头部作用域内求值：lambda 版只让头部订阅，页面体零订阅。
+    // derivedStateOf 保证滚动过程中仅在布尔翻转时重组一次头部（逐帧零开销）。
+    val collapsedNow by remember(collapsedSource, collapsed) {
+        derivedStateOf { collapsedSource?.invoke() ?: collapsed }
+    }
+
+    val outerV by animateDpAsState(if (collapsedNow) 6.dp else 10.dp, tween(220), label = "hdrOuterV")
+    val innerV by animateDpAsState(if (collapsedNow) 7.dp else 12.dp, tween(220), label = "hdrInnerV")
+    val titleSize by animateFloatAsState(if (collapsedNow) 19f else 24f, tween(220), label = "hdrTitle")
+    val subAlpha by animateFloatAsState(if (collapsedNow) 0f else 1f, tween(180), label = "hdrSubAlpha")
     // 副标题槽位：12sp 系统字体的自然行高约 17.6~19sp（厂商字体 metrics 不同），
     // 18dp 会把英文降部（如 Y / & 的下缘）裁掉。放大到 20dp 并去掉硬编码
     // lineHeight（原 14sp 比字体自然高度还小，段落盒自身就会截断字形）。
     // 切换到打包 Noto 字体后 metrics 稳定，但槽位仍留余量以容纳 fallback 字体。
-    val subH by animateDpAsState(if (collapsed) 0.dp else 20.dp, tween(220), label = "hdrSubH")
+    val subH by animateDpAsState(if (collapsedNow) 0.dp else 20.dp, tween(220), label = "hdrSubH")
 
     GlassCard(
         modifier = modifier

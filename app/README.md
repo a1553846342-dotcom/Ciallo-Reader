@@ -1,106 +1,47 @@
-# Ciallo阅读 - 软件全景技术文档与架构说明
+# Android 应用模块
 
-本文档详细记录了 **Ciallo阅读** Android 应用程序的完整架构、核心模块、数据流向及各源文件的功能作用。
+`app` 是 Ciallo 阅读的 Android 应用模块，负责小说与漫画书库、在线书源、本地导入、下载、阅读器、阅读记录和设置。入口为 `src/main/java/com/example/MainActivity.kt`；Compose 页面通过 ViewModel 与 repository 协作，Room 保存书籍、进度、书签和统计数据。
 
----
+## 技术与数据流
 
-## 一、 系统架构与技术栈
+```text
+Compose UI → ViewModel → Repository / Source
+                       ↘ Room / WorkManager
+在线源：OkHttp / Cronet → Jsoup / QuickJS
+漫画图像：页面调度 → 解码与缓存 → 阅读、增强或翻译
+```
 
-本应用采用 **MVVM (Model-View-ViewModel)** 架构设计，结合 **Jetpack Compose** 构建现代化声明式用户界面，底层使用 **Room** 实现本地持久化存储，支持高性能 EPUB 电子书解析、漫画图源渲染、语音朗读 (TTS) 以及多维度个性化阅读设置。
+- Kotlin、Jetpack Compose Material 3、Navigation Compose、Coroutines / StateFlow
+- Room / KSP 保存书库与阅读数据；WorkManager 承载长时间下载任务
+- OkHttp、Cronet、Jsoup 与 QuickJS 为原生书源和 Venera JavaScript 源提供网络及解析能力
+- Coil 负责封面与网络图片；ONNX Runtime 提供按需下载的漫画 OCR 模型
+- Gradle 以 arm64-v8a 为默认 Release ABI；模型文件不随 APK 打包
 
-### 1. 技术栈选型
-- **语言**：Kotlin (100%)
-- **UI 框架**：Jetpack Compose (Material Design 3 动态色彩与现代排版)
-- **本地持久化**：Room Database (SQLite 关系型数据库)
-- **异步处理**：Kotlin Coroutines & Flow (协程与反应式数据流)
-- **核心解析引擎**：自定义 EPUB 解析器、Comic 图像解析器
-- **扩展服务**：Android Text-to-Speech (TTS) 语音合成引擎、Backup/Restore 备份管理
+## 主要源码包
 
----
+| 目录 | 职责 |
+| --- | --- |
+| `src/main/java/com/example/data/` | Room、书籍导入解析、备份、设置、阅读统计与图片 token |
+| `src/main/java/com/example/download/` | 小说下载、续传策略、任务状态与归档处理 |
+| `src/main/java/com/example/library/` | 书库聚合搜索、小说/漫画详情、在线阅读接线及漫画下载 |
+| `src/main/java/com/example/source/` | 书源接口、Legado/JSON/Venera 适配、Z-Library 与 AniList |
+| `src/main/java/com/example/ui/` | Compose 页面、读者、缓存管理、书源管理及复用组件 |
+| `src/main/java/com/example/god/` | 漫画神回数据、编辑和排行榜展示 |
+| `src/main/java/com/example/mangatranslate/` | OCR、气泡检测、翻译、模型和页面内存预算 |
+| `src/main/java/fi/harism/curl/` | 仿真卷页使用的 GL 页面渲染器（vendored Java） |
+| `src/main/assets/` | Venera JS 源、JS 安全插桩、动画与源运行时数据 |
+| `src/main/res/` | Android 图标、字体、主题、启动画面和资源配置 |
+| `src/test/`、`src/androidTest/` | JVM/Robolectric 单元回归与 Android 设备测试 |
+| `schemas/` | Room 导出的 schema 历史，用于数据库迁移和升级检查 |
 
-## 二、 目录结构与核心源码说明
+各源码目录下的 `README.md` 说明该目录更细的内容。Android `assets/` 和 `res/` 子目录由构建工具直接扫描，因此它们的目录说明集中放在 `src/main/README.md` 与 `src/main/res/README.md`，避免文档被打进 APK 或让资源合并失败。完整功能与用户操作见仓库根目录 [README](../README.md)；逐源码设计与历史工作记录保存在仓库外的 `PROJECT_GUIDE.md`（本地开发工作区文件，不随仓库发布）。
 
-应用源码位于 `app/src/main/java/com/example/` 目录下，按职责划分为数据层、界面层及入口层。
+## Release 构建
 
-### 1. 根目录与入口 (`com/example/`)
-- **`MainActivity.kt`**
-  - **作用**：应用程序的唯一宿主 Activity。
-  - **内容**：负责初始化窗口全屏沉浸式体验 (`enableEdgeToEdge`)、设置全局 Compose 主题 (`Theme.kt`)、托管根导航图 (Navigation Compose) 并初始化全局 ViewModel (`MainViewModel`)。
-- **`MainViewModel.kt`**
-  - **作用**：全局核心状态管理与业务逻辑分发中心。
-  - **内容**：管理当前书架列表、正在阅读的书籍进度、全局偏好设置状态同步、图书导入导出逻辑以及与 Repository 层的交互。
+需要 JDK 17+ 和 Android SDK（compileSdk 35）：
 
----
+```bash
+./gradlew :app:assembleRelease
+```
 
-### 2. 数据与持久化层 (`com/example/data/`)
-该目录包含了应用的数据模型、本地数据库、解析引擎及系统服务管理。
-
-- **`Book.kt`**
-  - **作用**：核心数据实体类 (Room Entity)。
-  - **内容**：定义了书籍在数据库中的表结构，包括书名、作者、封面路径、文件路径、当前阅读章节索引、阅读进度百分比、最后阅读时间及标签分类。
-- **`AppDatabase.kt`**
-  - **作用**：Room 数据库实例抽象类。
-  - **内容**：声明数据库版本、关联的 Entity 列表，并提供图书数据访问对象 (DAO) 的抽象接口。
-- **`BookRepository.kt`**
-  - **作用**：数据仓库层 (Repository Pattern)。
-  - **内容**：解耦 UI 与数据源，封装了对 Room DAO 的异步调用，提供流式数据监听 (`Flow<List<Book>>`) 和增删改查操作。
-- **`PreferencesManager.kt`**
-  - **作用**：用户偏好设置管理器。
-  - **内容**：基于 SharedPreferences 封装，管理夜间模式自动切换、护眼色过滤、屏幕亮度、屏幕方向锁定、翻页模式、定时休息提醒时间、自定义闪屏海报等配置。
-- **`EpubParser.kt`**
-  - **作用**：EPUB 电子书解析引擎。
-  - **内容**：负责解压 ZIP 格式的 EPUB 文件，解析 `container.xml`、OPF 元数据、Manifest 目录结构以及 spine 线性阅读顺序，提取纯文本章节内容与内嵌图像。
-- **`ComicParser.kt`**
-  - **作用**：漫画/图像压缩包解析引擎。
-  - **内容**：支持解析本地图片文件夹或 CBZ/ZIP 格式的漫画压缩包，按自然排序提取所有页面图片路径供漫画阅读器渲染。
-- **`TtsManager.kt`**
-  - **作用**：文本转语音 (Text-to-Speech) 服务封装。
-  - **内容**：初始化 Android 系统 TTS 引擎，支持中文朗读、语速调节、暂停/继续、朗读进度回调及章节自动连读。
-- **`BackupManager.kt`**
-  - **作用**：数据备份与恢复管理器。
-  - **内容**：负责将用户书架数据库、阅读进度及配置文件导出为 JSON/备份文件，或从外部存储导入恢复。
-
----
-
-### 3. 用户界面层 (`com/example/ui/`)
-采用 Jetpack Compose 构建，包含多个功能模块屏幕及复用组件。
-
-- **`HomeScreen.kt`**
-  - **作用**：主页/书架聚合面板。
-  - **内容**：展示最近阅读的书籍卡片、阅读时长统计快捷入口、分类标签栏及快速导入书籍浮动按钮 (FAB)。
-- **`BookShelfScreen.kt`**
-  - **作用**：书架图书管理大厅。
-  - **内容**：网格与列表视图切换、图书搜索、长按多选删除、分类筛选及书籍详情管理。
-- **`ReaderScreen.kt`**
-  - **作用**：沉浸式图文小说阅读器界面。
-  - **内容**：支持自定义字体大小、行间距、背景主题色（羊皮纸、夜间黑、护眼绿等）、仿真/平移/上下滚动翻页模式、目录抽屉、亮度调节、划线笔记、TTS 语音朗读悬浮条，以及**定时休息提醒动画浮窗**（可动态设定休息分钟数，带有脉冲光效边框与优雅出入场动画）。
-- **`ComicReaderScreen.kt`**
-  - **作用**：专业漫画/图像阅读界面。
-  - **内容**：支持双指缩放 (`detectTransformGestures`)、平移、左右滑动切页、全屏沉浸模式及章节快速跳转。
-- **`SettingsTabScreen.kt`**
-  - **作用**：综合设置中心。
-  - **内容**：包含界面外观设置、护眼模式微调、定时休息提醒时长配置（支持 15/30/45/60 分钟预设及自定义分钟数输入）、屏幕方向锁定、翻页动画选择、自定义闪屏海报上传与数据备份管理。
-- **`SplashScreen.kt`**
-  - **作用**：应用启动闪屏。
-  - **内容**：展示品牌海报或用户自定义海报，支持纯净模式与启动淡入淡出动画。
-- **`StatisticsScreen.kt`**
-  - **作用**：阅读数据统计与分析面板。
-  - **内容**：统计每日/每周阅读时长、累计阅读字数、读完书籍数量及阅读成就图表。
-
-#### 子目录结构：
-- **`theme/`**：包含 `Theme.kt`、`Color.kt`、`Type.kt`，定义 Material 3 配色方案（如 MintPrimary 核心薄荷绿主题、深色与浅色动态适配）。
-- **`components/`**：封装通用按钮、对话框、顶部栏、空状态占位符等原子组件。
-- **`pageturn/`**：实现多种物理翻页特效（平移、覆盖、仿真卷页）。
-
----
-
-## 三. 底层架构与核心机制
-
-1. **响应式状态流 (State Flow)**：
-   - UI 层通过 `collectAsStateWithLifecycle()` 监听 ViewModel 中的 `StateFlow`，实现零阻塞的异步数据渲染。
-2. **高效本地缓存与数据库**：
-   - Room 数据库通过 KSP 进行编译期注解处理，所有数据库事务均在后台协程 (`Dispatchers.IO`) 中执行，确保主线程流畅度。
-3. **沉浸式 UI 与窗口适配**：
-   - 全面适配 Edge-to-Edge，动态处理状态栏与导航栏 WindowInsets，防止内容被系统栏遮挡。
-4. **自定义休息提醒联动系统**：
-   - 阅读器内置计时器，结合用户在设置中配置的分钟数（支持预设或任意自定义分钟），当时间触发时，在阅读界面顶部弹出带有呼吸光效的高颜值毛玻璃提醒横幅，提醒用户保护视力。
+APK 输出在 `app/build/outputs/apk/release/`。本地没有配置发布 keystore 时，Gradle 会按工程设置使用 `debug.keystore`；向应用商店发布前应配置组织自己的 Release 签名密钥。

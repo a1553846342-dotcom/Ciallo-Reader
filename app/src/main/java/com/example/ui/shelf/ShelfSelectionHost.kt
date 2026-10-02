@@ -616,17 +616,21 @@ fun CategoryPickerSheet(
                         modifier = Modifier.fillMaxWidth(),
                     )
                     Spacer(modifier = Modifier.height(8.dp))
-                    com.example.ui.components.AppActionButton(
-                        text = "创建并放入",
-                        onClick = {
-                            if (newName.isNotBlank()) {
-                                onCreate?.invoke(newName.trim())
-                                creating = false
-                                newName = ""
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                    )
+                    // 底部弹窗是独立窗口，按钮不能复用主窗口的玻璃坐标。
+                    com.example.ui.components.DialogLiquidGlass(fillMaxSize = false) {
+                        com.example.ui.components.AppActionButton(
+                            text = "创建并放入",
+                            onClick = {
+                                if (newName.isNotBlank()) {
+                                    onCreate?.invoke(newName.trim())
+                                    creating = false
+                                    newName = ""
+                                }
+                            },
+                            enabled = newName.isNotBlank(),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
                 }
             }
             Spacer(modifier = Modifier.height(20.dp))

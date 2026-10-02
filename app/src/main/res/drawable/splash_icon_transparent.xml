@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 系统冷启动闪屏的图标占位：全透明。
+     Android 12+ 不设置 icon 会回退到应用启动图标，所以想「无图标」
+     只能塞一个透明 drawable。背景色与 Compose 开屏页同底色，视觉上无缝。 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android">
+    <solid android:color="@android:color/transparent" />
+    <size android:width="1dp" android:height="1dp" />
+</shape>

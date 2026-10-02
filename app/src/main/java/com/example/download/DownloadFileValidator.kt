@@ -39,7 +39,10 @@ object DownloadFileValidator {
                 head[2] == 0x03.toByte() && head[3] == 0x04.toByte()
             if (!isZip) {
                 val headStr = String(head, 0, head.size, Charsets.UTF_8).lowercase()
-                if (headStr.contains("<!doctype html") || headStr.contains("<html") || headStr.contains("<head>")) {
+                val trimmed = headStr.trimStart()
+                val html = trimmed.startsWith("<!doctype html") || trimmed.startsWith("<html") || trimmed.startsWith("<head>")
+                val knownError = listOf("diamwall", "checking your browser", "verifying your browser", "daily limit", "page not found", "solve this captcha").any { it in headStr }
+                if (html && (!format.equals("txt", true) || knownError)) {
                     return IntegrityResult(false, null, true, extractHtmlErrorHint(file))
                 }
             }

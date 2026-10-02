@@ -86,7 +86,7 @@ import com.example.ui.components.AcrylicBottomOverlay
 import com.example.ui.components.AppIconButton
 import com.example.ui.components.GlassCard
 import com.example.ui.components.TabScreenHeader
-import com.example.ui.components.rememberHeaderCollapsed
+import com.example.ui.components.rememberHeaderCollapsedSource
 import com.example.ui.components.scrollTiltSource
 import com.example.ui.components.AcrylicDialog
 import com.example.ui.components.StarryNightBackground
@@ -109,6 +109,8 @@ import kotlinx.coroutines.launch
 import androidx.lifecycle.lifecycleScope
 import com.example.ui.theme.AppFonts
 import me.trishiraj.shadowglow.consistentShadow
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.ui.components.AppToast
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -141,7 +143,7 @@ fun HomeScreen(
     privacyModeEnabled: Boolean = false,
     protectedCategoryNames: Set<String> = emptySet(),
     unlockedCategoryIds: Set<Int> = emptySet(),
-    onUnlockCategory: ((com.example.data.CategoryEntity, String) -> Boolean)? = null,
+    onUnlockCategory: (suspend (com.example.data.CategoryEntity, String) -> Boolean)? = null,
     onToggleCategoryProtected: ((com.example.data.CategoryEntity, Boolean) -> Unit)? = null,
     /* ══════════════ 「我喜欢的」板块：与「我的书架」平行 ══════════════ */
     /** 收藏聚合列表（收藏 + 进度 + 已下载话数） */
@@ -172,7 +174,7 @@ fun HomeScreen(
     favoriteCategories: List<String> = emptyList(),
     /** 隐私模式里的开关：为 true 时「我喜欢的」需先验证 PIN 才显示内容 */
     favoritesProtected: Boolean = false,
-    onVerifyPrivacyPin: ((String) -> Boolean)? = null,
+    onVerifyPrivacyPin: (suspend (String) -> Boolean)? = null,
     onAddFavoriteCategory: (String) -> Unit = {},
     onRenameFavoriteCategory: (String, String) -> Unit = { _, _ -> },
     onDeleteFavoriteCategory: (String) -> Unit = {},
@@ -181,7 +183,7 @@ fun HomeScreen(
 ) {
     val sharedTransitionScope = com.example.LocalSharedTransitionScope.current
     val animatedVisibilityScope = com.example.LocalNavAnimatedVisibilityScope.current
-    val streakDays by streakDaysFlow.collectAsState()
+    val streakDays by streakDaysFlow.collectAsStateWithLifecycle()
 
     val currentlyReading = remember(books) {
         val result = if (books.isEmpty()) {
@@ -373,7 +375,7 @@ fun HomeScreen(
                     TextButton(onClick = {
                         onDeleteCategory?.invoke(cat) { deleted ->
                             if (!deleted) {
-                                android.widget.Toast.makeText(
+                                AppToast.makeText(
                                     ctx,
                                     "默认分类不可删除",
                                     android.widget.Toast.LENGTH_SHORT
@@ -527,109 +529,37 @@ fun HomeScreen(
         )
     }
 
-    // New Category Dialog
+    // 两套分类共用新建窗口的 UI，保存回调各自独立。
     if (showAddCategoryDialog) {
-        AcrylicDialog(
-            onDismissRequest = { showAddCategoryDialog = false },
-            title = { Text("新建分类", fontWeight = FontWeight.Bold) },
-            text = {
-                OutlinedTextField(
-                    value = newCategoryText,
-                    onValueChange = { newCategoryText = it },
-                    label = { Text("名称", color = MaterialTheme.colorScheme.onSurfaceVariant) },
-                    singleLine = true,
-                    colors = TextFieldDefaults.colors(
-                        focusedTextColor = MaterialTheme.colorScheme.onSurface,
-                        unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
-                        focusedLabelColor = MintPrimary,
-                        unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                        focusedIndicatorColor = MintPrimary,
-                        unfocusedIndicatorColor = MaterialTheme.colorScheme.outline,
-                        cursorColor = MintPrimary,
-                        focusedContainerColor = Color.Transparent,
-                        unfocusedContainerColor = Color.Transparent
-                    ),
-                    modifier = Modifier.fillMaxWidth()
-                )
+        NewCategoryDialog(
+            title = "新建书架分类",
+            description = "用于「我的书架」里的本地书籍。",
+            name = newCategoryText,
+            onNameChange = { newCategoryText = it },
+            onDismiss = { showAddCategoryDialog = false },
+            onCreate = { name ->
+                onAddCategory(name)
+                AppToast.makeText(context, "已创建分类「$name」", android.widget.Toast.LENGTH_SHORT).show()
+                newCategoryText = ""
+                showAddCategoryDialog = false
             },
-            confirmButton = {
-                val ctx = androidx.compose.ui.platform.LocalContext.current
-                TextButton(
-                    onClick = {
-                        if (newCategoryText.isNotBlank()) {
-                            onAddCategory(newCategoryText.trim())
-                            // 第十一轮第 2 条：与设置页一致的操作反馈（此前静默关闭，
-                            // 用户无法区分"创建成功"与"点击无效"）
-                            android.widget.Toast.makeText(
-                                ctx, "已创建分类「${newCategoryText.trim()}」",
-                                android.widget.Toast.LENGTH_SHORT
-                            ).show()
-                            newCategoryText = ""
-                            showAddCategoryDialog = false
-                        }
-                    }
-                ) {
-                    Text("新建", color = MintPrimary, fontWeight = FontWeight.Bold)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showAddCategoryDialog = false }) {
-                    Text("取消")
-                }
-            }
         )
     }
 
     /* ── 「我喜欢的」分类：新建 / 重命名 / 删除（独立体系，与书架分类互不影响） ── */
 
     if (showAddFavoriteCategoryDialog) {
-        AcrylicDialog(
-            onDismissRequest = { showAddFavoriteCategoryDialog = false },
-            title = { Text("新建收藏分类", fontWeight = FontWeight.Bold) },
-            text = {
-                Column {
-                    Text(
-                        "只用于「我喜欢的」，不会出现在书架的分类里。",
-                        fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Spacer(modifier = Modifier.height(10.dp))
-                    OutlinedTextField(
-                        value = newFavoriteCategoryText,
-                        onValueChange = { newFavoriteCategoryText = it },
-                        label = { Text("名称", color = MaterialTheme.colorScheme.onSurfaceVariant) },
-                        singleLine = true,
-                        colors = TextFieldDefaults.colors(
-                            focusedTextColor = MaterialTheme.colorScheme.onSurface,
-                            unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
-                            focusedLabelColor = MintPrimary,
-                            unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                            focusedIndicatorColor = MintPrimary,
-                            unfocusedIndicatorColor = MaterialTheme.colorScheme.outline,
-                            cursorColor = MintPrimary,
-                            focusedContainerColor = Color.Transparent,
-                            unfocusedContainerColor = Color.Transparent
-                        ),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
+        NewCategoryDialog(
+            title = "新建收藏分类",
+            description = "只用于「我喜欢的」，不会出现在书架的分类里。",
+            name = newFavoriteCategoryText,
+            onNameChange = { newFavoriteCategoryText = it },
+            onDismiss = { showAddFavoriteCategoryDialog = false },
+            onCreate = { name ->
+                onAddFavoriteCategory(name)
+                newFavoriteCategoryText = ""
+                showAddFavoriteCategoryDialog = false
             },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        if (newFavoriteCategoryText.isNotBlank()) {
-                            onAddFavoriteCategory(newFavoriteCategoryText.trim())
-                            newFavoriteCategoryText = ""
-                            showAddFavoriteCategoryDialog = false
-                        }
-                    }
-                ) {
-                    Text("新建", color = MintPrimary, fontWeight = FontWeight.Bold)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showAddFavoriteCategoryDialog = false }) { Text("取消") }
-            }
         )
     }
 
@@ -785,7 +715,7 @@ fun HomeScreen(
     // 主书架滚动 → 卡片惯性倾斜信号源（任务书「整卡倾斜」§2）；同时驱动头部折叠（原声明在内容分支内，头部够不到，上提）
     val homeGridState = rememberLazyGridState()
     homeGridState.scrollTiltSource()
-    val homeHeaderCollapsed = rememberHeaderCollapsed(homeGridState)
+    val homeHeaderCollapsedSource = rememberHeaderCollapsedSource(homeGridState)
 
     /**
      * 命中**兜底**：卡片的坐标回调不可靠（槽位复用时整帧都不触发，见
@@ -989,7 +919,7 @@ fun HomeScreen(
                         val iconCloseTint = if (isDark) Color.LightGray else Color.DarkGray
 
                         TabScreenHeader(
-                            collapsed = homeHeaderCollapsed,
+                            collapsedSource = homeHeaderCollapsedSource,
                             title = "我的书架",
                             // 与其它三页页头副标题统一英文风格（LIBRARY & SEARCH / STATISTICS & INSIGHTS / SETTINGS & PREFERENCES）
                             subtitle = "BOOKSHELF & READING",
@@ -1428,7 +1358,7 @@ fun HomeScreen(
 
 
             if (sortedBooks.isEmpty()) {
-                                    item(span = { GridItemSpan(maxLineSpan) }, key = "empty_state") {
+                                    item(span = { GridItemSpan(maxLineSpan) }, key = "empty_state", contentType = "fullspan") {
                                         if (selectedCategoryLocked) {
                                             // 6.3：受保护分类锁定态——不显示内容，引导验证密码
                                             // 第九轮修复⑤：不再整块白色大卡（用户反馈"书架下面盖了
@@ -1502,7 +1432,7 @@ fun HomeScreen(
                                         }
                                     }
                                 } else {
-                                    items(items = sortedBooks, key = { it.id }) { book ->
+                                    items(items = sortedBooks, key = { it.id }, contentType = { "book" }) { book ->
                                         val coverData = remember(book.coverUri, book.isCoverValid) {
                                             if (book.coverUri.isNullOrEmpty()) null
                                             else if (book.coverUri!!.startsWith("content://")) {
@@ -1915,7 +1845,7 @@ fun HomeScreen(
 
                             if (favoritesLocked) {
                                 // 锁定：只留一句引导，不泄露任何收藏标题/封面
-                                item(span = { GridItemSpan(maxLineSpan) }, key = "fav_locked") {
+                                item(span = { GridItemSpan(maxLineSpan) }, key = "fav_locked", contentType = "fullspan") {
                                     Box(
                                         modifier = Modifier
                                             .fillMaxWidth()
@@ -1955,7 +1885,7 @@ fun HomeScreen(
                                     }
                                 }
                             } else if (favSorted.isEmpty()) {
-                                item(span = { GridItemSpan(maxLineSpan) }, key = "fav_empty_state") {
+                                item(span = { GridItemSpan(maxLineSpan) }, key = "fav_empty_state", contentType = "fullspan") {
                                     com.example.ui.components.MascotEmptyState(
                                         mascotResId = com.example.ui.mascot.MascotSpriteSheet.idleDrawable,
                                         title = "「还没有喜欢的漫画」",
@@ -1966,7 +1896,7 @@ fun HomeScreen(
                                     )
                                 }
                             } else {
-                                items(items = favSorted, key = { com.example.ui.shelf.favShelfKey(it.key) }) { item ->
+                                items(items = favSorted, key = { com.example.ui.shelf.favShelfKey(it.key) }, contentType = { "favcard" }) { item ->
                                     // ⚠️ 收藏卡片也要登记几何，否则宿主的手势命中测试找不到它 ——
                                     // 「我喜欢的」长按完全没反应，就是差这一步。
                                     val favKey = com.example.ui.shelf.favShelfKey(item.key)
@@ -1995,7 +1925,7 @@ fun HomeScreen(
                                 }
                             }
 
-                                item(span = { GridItemSpan(maxLineSpan) }, key = "bottom_stats") {
+                                item(span = { GridItemSpan(maxLineSpan) }, key = "bottom_stats", contentType = "fullspan") {
                                     // 4. BOTTOM INFO CARD: READING STATISTICS PREVIEW
                                     // A2：原 24.dp 完全不足以躲开悬浮 Tab 栏 + 系统导航栏，
                                     // 改用全 App 统一的下发值
@@ -2371,7 +2301,7 @@ private fun shareTitles(context: android.content.Context, titles: List<String>) 
 private fun TodayReadTimeText(todaySecondsFlow: kotlinx.coroutines.flow.StateFlow<Long>) {
     // 第七轮第 4 条修复：数据源改为"今日"阅读秒数（daily_read_time_<今天>），
     // 旧版误用全生命周期累计值标"今日"；0 分钟如实显示（不再 coerceAtLeast(1)）
-    val todaySeconds by todaySecondsFlow.collectAsState()
+    val todaySeconds by todaySecondsFlow.collectAsStateWithLifecycle()
     val minutes = todayReadMinutes(todaySeconds)
 
     Text(
@@ -2379,6 +2309,51 @@ private fun TodayReadTimeText(todaySecondsFlow: kotlinx.coroutines.flow.StateFlo
         fontSize = 15.sp,
         fontWeight = FontWeight.Bold,
         color = MaterialTheme.colorScheme.onSurface
+    )
+}
+
+@Composable
+private fun NewCategoryDialog(
+    title: String,
+    description: String,
+    name: String,
+    onNameChange: (String) -> Unit,
+    onDismiss: () -> Unit,
+    onCreate: (String) -> Unit,
+) {
+    AcrylicDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title, fontWeight = FontWeight.Bold) },
+        text = {
+            Column {
+                Text(description, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(modifier = Modifier.height(10.dp))
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = onNameChange,
+                    label = { Text("名称", color = MaterialTheme.colorScheme.onSurfaceVariant) },
+                    singleLine = true,
+                    colors = TextFieldDefaults.colors(
+                        focusedTextColor = MaterialTheme.colorScheme.onSurface,
+                        unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
+                        focusedLabelColor = MintPrimary,
+                        unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                        focusedIndicatorColor = MintPrimary,
+                        unfocusedIndicatorColor = MaterialTheme.colorScheme.outline,
+                        cursorColor = MintPrimary,
+                        focusedContainerColor = Color.Transparent,
+                        unfocusedContainerColor = Color.Transparent,
+                    ),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onCreate(name.trim()) }, enabled = name.isNotBlank()) {
+                Text("新建", color = MintPrimary, fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
 }
 
@@ -2852,7 +2827,7 @@ private fun BookActionSheet(
                                                 shareScope.launch {
                                                     val err = com.example.library.BookShareHelper.shareBook(context, book)
                                                     sharing = false
-                                                    if (err != null) Toast.makeText(context, err, Toast.LENGTH_SHORT).show()
+                                                    if (err != null) AppToast.makeText(context, err, Toast.LENGTH_SHORT).show()
                                                 }
                                             }
                                             else -> onDelete()

@@ -1,7 +1,10 @@
 package com.example.mangatranslate
 
 import android.content.Context
+import com.example.source.executeCancellable
+import com.example.data.readImportBytes
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -34,13 +37,14 @@ class LlmBubbleTranslator(private val context: Context) {
     data class Item(val id: Int, val text: String)
 
     private val client by lazy {
-        OkHttpClient.Builder()
+        com.example.source.SharedHttpTransport.builder()
             .connectTimeout(20, TimeUnit.SECONDS)
             .readTimeout(180, TimeUnit.SECONDS)
             .writeTimeout(60, TimeUnit.SECONDS)
             .build()
     }
 
+    private val secrets = com.example.data.EncryptedSecretStore(context)
     private val glossaryLock = Any()
     /** 译名表（会话级持久，SharedPreferences 落盘），跨页积累保证人名一致。 */
     private val glossary = LinkedHashMap<String, String>()
@@ -49,8 +53,12 @@ class LlmBubbleTranslator(private val context: Context) {
         runCatching {
             val prefs = context.getSharedPreferences("mt_llm", Context.MODE_PRIVATE)
             val raw = prefs.getString("glossary", null) ?: return@runCatching
+            require(raw.length <= 256 * 1024)
             val o = JSONObject(raw)
-            o.keys().asSequence().forEach { k -> glossary[k] = o.optString(k) }
+            o.keys().asSequence().take(128).forEach { k ->
+                val value=o.optString(k)
+                if(k.length<=80 && value.length<=120) glossary[k]=value
+            }
         }
     }
 
@@ -63,6 +71,11 @@ class LlmBubbleTranslator(private val context: Context) {
         }
     }
 
+    fun cacheFingerprint():String {
+        val cfg=loadConfig()
+        val data="${cfg.apiUrl}|${cfg.modelName}|${cfg.geminiFormat}"
+        return java.security.MessageDigest.getInstance("SHA-256").digest(data.toByteArray()).joinToString("") { "%02x".format(it) }
+    }
     fun glossarySnapshot(): Map<String, String> =
         synchronized(glossaryLock) { glossary.toMap() }
 
@@ -70,16 +83,17 @@ class LlmBubbleTranslator(private val context: Context) {
         val p = context.getSharedPreferences("mt_llm", Context.MODE_PRIVATE)
         return LlmConfig(
             apiUrl = p.getString("api_url", "") ?: "",
-            apiKey = p.getString("api_key", "") ?: "",
+            apiKey = secrets.read("api_key", p) ?: "",
             modelName = p.getString("model_name", "") ?: "",
             geminiFormat = p.getBoolean("gemini_format", false),
         )
     }
 
     fun saveConfig(cfg: LlmConfig) {
+        secrets.write("api_key", cfg.apiKey)
         context.getSharedPreferences("mt_llm", Context.MODE_PRIVATE).edit()
+            .remove("api_key")
             .putString("api_url", cfg.apiUrl.trim())
-            .putString("api_key", cfg.apiKey)
             .putString("model_name", cfg.modelName.trim())
             .putBoolean("gemini_format", cfg.geminiFormat)
             .apply()
@@ -92,6 +106,8 @@ class LlmBubbleTranslator(private val context: Context) {
     suspend fun translateBubbles(items: List<Item>): Map<Int, String>? =
         withContext(Dispatchers.IO) {
             if (items.isEmpty()) return@withContext emptyMap()
+            if (items.size > 500 || items.sumOf { it.text.length.toLong() } > 128_000) return@withContext null
+            if(!TranslationPrivacy.allowed(context)) return@withContext null
             val cfg = loadConfig()
             if (!cfg.isValid()) return@withContext null
             val prompt = runCatching {
@@ -100,8 +116,13 @@ class LlmBubbleTranslator(private val context: Context) {
                 PROMPT_FALLBACK
             }
             var lastError: String? = null
-            repeat(RETRY_COUNT) {
-                val result = runCatching { requestOnce(cfg, prompt, items) }.getOrNull()
+            repeat(RETRY_COUNT) { attempt ->
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                if(attempt>0) kotlinx.coroutines.delay(500L shl (attempt-1))
+                val result = try { requestOnce(cfg, prompt, items) } catch(e:Exception) {
+                    if(e is kotlinx.coroutines.CancellationException) throw e
+                    null
+                }
                 if (result != null) return@withContext result
                 lastError = "parse_or_network"
             }
@@ -113,7 +134,7 @@ class LlmBubbleTranslator(private val context: Context) {
     suspend fun translateBuckets(regions: List<TranslatedRegion>): Map<Int, String>? =
         translateBubbles(regions.mapIndexed { i, r -> Item(i, r.original) })
 
-    private fun requestOnce(cfg: LlmConfig, prompt: String, items: List<Item>): Map<Int, String>? {
+    private suspend fun requestOnce(cfg: LlmConfig, prompt: String, items: List<Item>): Map<Int, String>? {
         val userPayload = buildUserPayload(items)
         val (url, body) = if (cfg.geminiFormat) buildGemini(cfg, prompt, userPayload)
         else buildOpenAiCompatible(cfg, prompt, userPayload)
@@ -123,9 +144,10 @@ class LlmBubbleTranslator(private val context: Context) {
             .apply { if (cfg.apiKey.isNotBlank()) header("Authorization", "Bearer ${cfg.apiKey}") }
             .post(body.toRequestBody("application/json".toMediaType()))
             .build()
-        client.newCall(request).execute().use { resp ->
+        client.newCall(request).executeCancellable().use { resp ->
             if (!resp.isSuccessful) return null
-            val raw = resp.body?.string() ?: return null
+            val raw = resp.body?.byteStream()?.use { it.readImportBytes(2 * 1024 * 1024).toString(Charsets.UTF_8) } ?: return null
+            com.example.source.parser.RuleBudget.json(raw)
             val content = if (cfg.geminiFormat) parseGeminiContent(raw) else parseOpenAiContent(raw)
             if (content == null) return null
             return parseStrict(content, items)
@@ -222,7 +244,10 @@ class LlmBubbleTranslator(private val context: Context) {
             synchronized(glossaryLock) {
                 used.keys().asSequence().forEach { k ->
                     val v = used.optString(k)
-                    if (k.isNotBlank() && v.isNotBlank()) glossary[k] = v
+                    if (k.isNotBlank() && v.isNotBlank() && k.length<=80 && v.length<=120) {
+                        glossary.remove(k); glossary[k]=v
+                        while(glossary.size>128) glossary.remove(glossary.keys.first())
+                    }
                 }
             }
             persistGlossary()

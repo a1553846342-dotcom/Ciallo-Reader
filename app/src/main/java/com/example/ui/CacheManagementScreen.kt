@@ -6,6 +6,10 @@
 package com.example.ui
 
 import android.os.StatFs
+import android.os.Build
+import android.os.Process
+import android.os.storage.StorageManager
+import android.app.usage.StorageStatsManager
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.Animatable
@@ -62,7 +66,8 @@ import java.io.File
 import java.util.Locale
 import androidx.compose.foundation.layout.widthIn
 import com.example.ui.adaptive.AdaptiveSpec
-import com.example.ui.design.DesignTokens
+import com.example.ui.design.DesignTokens
+import com.example.ui.components.AppToast
 
 /** 四类书籍封面目录（漫画/EPUB/FB2/MOBI 解析产物）。 */
 private val COVER_DIRS = listOf("comic_covers", "epub_covers", "fb2_covers", "mobi_covers")
@@ -86,7 +91,7 @@ private data class StorageRow(
  * 缓存管理页面：让用户看清应用存储占用，并能放心清理不紧要的文件。
  *
  * 安全模型（对标成熟应用的存储管理）：
- * - 「一键清理缓存」只作用于缓存区（网页图片 / 图片加载缓存 / 临时文件），即时执行，绝不触碰用户数据；
+ * - 一键清理只作用于可再生图片缓存和临时文件，不触碰译文、模型和离线内容；
  * - 离线书籍、离线漫画、封面图、网页浏览数据属于用户数据，删除必须经确认对话框量化后果；
  * - 数据库与设置只读统计，不提供清理入口；
  * - 所有统计带异常保护（权限/IO 异常按 0 处理，不让扫描协程卡死），清理后实测释放量并重扫刷新；
@@ -104,6 +109,7 @@ fun CacheManagementScreen(
     var isScanning by remember { mutableStateOf(true) }
     var isClearing by remember { mutableStateOf(false) }
     var appTotalSize by remember { mutableLongStateOf(0L) }
+    var systemMeasured by remember { mutableStateOf(false) }
     var otherSize by remember { mutableLongStateOf(0L) }
     var freeBytes by remember { mutableLongStateOf(0L) }
     var deviceTotalBytes by remember { mutableLongStateOf(0L) }
@@ -172,11 +178,34 @@ fun CacheManagementScreen(
     fun targetsFor(key: String): List<File> = when (key) {
         "ehimg" -> listOf(File(context.cacheDir, "ehimg"))
         "image_cache" -> listOf(File(context.cacheDir, "image_cache"))
+        "comic_image_cache" -> listOf(File(context.cacheDir, "comic_image_cache"))
+        "comic_processed" -> listOf(File(context.cacheDir, "comic_processed_v1"))
+        "external_cache" -> context.externalCacheDirs.filterNotNull().distinctBy { it.absolutePath }
         "temp" -> context.cacheDir.listFiles()
-            ?.filter { it.name != "ehimg" && it.name != "image_cache" && it.name != "manga_translate_v1" }
+            ?.filter { it.name !in setOf("ehimg", "image_cache", "comic_image_cache", "comic_processed_v1", "manga_translate_v1") }
             ?: emptyList()
         "downloads" -> listOf(File(context.filesDir, "downloads"))
+        "imports" -> listOf(File(context.filesDir, "imports"))
         "comics" -> context.filesDir.listFiles { f -> f.isDirectory && f.name.startsWith("comics_") }?.toList() ?: emptyList()
+        "book_images" -> listOf("epub_images", "mobi_images", "fb2_images", "docx_images").map { File(context.filesDir, it) }
+        "external_files" -> (context.getExternalFilesDirs(null).filterNotNull() + context.externalMediaDirs.filterNotNull()).distinctBy { it.absolutePath }
+        "personalization" -> context.filesDir.listFiles { f -> f.isFile &&
+            (f.name == "custom_font.ttf" || f.name.startsWith("custom_poster_") || f.name.startsWith("custom_app_bg_")) }?.toList() ?: emptyList()
+        "sources" -> listOf(File(context.filesDir, "js_sources"), File(context.filesDir, "novel_reader_backup.json"))
+        "appdata" -> listOf("databases", "shared_prefs", "no_backup").map { File(context.dataDir, it) }
+        "other" -> {
+            val knownDirs = setOf("downloads", "imports", "epub_images", "mobi_images", "fb2_images",
+                "docx_images", "js_sources", "manga_translate_models") + COVER_DIRS
+            val fileRemainder = context.filesDir.listFiles()?.filter { f ->
+                f.name !in knownDirs && !f.name.startsWith("comics_") &&
+                    f.name != "custom_font.ttf" && f.name != "novel_reader_backup.json" &&
+                    !f.name.startsWith("custom_poster_") && !f.name.startsWith("custom_app_bg_")
+            }.orEmpty()
+            val dataRemainder = context.dataDir.listFiles()?.filter { f ->
+                f.name !in setOf("files", "cache", "databases", "shared_prefs", "no_backup", "app_webview", "lib")
+            }.orEmpty()
+            fileRemainder + dataRemainder
+        }
         "covers" -> COVER_DIRS.map { File(context.filesDir, it) }
         "webview" -> listOf(File(context.dataDir, "app_webview"))
         "manga_tr_cache" -> listOf(com.example.mangatranslate.TranslationCache.dir(context))
@@ -192,11 +221,13 @@ fun CacheManagementScreen(
         when (key) {
             "temp" -> context.cacheDir.listFiles()?.forEach { f ->
                 when {
-                    f.name == "ehimg" || f.name == "image_cache" || f.name == "manga_translate_v1" -> Unit
+                    f.name in setOf("ehimg", "image_cache", "comic_image_cache", "comic_processed_v1", "manga_translate_v1") -> Unit
                     f.name == "share_temp" && f.isDirectory ->
                         f.listFiles()?.forEach { c -> if (c.lastModified() < now - 15 * 60_000L) runCatching { c.deleteRecursively() } }
                     f.name.startsWith("epub_") && f.isDirectory && newestFileTime(f) > now - 2 * 60_000L -> Unit
-                    else -> runCatching { f.deleteRecursively() }
+                    else -> if (newestFileTime(f) < now - 2 * 60_000L) {
+                        runCatching { f.deleteRecursively() }
+                    }
                 }
             }
             else -> targetsFor(key).forEach { runCatching { it.deleteRecursively() } }
@@ -223,7 +254,7 @@ fun CacheManagementScreen(
                     freed > 0 -> { successFreed = freed; com.example.ui.mascot.MascotAnimationController.play(com.example.ui.mascot.MascotEvent.CleanComplete); "" }
                     else -> "没有可释放的内容"
                 }
-                if (msg.isNotEmpty()) Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                if (msg.isNotEmpty()) AppToast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                 scanTrigger++
             } finally {
                 isClearing = false
@@ -231,14 +262,14 @@ fun CacheManagementScreen(
         }
     }
 
-    // 一键清理只作用于「缓存」区三项，用户数据与设置永远不在作用范围内
+    // 一键清理只作用于可再生缓存，译文、模型和离线内容走独立入口
     fun clearAllCache() {
         if (isClearing) return
         scope.launch {
             isClearing = true
             try {
                 val freed = withContext(Dispatchers.IO) {
-                    val keys = listOf("ehimg", "image_cache", "temp")
+                    val keys = listOf("ehimg", "image_cache", "comic_image_cache", "comic_processed", "external_cache", "temp")
                     val before = keys.sumOf { key -> targetsFor(key).sumOf { dirSize(it) } }
                     keys.forEach { key -> runCatching { clearTargets(key) } }
                     val after = keys.sumOf { key -> targetsFor(key).sumOf { dirSize(it) } }
@@ -250,7 +281,7 @@ fun CacheManagementScreen(
                     com.example.ui.mascot.MascotAnimationController.play(com.example.ui.mascot.MascotEvent.CleanComplete)
                     ""
                 } else "没有可释放的内容"
-                if (msg.isNotEmpty()) Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                if (msg.isNotEmpty()) AppToast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                 scanTrigger++
             } finally {
                 isClearing = false
@@ -258,7 +289,7 @@ fun CacheManagementScreen(
         }
     }
 
-    // ── 扫描：统计口径 = filesDir + cacheDir + 数据库/配置目录，与应用真实占用一致 ──
+    // ── 扫描：内部数据 + 外部缓存；安装包和系统组件不在此口径内 ──
     LaunchedEffect(scanTrigger) {
         isScanning = true
         val rows = mutableListOf<StorageRow>()
@@ -268,6 +299,7 @@ fun CacheManagementScreen(
         var deviceTotal = 0L
         var activeDownload = false
         var activeComic = false
+        var measuredBySystem = false
         try {
             withContext(Dispatchers.IO) {
                 val filesDir = context.filesDir
@@ -276,29 +308,55 @@ fun CacheManagementScreen(
 
                 val ehimgSize = dirSize(File(cacheDir, "ehimg"))
                 val imageCacheSize = dirSize(File(cacheDir, "image_cache"))
+                val comicImageSize = dirSize(File(cacheDir, "comic_image_cache"))
+                val comicProcessedSize = dirSize(File(cacheDir, "comic_processed_v1"))
                 val cacheAll = dirSize(cacheDir)
-                // 与 targetsFor("temp") 同构的直接求和，保证「扫描口径 == 清理口径」
-                val tempSize = cacheDir.listFiles()?.filter { it.name != "ehimg" && it.name != "image_cache" }?.sumOf { dirSize(it) } ?: 0L
+                val externalCacheSize = targetsFor("external_cache").sumOf { dirSize(it) }
+                val externalFilesSize = (context.getExternalFilesDirs(null).filterNotNull() +
+                    context.externalMediaDirs.filterNotNull()).distinctBy { it.absolutePath }.sumOf { dirSize(it) }
+                val tempSize = targetsFor("temp").sumOf { dirSize(it) }
 
                 val downloadsDir = File(filesDir, "downloads")
                 val downloadsSize = dirSize(downloadsDir)
+                val importsSize = dirSize(File(filesDir, "imports"))
+                val bookImagesSize = targetsFor("book_images").sumOf { dirSize(it) }
                 val comicDirs = filesDir.listFiles { f -> f.isDirectory && f.name.startsWith("comics_") }?.toList() ?: emptyList()
                 val comicsSize = comicDirs.sumOf { dirSize(it) }
                 val coversSize = COVER_DIRS.sumOf { dirSize(File(filesDir, it)) }
                 val personalFiles = filesDir.listFiles { f -> f.isFile && (f.name == "custom_font.ttf" || f.name.startsWith("custom_poster_") || f.name.startsWith("custom_app_bg_")) }?.toList() ?: emptyList()
                 val personalSize = personalFiles.sumOf { runCatching { it.length() }.getOrDefault(0L) }
                 val sourcesSize = dirSize(File(filesDir, "js_sources")) + (File(filesDir, "novel_reader_backup.json").takeIf { it.exists() }?.length() ?: 0L)
+                val trModelsSize = dirSize(File(filesDir, "manga_translate_models"))
                 val webviewSize = dirSize(File(dataDir, "app_webview"))
                 val appDataSize = listOf("databases", "shared_prefs", "no_backup").sumOf { dirSize(File(dataDir, it)) }
 
                 // filesDir 中未归类的杂项（历史遗留示例数据等），归入「其他」让总数自洽
                 filesDir.listFiles()?.forEach { f ->
-                    val known = (f.isDirectory && (f.name == "downloads" || f.name.startsWith("comics_") || f.name in COVER_DIRS || f.name == "js_sources")) ||
+                    val known = (f.isDirectory && (f.name == "downloads" || f.name == "imports" || f.name in setOf("epub_images", "mobi_images", "fb2_images", "docx_images") || f.name.startsWith("comics_") || f.name in COVER_DIRS || f.name == "js_sources" || f.name == "manga_translate_models")) ||
                         (f.isFile && (f.name == "custom_font.ttf" || f.name == "novel_reader_backup.json" || f.name.startsWith("custom_poster_") || f.name.startsWith("custom_app_bg_")))
                     if (!known) other += dirSize(f)
                 }
+                dataDir.listFiles()?.forEach { f ->
+                    if (f.name !in setOf("files", "cache", "databases", "shared_prefs", "no_backup", "app_webview", "lib")) {
+                        other += dirSize(f)
+                    }
+                }
 
-                appTotal = cacheAll + downloadsSize + comicsSize + coversSize + personalSize + sourcesSize + other + webviewSize + appDataSize
+                appTotal = cacheAll + externalCacheSize + externalFilesSize + downloadsSize + importsSize + bookImagesSize + comicsSize + coversSize + personalSize + sourcesSize + trModelsSize + other + webviewSize + appDataSize
+                val scannedData = appTotal
+                val systemTotal = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) runCatching {
+                    val stats = context.getSystemService(StorageStatsManager::class.java)
+                        .queryStatsForPackage(StorageManager.UUID_DEFAULT, context.packageName, Process.myUserHandle())
+                    stats.appBytes + stats.dataBytes
+                }.getOrNull() else null
+                measuredBySystem = systemTotal != null && systemTotal >= scannedData
+                val installAndSystemSize = if (measuredBySystem) {
+                    systemTotal!! - scannedData
+                } else {
+                    (listOf(context.applicationInfo.sourceDir) + context.applicationInfo.splitSourceDirs.orEmpty())
+                        .distinct().sumOf { path -> dirSize(File(path)) }
+                }
+                appTotal += installAndSystemSize
                 runCatching { StatFs(filesDir.path) }.getOrNull()?.let {
                     free = it.availableBytes
                     deviceTotal = it.totalBytes
@@ -319,34 +377,47 @@ fun CacheManagementScreen(
 
                 rows += StorageRow("ehimg", "网页图片缓存", "在线书源图片，删除后浏览时自动重新加载", ehimgSize, 0, true)
                 rows += StorageRow("image_cache", "图片加载缓存", "封面与在线图片的通用缓存，自动重建", imageCacheSize, 0, true)
-                rows += StorageRow("temp", "临时文件", "导入解压、分享等临时数据；正在使用中的文件会自动保留", tempSize, 0, true)
-                // 漫画翻译（第十五轮）：译文缓存（可再生=重译即可）与离线模型（可重下）
+                rows += StorageRow("comic_image_cache", "漫画原图缓存", "在线漫画图片，删除后阅读时重新下载", comicImageSize, 0, true)
+                rows += StorageRow("comic_processed", "漫画增强缓存", "画质增强后的页面，删除后重新处理", comicProcessedSize, 0, true)
+                if (externalCacheSize > 0) {
+                    rows += StorageRow("external_cache", "外部缓存", "应用专用外部缓存，删除后按需重建", externalCacheSize, 0, true)
+                }
+                rows += StorageRow("temp", "其他临时文件", "导入、分享和模型副本；正在使用的文件会保留", tempSize, 0, true)
+                // 译文需要重新翻译、模型需要重新下载，因此归入按需管理
                 val trCacheSize = runCatching { com.example.mangatranslate.TranslationCache.totalBytes(context) }.getOrDefault(0L)
-                val trModelsSize = runCatching { com.example.mangatranslate.TranslateModelManager.totalBytes(context) }.getOrDefault(0L)
                 val trCacheCount = runCatching {
                     com.example.mangatranslate.TranslationCache.dir(context).listFiles()?.count { it.isFile } ?: 0
                 }.getOrDefault(0)
                 if (trCacheSize > 0) {
-                    rows += StorageRow("manga_tr_cache", "漫画译文缓存", "已翻译页面的译文，点击可逐页/批量清理", trCacheSize, 0, true,
-                        null, if (trCacheCount > 0) "共 $trCacheCount 页" else null)
+                    rows += StorageRow("manga_tr_cache", "漫画译文缓存", "已翻译页面；清理后需要重新翻译", trCacheSize, 1, true,
+                        "清理后再次阅读这些页面需要重新翻译。", if (trCacheCount > 0) "共 $trCacheCount 页" else null)
                 }
                 if (trModelsSize > 0) {
-                    rows += StorageRow("manga_tr_models", "漫画翻译模型", "离线 OCR 模型（约 31MB），删除后可在阅读设置里重新下载", trModelsSize, 0, true)
+                    rows += StorageRow("manga_tr_models", "漫画翻译模型", "离线模型；清理后需要重新下载", trModelsSize, 1, true,
+                        "清理后漫画翻译将不可用，直到重新下载模型。")
                 }
 
                 rows += StorageRow("downloads", "离线书籍", "下载的书籍原文件，属于你的离线内容", downloadsSize, 1, true,
-                    "书架中使用这些文件的书将无法打开；若书源失效，将无法重新下载。$activeDownloadTip",
-                    if (bookCount > 0) "共 $bookCount 本" else null)
+                    "书架记录仍保留，但删除原文件后无法重新解析；若书源失效，也无法重新下载。$activeDownloadTip",
+                    if (bookCount > 0) "共 $bookCount 个文件" else null)
+                rows += StorageRow("imports", "导入的原文件", "本地书籍源文件", importsSize, 1, true,
+                    "删除后可能无法重新解析或恢复书内图片；书架记录仍会保留。")
                 rows += StorageRow("comics", "离线漫画", "已下载的漫画页面与封面，属于你的离线内容", comicsSize, 1, true,
                     "已下载的漫画页会被删除，之后无法离线阅读。$activeComicTip",
-                    if (comicDirs.isNotEmpty()) "共 ${comicDirs.size} 部" else null)
+                    if (comicDirs.isNotEmpty()) "共 ${comicDirs.size} 个目录" else null)
                 rows += StorageRow("covers", "封面图片", "书籍与漫画的封面图，删除后无法自动恢复", coversSize, 1, true,
                     "书架封面将显示为空白，重新导入对应书籍后才能恢复。")
                 rows += StorageRow("webview", "网页浏览数据", "网页书源的浏览器数据，删除后需重新登录书源网站", webviewSize, 1, true,
                     "网页书源的登录状态与浏览数据将被清除，之后需要重新登录。")
                 rows += StorageRow("personalization", "个性化文件", "导入的字体、启动海报与软件背景，可在设置中更换", personalSize, 1, false)
+                rows += StorageRow("book_images", "书内插图", "本地书籍解析出的图片", bookImagesSize, 1, false)
+                if (externalFilesSize > 0) rows += StorageRow("external_files", "外部应用文件", "应用专用外部文件", externalFilesSize, 1, false)
                 rows += StorageRow("sources", "书源与备份", "已安装的书源脚本与设置备份", sourcesSize, 1, false)
                 rows += StorageRow("appdata", "书籍数据与设置", "书架、阅读进度与全部设置，不可在此清理", appDataSize, 2, false)
+                if (installAndSystemSize > 0) rows += StorageRow("install", "安装包与系统文件", "应用安装及系统编译文件", installAndSystemSize, 2, false)
+                if (other > 0) {
+                    rows += StorageRow("other", "其他应用数据", "运行代码缓存等内部文件，应用运行时不提供清理", other, 2, false)
+                }
             }
         } catch (e: CancellationException) {
             throw e
@@ -356,6 +427,7 @@ fun CacheManagementScreen(
             if (isActive) {
                 storageRows = rows
                 appTotalSize = appTotal
+                systemMeasured = measuredBySystem
                 otherSize = other
                 freeBytes = free
                 deviceTotalBytes = deviceTotal
@@ -372,8 +444,10 @@ fun CacheManagementScreen(
     detailRow?.let { row ->
         StorageDetailDialog(
             rowKey = row.key,
-            title = "${row.name} · 明细",
+            title = row.name,
             targets = targetsFor(row.key),
+            confirmTip = row.confirmTip,
+            allowDelete = row.deletable,
             onDismiss = { detailRow = null },
             onChanged = { scanTrigger++ },
         )
@@ -450,11 +524,12 @@ fun CacheManagementScreen(
                                     fontWeight = FontWeight.Bold,
                                     color = MaterialTheme.colorScheme.primary
                                 )
-                                Text("应用总占用", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(if (systemMeasured) "应用总占用 · 系统统计" else "已扫描占用 · 含安装包",
+                                    fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
 
                                 // 占比条：缓存 / 用户数据 / 书籍数据与设置（+ 其他杂项，让总数与分段自洽）
                                 val userTotal = storageRows.filter { it.zone == 1 }.sumOf { it.size }
-                                val appDataTotal = storageRows.filter { it.zone == 2 }.sumOf { it.size }
+                                val appDataTotal = storageRows.filter { it.zone == 2 && it.key != "other" }.sumOf { it.size }
                                 if (appTotalSize > 0) {
                                     Spacer(Modifier.height(16.dp))
                                     Row(
@@ -469,9 +544,9 @@ fun CacheManagementScreen(
                                 Spacer(Modifier.height(12.dp))
                                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                     val legend = buildList {
-                                        add(Triple("缓存（可清理）", cacheTotal, Color(0xFF00B894)))
-                                        add(Triple("用户数据", userTotal, Color(0xFFE17055)))
-                                        add(Triple("书籍数据与设置", appDataTotal, Color(0xFF74B9FF)))
+                                        add(Triple("可直接清理", cacheTotal, Color(0xFF00B894)))
+                                        add(Triple("按需管理与离线内容", userTotal, Color(0xFFE17055)))
+                                        add(Triple("应用数据与设置", appDataTotal, Color(0xFF74B9FF)))
                                         if (otherSize > 0) add(Triple("其他", otherSize, Color(0xFF90A4AE)))
                                     }
                                     legend.forEach { (label, size, color) ->
@@ -523,28 +598,21 @@ fun CacheManagementScreen(
                             Text("正在清理…", fontWeight = FontWeight.SemiBold)
                         } else {
                             Text(
-                                if (cacheTotal > 0) "一键清理缓存 · ${formatSize(cacheTotal)}" else "一键清理缓存",
+                                if (cacheTotal > 0) "清理可再生缓存 · 约 ${formatSize(cacheTotal)}" else "清理可再生缓存",
                                 fontWeight = FontWeight.SemiBold
                             )
                         }
                     }
                 }
 
-                // 三个分区：缓存（放心清）→ 用户数据（确认后删）→ 书籍数据与设置（只读）；空区整段隐藏
-                val zoneMeta = listOf(
-                    Triple(0, "缓存", "可放心清理：删除后会自动重建；正在分享或导入中的文件会保留"),
-                    Triple(1, "用户数据", "重要内容，删除需确认且无法恢复；不会被「一键清理缓存」删除"),
-                    Triple(2, "书籍数据与设置", "应用核心数据，仅作统计展示")
-                )
-                zoneMeta.forEach { (zone, title, caption) ->
+                // 三个分区：可再生缓存 → 按需管理与离线内容 → 核心数据；空区整段隐藏
+                val zoneMeta = listOf(0 to "可清理缓存", 1 to "离线内容与个人文件", 2 to "应用与设置")
+                zoneMeta.forEach { (zone, title) ->
                     val zoneRows = storageRows.filter { it.zone == zone && it.size > 0 }
                     if (zoneRows.isNotEmpty()) {
                         item(key = "zone_header_$zone") {
-                            Column(Modifier.padding(top = 2.dp)) {
-                                Text(title, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
-                                Spacer(Modifier.height(2.dp))
-                                Text(caption, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
+                            Text(title, modifier = Modifier.padding(top = 2.dp), fontSize = 14.sp,
+                                fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
                         }
                         items(zoneRows, key = { it.key }) { row ->
                             Surface(
@@ -560,7 +628,7 @@ fun CacheManagementScreen(
                                         )
                                     )
                                     .then(
-                                        if (row.deletable) Modifier.clickable { detailRow = row }
+                                        if (targetsFor(row.key).isNotEmpty()) Modifier.clickable { detailRow = row }
                                         else Modifier
                                     )
                             ) {
@@ -570,10 +638,12 @@ fun CacheManagementScreen(
                                 ) {
                                     Column(Modifier.weight(1f)) {
                                         Text(
-                                            if (row.deletable) "${row.name}（点击管理明细）" else row.name,
+                                            row.name,
                                             fontWeight = FontWeight.SemiBold, fontSize = 15.sp
                                         )
-                                        Text(row.desc, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        Text(row.desc, fontSize = 12.sp, maxLines = 1,
+                                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     }
                                     Text(
                                         formatSize(row.size), fontSize = 14.sp, fontWeight = FontWeight.Medium,
@@ -582,7 +652,11 @@ fun CacheManagementScreen(
                                     if (row.deletable) {
                                         Spacer(Modifier.width(12.dp))
                                         AppIconButton(
-                                            onClick = { if (row.confirmTip != null) confirmRow = row else clearRow(row.key) },
+                                            onClick = {
+                                                if (row.key in setOf("downloads", "imports", "comics", "covers")) detailRow = row
+                                                else if (row.confirmTip != null) confirmRow = row
+                                                else clearRow(row.key)
+                                            },
                                             enabled = !isScanning && !isClearing
                                         ) {
                                             Icon(

@@ -30,6 +30,8 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.*
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -78,6 +80,8 @@ fun PageTurnContainer(
     onClickRight: () -> Unit,
     isBookmarked: Boolean = false,
     onToggleBookmark: (() -> Unit)? = null,
+    // 点击位置命中正文插图时回调（返回 true=已打开全屏，宿主跳过翻页分派）
+    onImageTapAt: ((androidx.compose.ui.geometry.Offset) -> Boolean)? = null,
     pageKey: Any = Unit,
     /** 中间区域长按 1s：触发串珠快速翻页（PageScrubberOverlay）。 */
     onLongPressCenter: (() -> Unit)? = null,
@@ -112,6 +116,9 @@ fun PageTurnContainer(
     val latestOnToggleBookmark by rememberUpdatedState(onToggleBookmark)
     val latestOnLongPressCenter by rememberUpdatedState(onLongPressCenter)
     val latestMenuVisible by rememberUpdatedState(menuVisible)
+    // 插图命中（按屏幕位置）：返回 true 表示已打开全屏，宿主跳过翻页分派
+    val latestOnImageTapAt by rememberUpdatedState(onImageTapAt)
+    var containerOffsetInWindow by remember { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
 
     // Reset offsets when pageKey changes (page turned)
     LaunchedEffect(pageKey) {
@@ -126,6 +133,7 @@ fun PageTurnContainer(
         modifier = modifier
             .fillMaxSize()
             .clipToBounds()
+            .onGloballyPositioned { containerOffsetInWindow = it.positionInWindow() }
             .pointerInput(pageTurnMode) {
                 // 滚动阅读模式：手势完全交给阅读器自身的滚动容器处理，
                 // 这里不再拦截点击/拖拽，避免“下滑误触菜单/误切章节”。
@@ -145,6 +153,7 @@ fun PageTurnContainer(
                     var isDrag = false
                     var activeMode = 0 // 0: uncommitted, 1: horizontal page turn, 2: pull-down bookmark
                     var longPressFired = false
+                    var tapConsumedByChild = false
 
                     val touchSlop = viewConfiguration.touchSlop
                     val screenWidth = size.width.toFloat()
@@ -182,6 +191,9 @@ fun PageTurnContainer(
                         lastUptime = maxOf(lastUptime, event.changes.maxOf { it.uptimeMillis })
                         val currentChange = event.changes.firstOrNull { it.id == down.id } ?: break
                         if (!currentChange.pressed) {
+                            // up 已被子层（正文内嵌图片的 clickable 等）消费：
+                            // 该次触摸属于内容交互（如打开图片全屏），不再分派翻页/菜单
+                            tapConsumedByChild = currentChange.isConsumed
                             break
                         }
 
@@ -263,6 +275,13 @@ fun PageTurnContainer(
                             }
                         }
                     } else if (!latestMenuVisible && !longPressFired) {
+                        // 插图命中优先（按屏幕矩形注册表，不依赖事件消费——
+                        // 与事件 pass 顺序无关，翻页引擎无关）：命中即打开全屏
+                        val imageHandled = latestOnImageTapAt
+                            ?.invoke(down.position + containerOffsetInWindow) == true
+                        if (imageHandled || tapConsumedByChild) {
+                            // 命中插图 / 子层已消费：不分派翻页
+                        } else {
                         val tapX = down.position.x
                         val leftZone = screenWidth * 0.35f
                         val rightZone = screenWidth * 0.65f
@@ -312,6 +331,7 @@ fun PageTurnContainer(
                                 }
                             }
                             else -> latestOnClickCenter()
+                        }
                         }
                     }
                 }

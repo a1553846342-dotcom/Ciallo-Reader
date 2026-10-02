@@ -1,6 +1,9 @@
 package com.example.source.anilist
 
 import kotlinx.coroutines.Dispatchers
+import com.example.source.executeCancellable
+import com.example.data.readImportBytes
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -28,7 +31,7 @@ class AniListClient(
         const val ENDPOINT = "https://graphql.anilist.co"
         const val PER_PAGE = 50
 
-        fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
+        fun defaultClient(): OkHttpClient = com.example.source.SharedHttpTransport.builder()
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
             .build()
@@ -87,9 +90,9 @@ class AniListClient(
                     .post(body.toRequestBody(JSON))
                     .header("Accept", "application/json")
                     .build()
-                client.newCall(request).execute().use { response ->
+                client.newCall(request).executeCancellable().use { response ->
                     if (!response.isSuccessful) return@runCatching null
-                    val text = response.body?.string() ?: return@runCatching null
+                    val text = response.body?.byteStream()?.use { it.readImportBytes(2*1024*1024).toString(Charsets.UTF_8) } ?: return@runCatching null
                     val page = JSONObject(text)
                         .optJSONObject("data")
                         ?.optJSONObject("Page")
@@ -121,6 +124,6 @@ class AniListClient(
                     }
                     AniListSyncPage(media = media, hasMore = hasMore)
                 }
-            }.getOrNull()
+            }.getOrElse { kotlinx.coroutines.currentCoroutineContext().ensureActive(); null }
         }
 }

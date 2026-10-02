@@ -4,6 +4,7 @@ import android.content.Context
 import com.example.source.zlibrary.network.ZLibraryDns
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import com.example.source.executeCancellable
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.net.URLEncoder
@@ -38,8 +39,9 @@ data class EndpointHealthResult(
 class EndpointHealthChecker(private val context: Context) {
     private val credentialStorage = ZLibraryCredentialStorage(context)
     private val cookieJar = EncryptedCookieJar(credentialStorage)
-    private val httpClient = OkHttpClient.Builder()
+    private val httpClient = com.example.source.SharedHttpTransport.builder()
         .dns(ZLibraryDns.INSTANCE)
+        .callTimeout(12, TimeUnit.SECONDS)
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(10, TimeUnit.SECONDS)
         .writeTimeout(10, TimeUnit.SECONDS)
@@ -85,11 +87,10 @@ class EndpointHealthChecker(private val context: Context) {
             // Step 1: 首页（DiamWallInterceptor 会先解 c_token PoW 再返回最终响应）
             val homeUrl = "https://$domain/"
             val homeRequest = Request.Builder().url(homeUrl).get().build()
-            val homeResponse = httpClient.newCall(homeRequest).execute()
-            tlsOk = true
-            val homeCode = homeResponse.code
-            val homeBody = homeResponse.peekBody(1024 * 1024).string()
-            homeResponse.close()
+            val (homeCode,homeBody)=httpClient.newCall(homeRequest).executeCancellable().use { response ->
+                tlsOk=true
+                response.code to response.peekBody(1024 * 1024).string()
+            }
             httpCode = homeCode
 
             val isCloudflareBlocked = homeCode == 403 || homeCode == 503 || homeCode == 517 || homeCode == 513 ||
@@ -137,18 +138,17 @@ class EndpointHealthChecker(private val context: Context) {
 
             // Step 3: eapi JSON 层探针（登录/书单/下载依赖）
             var eapiOk = false
-            runCatching {
+            try {
                 val eapiRequest = Request.Builder()
                     .url("https://$domain/eapi/info")
                     .header("Referer", homeUrl)
                     .get()
                     .build()
-                val eapiResponse = httpClient.newCall(eapiRequest).execute()
-                val eapiBody = eapiResponse.peekBody(512 * 1024).string()
-                eapiOk = eapiResponse.code == 200 &&
-                    eapiBody.contains("\"success\":1", ignoreCase = true)
-                eapiResponse.close()
-            }
+                httpClient.newCall(eapiRequest).executeCancellable().use { response ->
+                    val body=response.peekBody(512*1024).string()
+                    eapiOk=response.code==200 && body.contains("\"success\":1",ignoreCase=true)
+                }
+            } catch(e:Exception) { if(e is kotlinx.coroutines.CancellationException) throw e }
 
             // Step 4: 搜索服务探针（官网搜索故障时节点仍可达，只是搜索不可用）。
             // 双重校验（修复"搜索出40本"假通过）：入口跳转域（zh.101z.by 等）会把
@@ -158,13 +158,13 @@ class EndpointHealthChecker(private val context: Context) {
             val encodedKw = URLEncoder.encode("三体", "UTF-8").replace("+", "%20")
             var searchAvailable = false
             var searchDetail = ""
-            runCatching {
+            try {
                 val searchRequest = Request.Builder()
                     .url("https://$domain/s/$encodedKw")
                     .header("Referer", homeUrl)
                     .get()
                     .build()
-                val searchResponse = httpClient.newCall(searchRequest).execute()
+                httpClient.newCall(searchRequest).executeCancellable().use { searchResponse ->
                 val searchHtml = searchResponse.peekBody(1024 * 1024).string()
                 val finalPath = searchResponse.request.url.encodedPath
                 val stayedOnSearchPath = finalPath.startsWith("/s/")
@@ -180,8 +180,8 @@ class EndpointHealthChecker(private val context: Context) {
                     !keywordRelevant -> "搜索结果与关键词无关（疑似主页充数）"
                     else -> ""
                 }
-                searchResponse.close()
-            }
+                }
+            } catch(e:Exception) { if(e is kotlinx.coroutines.CancellationException) throw e }
 
             val rtt = System.currentTimeMillis() - startTime
             return@withContext EndpointHealthResult(
@@ -202,6 +202,7 @@ class EndpointHealthChecker(private val context: Context) {
             )
 
         } catch (e: Exception) {
+            if(e is kotlinx.coroutines.CancellationException) throw e
             val rtt = System.currentTimeMillis() - startTime
             val errMessage = e.message ?: "网络超时"
             val isTlsError = errMessage.contains("SSL") || errMessage.contains("TLS") || errMessage.contains("Certificate")

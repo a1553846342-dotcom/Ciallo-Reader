@@ -74,7 +74,6 @@ import androidx.compose.material3.TopAppBarScrollBehavior
 import androidx.compose.material3.rememberTopAppBarState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -118,6 +117,7 @@ import com.example.source.SourceResult
 import com.example.source.SourceViewModel
 import com.example.source.importer.SourceImporter
 import com.example.source.isNovelSource
+import com.example.source.isComicSource
 import com.example.source.zlibrary.ZLibrarySource
 import com.example.ui.components.AcrylicDialog
 import com.example.ui.components.AppIconButton
@@ -138,6 +138,8 @@ import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.haze
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.ui.components.AppToast
 
 /* ══════════════════════════════════════════════════════════════════════════
  * 书源管理 · 设计令牌（2026-09-24 重排版）
@@ -267,10 +269,10 @@ fun SourceManagementScreen(
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
-    val allSources by viewModel.allSources.collectAsState()
-    val activeSource by viewModel.activeSource.collectAsState()
-    val enabledStates by viewModel.enabledStates.collectAsState()
-    val importStatus by viewModel.importStatus.collectAsState()
+    val allSources by viewModel.allSources.collectAsStateWithLifecycle()
+    val activeSource by viewModel.activeSource.collectAsStateWithLifecycle()
+    val enabledStates by viewModel.enabledStates.collectAsStateWithLifecycle()
+    val importStatus by viewModel.importStatus.collectAsStateWithLifecycle()
 
     var showPasteDialog by remember { mutableStateOf(false) }
     var showNetworkDialog by remember { mutableStateOf(false) }
@@ -317,6 +319,8 @@ fun SourceManagementScreen(
     }
 
     val snackbarHostState = remember { SnackbarHostState() }
+    // 登记为全局提示宿主（本页 Toast 已迁移到 AppToast；宿主离开组合时自动解绑回退到系统 Toast）
+    com.example.ui.components.BindAppToastHost(snackbarHostState)
 
     LaunchedEffect(importStatus) {
         importStatus?.let {
@@ -326,7 +330,7 @@ fun SourceManagementScreen(
                     duration = SnackbarDuration.Short
                 )
             } else {
-                Toast.makeText(context, it, Toast.LENGTH_SHORT).show()
+                AppToast.makeText(context, it, Toast.LENGTH_SHORT).show()
             }
             viewModel.clearImportStatus()
         }
@@ -342,9 +346,11 @@ fun SourceManagementScreen(
     val groups: List<SourceGroup> = remember(builtinSources, customSources) {
         buildList {
             val novels = builtinSources.filter { it.isNovelSource }
-            val comics = builtinSources.filterNot { it.isNovelSource }
+            val comics = builtinSources.filter { it.isComicSource }
+            val others = builtinSources.filter { !it.isNovelSource && !it.isComicSource }
             if (novels.isNotEmpty()) add(SourceGroup("小说", SourceGroupKind.NOVEL, novels))
             if (comics.isNotEmpty()) add(SourceGroup("漫画", SourceGroupKind.COMIC, comics))
+            if (others.isNotEmpty()) add(SourceGroup("其他", SourceGroupKind.OTHER, others))
             if (customSources.isNotEmpty()) {
                 add(SourceGroup("自定义", SourceGroupKind.CUSTOM, customSources))
             }
@@ -390,10 +396,24 @@ fun SourceManagementScreen(
                 containerColor = Color.Transparent,
                 snackbarHost = {
                     SnackbarHost(hostState = snackbarHostState) { data ->
-                        com.example.ui.components.AppErrorSnackbar(
-                            message = data.visuals.message,
-                            onDismissClick = { data.dismiss() }
-                        )
+                        // 按语义挑皮肤（与主页 SnackbarHost 同一规则）：本页 Toast 迁过来后，
+                        // 中性提示不能再一律套红色「操作出错」卡。
+                        val kind = (data.visuals as? com.example.ui.components.AppSnackbarVisuals)
+                            ?.kind ?: com.example.ui.components.AppSnackKind.ERROR
+                        when (kind) {
+                            com.example.ui.components.AppSnackKind.ERROR ->
+                                com.example.ui.components.AppErrorSnackbar(
+                                    message = data.visuals.message,
+                                    onDismissClick = { data.dismiss() }
+                                )
+                            com.example.ui.components.AppSnackKind.TOAST ->
+                                com.example.ui.components.AppToastSnackbar(
+                                    message = data.visuals.message,
+                                    actionLabel = data.visuals.actionLabel,
+                                    onActionClick = { data.performAction() },
+                                    onDismissClick = { data.dismiss() }
+                                )
+                        }
                     }
                 },
                 topBar = {
@@ -472,7 +492,9 @@ fun SourceManagementScreen(
                                     if (enabled) viewModel.enableSource(source.id)
                                     else viewModel.disableSource(source.id)
                                 },
-                                onOpenLogin = { source -> loginSource = source },
+                                onOpenLogin = { source ->
+                                    loginSource = source
+                                },
                                 onOpenNodeManager = { showNodeManagement = true },
                                 onDelete = { source -> viewModel.removeSource(source.id) }
                             )
@@ -518,7 +540,7 @@ fun SourceManagementScreen(
                     text = "复制全部",
                     onClick = {
                         clipboard.setText(AnnotatedString(debugLogText))
-                        Toast.makeText(context, "日志已复制到剪贴板", Toast.LENGTH_SHORT).show()
+                        AppToast.makeText(context, "日志已复制到剪贴板", Toast.LENGTH_SHORT).show()
                     }
                 )
             },
@@ -711,7 +733,17 @@ fun SourceManagementScreen(
         ZLibraryLoginDialog(
             source = src,
             onDismiss = { loginSource = null },
-            onSuccess = { loginSource = null }
+            onSuccess = { loginSource = null },
+            // vomic 支持站内注册：登录窗口下方出现「注册新账号」（弹窗链驱动）
+            onRegister = if (src.id == "js_vomic") {
+                {
+                    val result = (src as? com.example.source.js.JsComicSource)?.register()
+                        ?: throw IllegalStateException("源不可用")
+                    if (result is com.example.source.SourceResult.Error) {
+                        throw Exception(result.exception.message ?: "注册失败")
+                    }
+                }
+            } else null
         )
     }
 }
@@ -1065,7 +1097,7 @@ private fun BreathingDot(modifier: Modifier = Modifier) {
  * ⑤ B / C 分组卡（结构完全一致）
  * ══════════════════════════════════════════════════════════════════════════ */
 
-private enum class SourceGroupKind { NOVEL, COMIC, CUSTOM }
+private enum class SourceGroupKind { NOVEL, COMIC, CUSTOM, OTHER }
 
 private class SourceGroup(
     val title: String,
@@ -1332,6 +1364,8 @@ private fun SourceRow(
     onDelete: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    var showSourceInfo by remember(source.id) { mutableStateOf(false) }
+    if (showSourceInfo) SourceInfoDialog(source = source, enabled = isEnabled, onDismiss = { showSourceInfo = false })
     Row(
         modifier = modifier
             .fillMaxWidth()
@@ -1380,6 +1414,12 @@ private fun SourceRow(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
+            if (source.isComicSource) {
+                TextButton(onClick = { showSourceInfo = true }, contentPadding = PaddingValues(0.dp),
+                    modifier = Modifier.heightIn(min = 28.dp)) {
+                    Text("漫画源 · 查看资料", style = SourceIdStyle.copy(color = MaterialTheme.colorScheme.primary))
+                }
+            }
         }
 
         Spacer(modifier = Modifier.width(8.dp))

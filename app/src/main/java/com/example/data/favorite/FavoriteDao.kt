@@ -165,4 +165,78 @@ interface FavoriteDao {
             upsertChapterStates(states.map { it.copy(sourceId = toSourceId, comicId = toComicId) })
         }
     }
+    @Query("DELETE FROM comic_chapter_read WHERE sourceId=:source AND comicId=:comic AND chapterId IN (:ids)")
+    suspend fun deleteChapterIds(source:String,comic:String,ids:List<String>)
+
+    @Transaction
+    suspend fun reconcileChapterIds(source:String,comic:String,states:List<ChapterReadEntity>,progress:ComicProgressEntity?,oldIds:List<String>) {
+        if(oldIds.isNotEmpty()) deleteChapterIds(source,comic,oldIds)
+        if(states.isNotEmpty()) upsertChapterStates(states)
+        if(progress!=null) upsertProgress(progress)
+    }
+
+    @Transaction
+    suspend fun migrateResolved(from:ComicKey,to:ComicKey,states:List<ChapterReadEntity>,progress:ComicProgressEntity?,favorite:FavoriteEntity?,clearOld:Boolean) {
+        if(states.isNotEmpty()) upsertChapterStates(states)
+        if(progress!=null) upsertProgress(progress)
+        if(favorite!=null) insertFavorite(favorite)
+        if(clearOld) {
+            clearChapterStates(from.sourceId,from.comicId)
+            deleteProgress(from.sourceId,from.comicId)
+            deleteFavorite(from.sourceId,from.comicId)
+        }
+    }
+
+    /** Replace the favorite atomically. Keep old reading records as a fallback for missing chapters. */
+    @Transaction
+    suspend fun replaceFavoriteMapped(
+        from: ComicKey,
+        replacement: FavoriteEntity,
+        mapping: Map<String, String>,
+        chapterOrders: Map<String, Int>,
+        latestId: String?,
+    ): FavoriteMigrationReport {
+        val oldFavorite = favorite(from.sourceId, from.comicId)
+            ?: throw IllegalStateException("旧收藏已移除，请重新选择")
+        val targetStates = chapterStatesSync(replacement.sourceId, replacement.comicId).associateBy { it.chapterId }
+        val oldStates = chapterStatesSync(from.sourceId, from.comicId)
+            .filter { it.status != ChapterReadState.UNREAD.code || it.bookmarked }
+        val mapped = oldStates.mapNotNull { state -> mapping[state.chapterId]?.let { chapterId ->
+            val existing = targetStates[chapterId]
+            val transferred = state.copy(
+                sourceId = replacement.sourceId, comicId = replacement.comicId,
+                chapterId = chapterId, chapterIndex = chapterOrders[chapterId] ?: -1,
+                // Different editions have different page counts. Resume at this episode's first page.
+                pageIndex = 0, pageCount = 0,
+                bookmarked = state.bookmarked || existing?.bookmarked == true,
+            )
+            if (existing != null && (existing.status > state.status ||
+                    (existing.status == state.status && existing.updatedAt >= state.updatedAt))) {
+                existing.copy(bookmarked = transferred.bookmarked)
+            } else transferred
+        } }
+        val oldProgress = progress(from.sourceId, from.comicId)
+        val resumeId = oldProgress?.lastChapterId?.let(mapping::get)
+        val targetProgress = progress(replacement.sourceId, replacement.comicId)
+        if (resumeId != null && oldProgress != null &&
+            (targetProgress?.lastChapterId == null || targetProgress.lastReadAt < oldProgress.lastReadAt)) {
+            upsertProgress(oldProgress.copy(
+                sourceId = replacement.sourceId, comicId = replacement.comicId,
+                lastChapterId = resumeId, lastChapterIndex = chapterOrders[resumeId] ?: -1,
+                lastPageIndex = 0, lastPageCount = 0,
+                seenTopChapterId = latestId, seenChapterCount = chapterOrders.size,
+            ))
+        }
+        if (mapped.isNotEmpty()) upsertChapterStates(mapped)
+        val targetFavorite = favorite(replacement.sourceId, replacement.comicId)
+        insertFavorite(replacement.copy(
+            categoryName = targetFavorite?.categoryName ?: oldFavorite.categoryName,
+            favoritedAt = targetFavorite?.favoritedAt ?: oldFavorite.favoritedAt,
+            sortOrder = targetFavorite?.sortOrder ?: oldFavorite.sortOrder,
+        ))
+        deleteFavorite(from.sourceId, from.comicId)
+        return FavoriteMigrationReport(mapped.size, oldStates.size - mapped.size,
+            oldProgress?.lastChapterId == null || resumeId != null)
+    }
+
 }

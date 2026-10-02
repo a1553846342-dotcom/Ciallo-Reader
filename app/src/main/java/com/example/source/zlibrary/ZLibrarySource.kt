@@ -29,6 +29,7 @@ class ZLibrarySource(
 
     override val id: String = "zlibrary"
     override val name: String = "Z-Library"
+    override suspend fun getRegistrationUrl(): String = "https://${ZLibraryNodeConfig.domain}/registration"
     override val capabilities: SourceCapabilities = SourceCapabilities(
         supportSearch = true,
         supportDownload = true,
@@ -438,6 +439,8 @@ class ZLibrarySource(
 
             val parsed = ZLibraryParserManager.parseDetailPage(html, "https://${response.request.url.host}")
 
+            val novelInfo = com.example.library.zLibraryNovelMetadata(html)
+
             val sourceBook = SearchBook(
                 id = bookId,
                 sourceId = id,
@@ -445,6 +448,8 @@ class ZLibrarySource(
                 author = parsed.author,
                 cover = parsed.cover,
                 format = parsed.format,
+                description = novelInfo.synopsis,
+                novelInfo = novelInfo,
                 downloadUrl = parsed.downloadUrl
             )
             // 新版详情页可能解析不到 /dl/ 链接：用 eapi 书信息的 dl 字段补全
@@ -455,9 +460,11 @@ class ZLibrarySource(
                         eapiClient.getBookInfo(key.first, key.second, domain)
                     }
                 }.getOrNull()
-                if (eapiBook != null) {
-                    return SourceResult.Success(eapiBook)
-                }
+                  if (eapiBook != null) {
+                      return SourceResult.Success(eapiBook.copy(
+                          description = eapiBook.description ?: sourceBook.description,
+                          novelInfo = eapiBook.novelInfo ?: sourceBook.novelInfo))
+                  }
             }
             SourceResult.Success(sourceBook)
         } catch (e: SourceException) {
@@ -709,7 +716,9 @@ class ZLibrarySource(
         runCatching {
             val cm = android.webkit.CookieManager.getInstance()
             cm.setAcceptCookie(true)
-            cm.setCookie("https://$domain/", cookies)
+            cookies.split(';').forEach { cookie ->
+                if(cookie.contains('=')) cm.setCookie("https://$domain/", cookie.trim()+"; Path=/; Secure")
+            }
             cm.flush()
         }
     }

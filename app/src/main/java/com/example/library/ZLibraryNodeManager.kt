@@ -179,7 +179,7 @@ object ZLibraryNodeManager {
      *  实时节点来源。 */
     suspend fun scrapeNodes(context: Context): List<String> = withContext(Dispatchers.IO) {
         try {
-            val client = OkHttpClient.Builder()
+            val client = com.example.source.SharedHttpTransport.builder()
                 .dns(ZLibraryDns.INSTANCE)
                 .connectTimeout(10, TimeUnit.SECONDS)
                 .readTimeout(10, TimeUnit.SECONDS)

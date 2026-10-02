@@ -1,5 +1,6 @@
 package com.example.source.impl
 
+import com.example.data.readImportBytes
 import com.example.source.*
 import com.example.source.parser.JsonPathResolver
 import com.example.source.parser.LegadoRule
@@ -37,15 +38,27 @@ class JsonBookSource(
 ) : ComicSource {
 
     /** 搜索结果缓存：让 getDownloadInfo 直接复用列表里的下载链接/标题，避免必须配置 detail。 */
-    private val searchItemCache = mutableMapOf<String, SearchBook>()
-    private val searchRawCache = mutableMapOf<String, JSONObject>()
-    private val requestClient: OkHttpClient =
-        if (config.insecureTls) createInsecureClient() else client
+    private val searchItemCache = java.util.concurrent.ConcurrentHashMap<String, SearchBook>()
+    private val searchRawCache = java.util.concurrent.ConcurrentHashMap<String, JSONObject>()
+    private val configuredHost=runCatching { java.net.URI(config.baseUrl.ifBlank { config.search.url }).host?.lowercase() }.getOrNull()
+    private val requestClient: OkHttpClient = (if (config.insecureTls) createInsecureClient() else client).newBuilder()
+        .dns(object : okhttp3.Dns {
+            override fun lookup(hostname: String): List<java.net.InetAddress> = client.dns.lookup(hostname).also { addresses ->
+                addresses.forEach { com.example.source.SourceNetworkPolicy.checkAddress(hostname,it,configuredHost) }
+            }
+        })
+        .addNetworkInterceptor { chain ->
+            val request=chain.request()
+            com.example.source.SourceNetworkPolicy.check(request.url,configuredHost)
+            if(config.insecureTls && (request.header("Authorization")!=null || request.header("Cookie")!=null))
+                throw java.io.IOException("不安全 TLS 书源不能发送登录凭据，请启用证书验证")
+            chain.proceed(request)
+        }.build()
 
     companion object {
         private const val DEFAULT_UA =
             "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.5359.128 Mobile Safari/537.36"
-        private val defaultClient = OkHttpClient.Builder()
+        private val defaultClient = com.example.source.SharedHttpTransport.builder()
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(15, TimeUnit.SECONDS)
             .build()
@@ -58,7 +71,7 @@ class JsonBookSource(
             })
             val sslContext = SSLContext.getInstance("TLS")
             sslContext.init(null, trustAll, SecureRandom())
-            return OkHttpClient.Builder()
+            return com.example.source.SharedHttpTransport.builder()
                 .connectTimeout(15, TimeUnit.SECONDS)
                 .readTimeout(15, TimeUnit.SECONDS)
                 .sslSocketFactory(sslContext.socketFactory, trustAll[0])
@@ -103,6 +116,7 @@ class JsonBookSource(
     override suspend fun search(keyword: String): SourceResult<List<SearchBook>> {
         return withContext(Dispatchers.IO) {
             try {
+                if(searchItemCache.size>1000) { searchItemCache.clear(); searchRawCache.clear() }
                 if (config.htmlSearch != null) {
                     return@withContext searchHtml(keyword)
                 }
@@ -120,14 +134,15 @@ class JsonBookSource(
                 config.search.headers.forEach { (k, v) -> requestBuilder.header(k, v) }
                 val request = buildRequest(requestBuilder, config.search.method, config.search.body, encodedKeyword)
 
-                val response = requestClient.newCall(request).execute()
+                val response = requestClient.newCall(request).executeCancellable()
                 if (!response.isSuccessful) {
+                    response.close()
                     return@withContext SourceResult.Error(
                         SourceException.NetworkError("HTTP error status code: ${response.code}")
                     )
                 }
 
-                val bodyStr = response.body?.string() ?: ""
+                val bodyStr = response.body?.byteStream()?.use { it.readImportBytes(2*1024*1024).toString(Charsets.UTF_8) } ?: ""
                 val jsonItems = JsonPathResolver.resolveArray(bodyStr, config.search.listPath)
 
                 jsonItems.forEach { jsonObj ->
@@ -147,6 +162,7 @@ class JsonBookSource(
             } catch (e: JSONException) {
                 SourceResult.Error(SourceException.ParseError("JSON解析异常: ${e.message}"))
             } catch (e: Exception) {
+                if(e is kotlinx.coroutines.CancellationException) throw e
                 SourceResult.Error(SourceException.Unknown("未知错误: ${e.message}", e))
             }
         }
@@ -393,7 +409,7 @@ class JsonBookSource(
         return LegadoRule.evalFirst(root, r)
     }
 
-    private fun fetchHtml(url: String, method: String = "GET", body: String? = null): String {
+    private suspend fun fetchHtml(url: String, method: String = "GET", body: String? = null): String {
         val builder = Request.Builder().url(url)
         val headers = config.search.headers
         if (headers.keys.none { it.equals("User-Agent", ignoreCase = true) }) {
@@ -413,23 +429,24 @@ class JsonBookSource(
         } else {
             builder.get()
         }
-        SourceLog.log(name, "请求 $method ${url.take(120)}" + (body?.let { " body=${it.take(80)}" } ?: ""))
-        val response = requestClient.newCall(builder.build()).execute()
+        SourceLog.log(name, "请求 $method ${url.take(120)}")
+        return requestClient.newCall(builder.build()).executeCancellable().use { response ->
         if (!response.isSuccessful) {
             SourceLog.log(name, "HTTP ${response.code} ← $method ${url.take(120)}")
             throw SourceException.NetworkError("HTTP ${response.code} @ ${url.take(160)}")
         }
         SourceLog.log(name, "HTTP ${response.code} OK ← $method ${url.take(120)}")
         val charset = config.htmlSearch?.charset?.ifBlank { null }
-        return if (charset != null) {
-            val bytes = response.body?.bytes() ?: return ""
+        if (charset != null) {
+            val bytes = response.body?.byteStream()?.use { it.readImportBytes(2*1024*1024) } ?: return ""
             try {
                 String(bytes, Charset.forName(charset))
             } catch (e: Exception) {
                 String(bytes, Charsets.UTF_8)
             }
         } else {
-            response.body?.string() ?: ""
+            response.body?.byteStream()?.use { it.readImportBytes(2*1024*1024).toString(Charsets.UTF_8) } ?: ""
+        }
         }
     }
 
@@ -481,14 +498,15 @@ class JsonBookSource(
                 detailRule.headers.forEach { (k, v) -> requestBuilder.header(k, v) }
                 val request = buildRequest(requestBuilder, detailRule.method, detailRule.body, encodedId)
 
-                val response = requestClient.newCall(request).execute()
+                val response = requestClient.newCall(request).executeCancellable()
                 if (!response.isSuccessful) {
+                    response.close()
                     return@withContext SourceResult.Error(
                         SourceException.NetworkError("HTTP error status code: ${response.code}")
                     )
                 }
 
-                val bodyStr = response.body?.string() ?: ""
+                val bodyStr = response.body?.byteStream()?.use { it.readImportBytes(2*1024*1024).toString(Charsets.UTF_8) } ?: ""
                 val jsonObj = try {
                     JSONObject(bodyStr)
                 } catch (e: Exception) {
@@ -506,6 +524,7 @@ class JsonBookSource(
             } catch (e: JSONException) {
                 SourceResult.Error(SourceException.ParseError("JSON解析异常: ${e.message}"))
             } catch (e: Exception) {
+                if(e is kotlinx.coroutines.CancellationException) throw e
                 SourceResult.Error(SourceException.Unknown("未知错误: ${e.message}", e))
             }
         }

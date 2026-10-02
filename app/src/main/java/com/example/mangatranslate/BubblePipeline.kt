@@ -100,6 +100,7 @@ object BubblePipeline {
     private const val TEXT_SIZE_PRECISION_PX = 0.25f
 
     fun bake(base: Bitmap, regions: List<Pair<Region, String>>, textScale: Float): Bitmap {
+        PageMemoryBudget.check(base)
         val out = base.copy(Bitmap.Config.ARGB_8888, true)
         // 背景采样用未污染快照（重叠气泡不采样到先前填充）
         val sampling = base.copy(Bitmap.Config.ARGB_8888, false)

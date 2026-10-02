@@ -64,7 +64,7 @@ class ComicUpgrade28Test {
         val n = 10
         // LTR 前进 = harism 索引 +1；RTL 前进 = harism 索引 -1（拖左页右翻）
         assertTrue(harismIndexFor(3, n, false) < harismIndexFor(4, n, false))
-        assertTrue(harismIndexFor(4, n, true) < harismIndexFor(3, n, true))
+        assertTrue(harismIndexFor(4, n, true) > harismIndexFor(3, n, true))
         // 双页 displaySlots：RTL 时首读页在右（slots 反转），LTR 在左
         val cfgRtl = ComicReaderConfig(mode = ComicMode.DOUBLE, direction = ComicDirection.RTL)
         val cfgLtr = ComicReaderConfig(mode = ComicMode.DOUBLE, direction = ComicDirection.LTR)
@@ -116,8 +116,9 @@ class ComicUpgrade28Test {
         assertEquals(0f, cont.spacingDp)
         assertTrue(!cont.snapToPage)
         assertTrue(cont.pixelProgress)
-        // 预加载窗口：无缝更宽（保证连续无停顿）
-        assertTrue(cont.prefetchWindow > webtoon.prefetchWindow)
+        // 两种滚动模式均提前四页，首载与驻留预算由共同调度控制。
+        assertEquals(4, webtoon.prefetchWindow)
+        assertEquals(4, cont.prefetchWindow)
         // 关磁吸开关只影响条漫
         assertTrue(!ComicScrollStrategy.forConfig(cfg.copy(webtoonSnap = false)).snapToPage)
     }
@@ -192,13 +193,13 @@ class ComicUpgrade28Test {
             val hRtl = spreadToHarismTwo(k, n, reversed = true)
             assertEquals(k, harismToSpreadTwo(hRtl, n, reversed = true))
             // RTL 首屏（spread0）的右页 = harism 末位附近（倒序映射）
-            if (k == 0) assertEquals(n - 1, hRtl)
+            if (k == 0) assertEquals(1, hRtl)
             // LTR 首屏右页 = 1（第二槽位）
             if (k == 0) assertEquals(1, hLtr)
         }
         // 步进语义：一次翻页 = 索引 ±2（整 spread）
         assertEquals(spreadToHarismTwo(1, n, false), spreadToHarismTwo(0, n, false) + 2)
-        assertEquals(spreadToHarismTwo(1, n, true), spreadToHarismTwo(0, n, true) - 2)
+        assertEquals(spreadToHarismTwo(1, n, true), spreadToHarismTwo(0, n, true) + 2)
     }
 
     /* ═══ 14：自动裁边四类场景 ═══ */

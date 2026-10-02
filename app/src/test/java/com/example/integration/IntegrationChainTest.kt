@@ -32,11 +32,14 @@ import org.robolectric.annotation.Config
 class IntegrationChainTest {
 
     private val testDispatcher = StandardTestDispatcher()
+    private lateinit var database: AppDatabase
 
     @Before
     fun setUp() {
         Dispatchers.setMain(testDispatcher)
         val app = ApplicationProvider.getApplicationContext<Application>()
+        database = androidx.room.Room.inMemoryDatabaseBuilder(app, AppDatabase::class.java).allowMainThreadQueries().build()
+        AppDatabase::class.java.getDeclaredField("INSTANCE").apply { isAccessible = true }.set(null, database)
         try {
             val config = androidx.work.Configuration.Builder()
                 .setExecutor { it.run() }
@@ -49,6 +52,8 @@ class IntegrationChainTest {
 
     @After
     fun tearDown() {
+        database.close()
+        AppDatabase::class.java.getDeclaredField("INSTANCE").apply { isAccessible = true }.set(null, null)
         Dispatchers.resetMain()
     }
 
@@ -86,7 +91,7 @@ class IntegrationChainTest {
             coverUrl = targetBook.cover
         )
         downloadManager.enqueueDownload(request, dlInfo.referer, dlInfo.headers)
-        val taskId = targetBook.id
+        val taskId = DownloadManager.taskId(targetBook.sourceId, targetBook.id)
         assertNotNull(taskId)
 
         testScheduler.advanceUntilIdle()
@@ -95,10 +100,10 @@ class IntegrationChainTest {
         var tasks: List<DownloadTaskEntity> = emptyList()
         for (i in 1..20) {
             tasks = downloadManager.allTasksFlow.first()
-            if (tasks.any { it.id == targetBook.id }) break
+            if (tasks.any { it.id == taskId }) break
             kotlinx.coroutines.delay(50)
         }
-        assertTrue(tasks.any { it.id == targetBook.id })
+        assertTrue(tasks.any { it.id == taskId })
     }
 
     @Test

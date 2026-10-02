@@ -139,6 +139,65 @@ class ComicReadingLogicTest {
     }
 
     @Test
+    fun `更新检测 话数相同不算新话（id 不稳定源）`() {
+        // 有的源每次拉取 chapterId 都不同：id 变了但话数没涨 = 同一话，不算更新
+        val top = ComicReadingLogic.ordered(listOf(ch("c12-v2", "第 12 话"))).last()
+        assertTrue(
+            !ComicReadingLogic.isNewChapterObserved(
+                oldLatestId = "c12-v1", oldLatestTitle = "第 12 话", newLatest = top,
+            )
+        )
+    }
+
+    @Test
+    fun `更新检测 话数涨了算新话`() {
+        val top = ComicReadingLogic.ordered(listOf(ch("c13", "第 13 话"))).last()
+        assertTrue(
+            ComicReadingLogic.isNewChapterObserved(
+                oldLatestId = "c12", oldLatestTitle = "第 12 话", newLatest = top,
+            )
+        )
+    }
+
+    @Test
+    fun `更新检测 id 相同不算新话`() {
+        val top = ComicReadingLogic.ordered(listOf(ch("c12", "第 12 话"))).last()
+        assertTrue(
+            !ComicReadingLogic.isNewChapterObserved(
+                oldLatestId = "c12", oldLatestTitle = "第 12 话", newLatest = top,
+            )
+        )
+    }
+
+    @Test
+    fun `更新检测 话数解析不到时退回 id 比较`() {
+        // 新旧标题都解析不出话数：id 不同只能当更新（宁可误报不可漏报）
+        val top = ComicReadingLogic.ordered(listOf(ch("x2", "番外"))).last()
+        assertTrue(
+            ComicReadingLogic.isNewChapterObserved(
+                oldLatestId = "x1", oldLatestTitle = "番外篇", newLatest = top,
+            )
+        )
+    }
+
+    @Test
+    fun `更新检测 首次观察与空章节`() {
+        // 从没抓到过快照 → 首次观察到算"有"（要推进更新时间）
+        val top = ComicReadingLogic.ordered(listOf(ch("c1", "第 1 话"))).last()
+        assertTrue(
+            ComicReadingLogic.isNewChapterObserved(
+                oldLatestId = null, oldLatestTitle = null, newLatest = top,
+            )
+        )
+        // 源没返回章节 → 算没有
+        assertTrue(
+            !ComicReadingLogic.isNewChapterObserved(
+                oldLatestId = "c1", oldLatestTitle = "第 1 话", newLatest = null,
+            )
+        )
+    }
+
+    @Test
     fun `未读话数与已读占比`() {
         val chapters = listOf(ch("c1", "第 1 话", 1f), ch("c2", "第 2 话", 2f), ch("c3", "第 3 话", 3f))
         val states = mapOf("c1" to ChapterReadState.READ, "c2" to ChapterReadState.READING)

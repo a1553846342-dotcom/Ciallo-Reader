@@ -90,6 +90,28 @@ val LocalReduceMotion = compositionLocalOf { false }
 /** 触觉开关（设置项，默认开）。 */
 val LocalHapticsEnabled = compositionLocalOf { true }
 
+/**
+ * 触觉总开关的**非组合环境**镜像。
+ *
+ * 为什么需要一个全局 object 而不只有 CompositionLocal：漫画翻页、裁切滑块等处的震动是直接
+ * 调 `View.performHapticFeedback`（走 LocalView），组合期之外、协程里都在触发，CompositionLocal
+ * 传不进去。这里由 MainActivity 用 SideEffect 同步一次，读取方只做一次布尔判断，零订阅成本。
+ * ⚠️ 它是「进程级」状态，不参与重组，因此不会引入额外的 recomposition。
+ */
+object HapticsGate {
+    @Volatile
+    var enabled: Boolean = true
+}
+
+/** [HapticsGate] 关闭时替换 LocalHapticFeedback 的空实现：所有 Compose 侧震动静默。 */
+object MutingHapticFeedback : androidx.compose.ui.hapticfeedback.HapticFeedback {
+    override fun performHapticFeedback(
+        feedbackType: androidx.compose.ui.hapticfeedback.HapticFeedbackType
+    ) {
+        // 故意什么都不做
+    }
+}
+
 /** 触觉分级。 */
 enum class HapticKind { SELECTION, LIGHT, MEDIUM, HEAVY, SUCCESS }
 
@@ -103,6 +125,7 @@ class AppHaptics(
     private val enabled: () -> Boolean,
 ) {
     fun perform(kind: HapticKind) {
+        if (!HapticsGate.enabled) return
         if (!enabled()) return
         runCatching {
             val vibrator = vibrator() ?: return

@@ -59,6 +59,16 @@ public class CurlRenderer implements GLSurfaceView.Renderer {
 	private int mViewMode = SHOW_ONE_PAGE;
 	// Project adaptation: explicit pixel-rect override active.
 	private boolean mExplicitPageRect = false;
+	private boolean mRightToLeft = false;
+
+	/** Mirror the book geometry, while the provider keeps page artwork upright. */
+	public synchronized void setRightToLeft(boolean rightToLeft) {
+		if (mRightToLeft == rightToLeft) return;
+		mRightToLeft = rightToLeft;
+		updatePageRects();
+	}
+
+	public boolean isRightToLeft() { return mRightToLeft; }
 	// Screen size.
 	private int mViewportWidth, mViewportHeight;
 	// Rect for render area.
@@ -122,9 +132,12 @@ public class CurlRenderer implements GLSurfaceView.Renderer {
 			mBackgroundMesh.onDrawFrame(gl);
 		}
 
+		gl.glPushMatrix();
+		if (mRightToLeft) gl.glScalef(-1f, 1f, 1f);
 		for (int i = 0; i < mCurlMeshes.size(); ++i) {
 			mCurlMeshes.get(i).onDrawFrame(gl);
 		}
+		gl.glPopMatrix();
 	}
 
 	/**
@@ -242,6 +255,17 @@ public class CurlRenderer implements GLSurfaceView.Renderer {
 			return;
 		}
 		mExplicitPageRect = true;
+		if (mRightToLeft) {
+			RectF physicalRight = rightPx;
+			if (mViewMode == SHOW_TWO_PAGES) {
+				rightPx = mirrorPixels(leftPx);
+				leftPx = mirrorPixels(physicalRight);
+			} else {
+				rightPx = mirrorPixels(physicalRight);
+				leftPx = new RectF(rightPx);
+				leftPx.offset(-rightPx.width(), 0f);
+			}
+		}
 		mPageRectRight.set(toViewX(rightPx.left), toViewY(rightPx.top),
 				toViewX(rightPx.right), toViewY(rightPx.bottom));
 		mPageRectLeft.set(toViewX(leftPx.left), toViewY(leftPx.top),
@@ -260,6 +284,11 @@ public class CurlRenderer implements GLSurfaceView.Renderer {
 		return mViewRect.left + mViewRect.width() * px / mViewportWidth;
 	}
 
+	private RectF mirrorPixels(RectF rect) {
+		return new RectF(mViewportWidth - rect.right, rect.top,
+				mViewportWidth - rect.left, rect.bottom);
+	}
+
 	private float toViewY(float py) {
 		return mViewRect.top + mViewRect.height() * py / mViewportHeight;
 	}
@@ -269,6 +298,7 @@ public class CurlRenderer implements GLSurfaceView.Renderer {
 	 */
 	public void translate(PointF pt) {
 		pt.x = mViewRect.left + (mViewRect.width() * pt.x / mViewportWidth);
+		if (mRightToLeft) pt.x = -pt.x;
 		pt.y = mViewRect.top - (-mViewRect.height() * pt.y / mViewportHeight);
 	}
 

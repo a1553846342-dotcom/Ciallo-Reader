@@ -40,6 +40,8 @@ class FavoriteRepository(
     scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
 ) {
     private val repoScope = scope
+    var catalogContext: android.content.Context? = null
+    private val catalogMutex = kotlinx.coroutines.sync.Mutex()
 
     /* ───────────── 收藏 ───────────── */
 
@@ -91,6 +93,46 @@ class FavoriteRepository(
     suspend fun isFavorite(sourceId: String, comicId: String): Boolean =
         dao.favorite(sourceId, comicId) != null
 
+    suspend fun favoritesSnapshot(): List<FavoriteEntity> = dao.allFavoritesSync()
+
+    suspend fun replaceFavorite(
+        from: ComicKey,
+        book: SearchBook,
+        newChapters: List<ComicChapter>,
+    ): FavoriteMigrationReport = withContext(Dispatchers.IO) {
+        require(from.valid && book.sourceId.isNotBlank() && book.id.isNotBlank())
+        require(from.raw != favoriteKey(book.sourceId, book.id))
+        require(newChapters.isNotEmpty()) { "新来源暂无可用章节，暂时无法迁移" }
+        catalogMutex.lock()
+        try {
+            val catalog = catalogContext?.let(::ChapterCatalog)
+            var oldChapters = catalog?.read(from.sourceId, from.comicId).orEmpty()
+            if (oldChapters.isEmpty()) {
+                val source = comicSourceOf(from.sourceId)
+                val loaded = try {
+                    kotlinx.coroutines.withTimeoutOrNull(15_000) { source?.getChapters(from.comicId) }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (_: Exception) { null }
+                if (loaded is com.example.source.SourceResult.Success) oldChapters = loaded.data
+            }
+            val mapping = ComicChapterMatching.mapping(oldChapters, newChapters).mapValues { it.value.id }
+            val ordered = ComicReadingLogic.ordered(newChapters)
+            val latest = ordered.lastOrNull()?.chapter
+            val replacement = FavoriteEntity(
+                sourceId = book.sourceId, comicId = book.id,
+                title = book.title, author = book.author, coverUrl = book.cover,
+                serialStatus = serialStatusOf(book.comicInfo?.status),
+                latestChapterId = latest?.id, latestChapterTitle = latest?.title,
+                lastCheckedAt = System.currentTimeMillis(),
+            )
+            // Write catalog first: a failed disk write must not remove the old favorite.
+            catalog?.write(book.sourceId, book.id, newChapters)
+            dao.replaceFavoriteMapped(from, replacement, mapping,
+                ordered.associate { it.chapter.id to it.order }, latest?.id)
+        } finally { catalogMutex.unlock() }
+    }
+
     fun favoriteFlow(sourceId: String, comicId: String): Flow<FavoriteEntity?> =
         dao.favoriteFlow(sourceId, comicId)
 
@@ -119,6 +161,7 @@ class FavoriteRepository(
                 coverUrl = book.cover ?: existing?.coverUrl,
                 categoryName = useCategory,
                 sourceAlive = true,
+                serialStatus = book.comicInfo?.status?.let(::serialStatusOf) ?: existing?.serialStatus ?: SerialStatus.UNKNOWN.code,
                 latestChapterId = top?.chapter?.id ?: existing?.latestChapterId,
                 latestChapterTitle = top?.chapter?.title ?: existing?.latestChapterTitle,
             )
@@ -184,10 +227,14 @@ class FavoriteRepository(
         )
         dao.upsertChapterStates(
             listOf(
-                ChapterReadEntity(
+                // 读旧合并：REPLACE 会整行覆盖，直接构造会抹掉读者标注的书签
+                (dao.chapterStatesSync(sourceId, comicId)
+                    .firstOrNull { it.chapterId == chapterId } ?: ChapterReadEntity(
                     sourceId = sourceId,
                     comicId = comicId,
                     chapterId = chapterId,
+                    chapterIndex = chapterIndex,
+                )).copy(
                     status = if (finished) ChapterReadState.READ.code else ChapterReadState.READING.code,
                     pageIndex = pageIndex.coerceAtLeast(0),
                     pageCount = pageCount.coerceAtLeast(0),
@@ -205,17 +252,50 @@ class FavoriteRepository(
         chapterId: String,
         chapterIndex: Int,
         read: Boolean,
-    ) = dao.upsertChapterStates(
-        listOf(
-            ChapterReadEntity(
-                sourceId = sourceId,
-                comicId = comicId,
-                chapterId = chapterId,
-                status = if (read) ChapterReadState.READ.code else ChapterReadState.UNREAD.code,
-                chapterIndex = chapterIndex,
+    ) {
+        // 读旧合并：保留书签列（REPLACE 会整行覆盖）
+        val previous = dao.chapterStatesSync(sourceId, comicId)
+            .firstOrNull { it.chapterId == chapterId }
+        dao.upsertChapterStates(
+            listOf(
+                (previous ?: ChapterReadEntity(
+                    sourceId = sourceId,
+                    comicId = comicId,
+                    chapterId = chapterId,
+                    chapterIndex = chapterIndex,
+                )).copy(
+                    status = if (read) ChapterReadState.READ.code else ChapterReadState.UNREAD.code,
+                    chapterIndex = chapterIndex,
+                    updatedAt = System.currentTimeMillis(),
+                )
             )
         )
-    )
+    }
+
+    /** 详情页左滑/右滑该话卡片：切换书签标注。 */
+    suspend fun setChapterBookmark(
+        sourceId: String,
+        comicId: String,
+        chapterId: String,
+        chapterIndex: Int,
+        bookmarked: Boolean,
+    ) {
+        val previous = dao.chapterStatesSync(sourceId, comicId)
+            .firstOrNull { it.chapterId == chapterId }
+        dao.upsertChapterStates(
+            listOf(
+                (previous ?: ChapterReadEntity(
+                    sourceId = sourceId,
+                    comicId = comicId,
+                    chapterId = chapterId,
+                    chapterIndex = chapterIndex,
+                )).copy(
+                    bookmarked = bookmarked,
+                    updatedAt = System.currentTimeMillis(),
+                )
+            )
+        )
+    }
 
     /** 「将以上全部标记为已读」（按阅读序号批量置位）。 */
     suspend fun markChaptersReadUpTo(sourceId: String, comicId: String, maxIndex: Int) =
@@ -223,6 +303,7 @@ class FavoriteRepository(
 
     /** 进入章节列表时记录「已见」快照，用于之后显示「新」小红点。 */
     suspend fun markSeen(sourceId: String, comicId: String, chapters: List<ComicChapter>) {
+        reconcileCatalog(sourceId,comicId,chapters)
         val seq = ComicReadingLogic.ordered(chapters)
         val top = seq.lastOrNull()?.chapter?.id
         val cur = dao.progress(sourceId, comicId)
@@ -259,42 +340,41 @@ class FavoriteRepository(
         val oldProg = dao.progress(from.sourceId, from.comicId)
         val oldFav = dao.favorite(from.sourceId, from.comicId)
 
-        // ① 章节状态：旧序号 → 新 chapterId
-        val mapped = oldStates.mapNotNull { s ->
-            val idx = if (s.chapterIndex >= 0) s.chapterIndex else return@mapNotNull null
-            seq.getOrNull(idx)?.chapter?.id?.let { newId ->
-                s.copy(sourceId = to.sourceId, comicId = to.comicId, chapterId = newId)
-            }
-        }
-        if (mapped.isNotEmpty()) dao.upsertChapterStates(mapped)
-
-        // ② 漫画级进度：页码直接沿用，章节 id 换到新源同序号的章节
-        if (oldProg != null) {
-            val newChapterId = oldProg.lastChapterIndex.takeIf { it >= 0 }
-                ?.let { seq.getOrNull(it)?.chapter?.id }
-            dao.upsertProgress(
-                oldProg.copy(
-                    sourceId = to.sourceId,
-                    comicId = to.comicId,
-                    lastChapterId = newChapterId,
-                    seenTopChapterId = seq.lastOrNull()?.chapter?.id,
-                    seenChapterCount = seq.size,
-                )
-            )
-        }
-
-        // ③ 收藏：保留分类、收藏时间、排序；封面与快照随后由更新检查刷新
-        if (oldFav != null) {
-            dao.insertFavorite(oldFav.copy(sourceId = to.sourceId, comicId = to.comicId))
-        } else if (oldProg != null || mapped.isNotEmpty()) {
-            // 没收藏但读过：迁移后保留进度即可，不凭空造一条收藏
-        }
-
-        // ④ 清理旧键（三张表都清，保证「换源后不存在两条记录」）
-        dao.clearChapterStates(from.sourceId, from.comicId)
-        dao.deleteProgress(from.sourceId, from.comicId)
-        dao.deleteFavorite(from.sourceId, from.comicId)
+        val catalog=catalogContext?.let { ChapterCatalog(it) }
+        val identities=catalog?.mapping(catalog.read(from.sourceId,from.comicId),newChapters).orEmpty()
+        val orders=seq.associate { it.chapter.id to it.order }
+        val mapped=oldStates.mapNotNull { state -> identities[state.chapterId]?.let { chapter ->
+            state.copy(sourceId=to.sourceId,comicId=to.comicId,chapterId=chapter.id,chapterIndex=orders[chapter.id] ?: -1)
+        } }
+        val progressChapter=oldProg?.lastChapterId?.let { identities[it] }
+        val newProgress=if(oldProg!=null && progressChapter!=null) oldProg.copy(sourceId=to.sourceId,comicId=to.comicId,
+            lastChapterId=progressChapter.id,lastChapterIndex=orders[progressChapter.id] ?: -1,
+            seenTopChapterId=seq.lastOrNull()?.chapter?.id,seenChapterCount=seq.size) else null
+        val complete=mapped.size==oldStates.size && (oldProg?.lastChapterId==null || progressChapter!=null)
+        dao.migrateResolved(from,to,mapped,newProgress,oldFav?.copy(sourceId=to.sourceId,comicId=to.comicId),complete)
+        catalog?.write(to.sourceId,to.comicId,newChapters)
         mapped.size
+    }
+
+    private suspend fun reconcileCatalog(source:String,comic:String,chapters:List<ComicChapter>) = withContext(Dispatchers.IO) {
+        val context=catalogContext ?: return@withContext
+        catalogMutex.lock()
+        try {
+            val catalog=ChapterCatalog(context)
+            val mapping=catalog.mapping(catalog.read(source,comic),chapters)
+            val orders=ComicReadingLogic.ordered(chapters).associate { it.chapter.id to it.order }
+            val states=dao.chapterStatesSync(source,comic)
+            val changed=states.mapNotNull { state -> mapping[state.chapterId]?.takeIf { it.id!=state.chapterId }?.let { chapter ->
+                state.copy(chapterId=chapter.id,chapterIndex=orders[chapter.id] ?: state.chapterIndex)
+            } }
+            val progress=dao.progress(source,comic)
+            val mapped=progress?.lastChapterId?.let { mapping[it] }
+            val updated=if(mapped!=null) progress?.copy(lastChapterId=mapped.id,lastChapterIndex=orders[mapped.id] ?: progress.lastChapterIndex) else null
+            val changedIds=changed.mapTo(HashSet()) { it.chapterId }
+            val oldIds=states.filter { mapping[it.chapterId]?.id in changedIds }.map { it.chapterId }
+            dao.reconcileChapterIds(source,comic,changed,updated,oldIds)
+            catalog.write(source,comic,chapters)
+        } finally { catalogMutex.unlock() }
     }
 
     /* ───────────── 更新检测 ───────────── */
@@ -337,23 +417,44 @@ class FavoriteRepository(
                                 )
                             }
                             val top = ComicReadingLogic.ordered(chapters).lastOrNull()
+                            // ⚠️ 回写前重读当前行：targets 是检查开始时的快照，检查期间
+                            // 用户可能取消收藏 / 移动分类 —— 拿快照整行 REPLACE 会把
+                            // 已删除的收藏"复活"、把分类跳回旧值。
+                            val fresh = dao.favorite(fav.sourceId, fav.comicId)
+                                ?: return@runCatching
+                            // ⚠️ 「是否真的有新话」要走话数归一化判定（isNewChapterObserved）：
+                            // 裸 id 比较在 id 不稳定的源上会把同一话反复判成新话。
+                            val changed = ComicReadingLogic.isNewChapterObserved(
+                                fav.latestChapterId, fav.latestChapterTitle, top,
+                            )
                             dao.insertFavorite(
-                                fav.copy(
-                                    latestChapterId = top?.chapter?.id ?: fav.latestChapterId,
-                                    latestChapterTitle = top?.chapter?.title ?: fav.latestChapterTitle,
-                                    latestChapterUpdateAt = System.currentTimeMillis(),
+                                fresh.copy(
+                                    latestChapterId = top?.chapter?.id ?: fresh.latestChapterId,
+                                    latestChapterTitle = top?.chapter?.title ?: fresh.latestChapterTitle,
+                                    // ⚠️ 只有真的观察到新话才推进「更新时间」：以前每次检查
+                                    // 都盖 now —— 「最近更新」排序实际是「最近检查过」，
+                                    // 每 30 分钟自动检查后所有收藏都排到最前（用户实测排序乱跳）
+                                    latestChapterUpdateAt = if (changed) {
+                                        System.currentTimeMillis()
+                                    } else {
+                                        fresh.latestChapterUpdateAt
+                                    },
                                     lastCheckedAt = System.currentTimeMillis(),
                                     sourceAlive = true,
                                 )
                             )
                         }.onFailure {
-                            // 单本失败只标记这一本：保留缓存信息与已读状态，UI 显示灰色警示
-                            dao.insertFavorite(
-                                fav.copy(
-                                    lastCheckedAt = System.currentTimeMillis(),
-                                    sourceAlive = false,
+                            // 单本失败只标记这一本：保留缓存信息与已读状态，UI 显示灰色警示。
+                            // 同样重读当前行，避免复活竞态
+                            val fresh = dao.favorite(fav.sourceId, fav.comicId)
+                            if (fresh != null) {
+                                dao.insertFavorite(
+                                    fresh.copy(
+                                        lastCheckedAt = System.currentTimeMillis(),
+                                        sourceAlive = false,
+                                    )
                                 )
-                            )
+                            }
                         }
                     }
                 }
@@ -366,7 +467,6 @@ class FavoriteRepository(
 
     /** 来源失效后重试单本。 */
     suspend fun retrySource(sourceId: String, comicId: String): Boolean = withContext(Dispatchers.IO) {
-        val fav = dao.favorite(sourceId, comicId) ?: return@withContext false
         updateGate.withPermit {
             runCatching {
                 throttle(sourceId)
@@ -376,10 +476,21 @@ class FavoriteRepository(
                     is com.example.source.SourceResult.Error -> return@runCatching false
                 }
                 val top = ComicReadingLogic.ordered(chapters).lastOrNull()
+                // 与 checkUpdates 同款：重读当前行（防复活竞态）+ 话数归一化判定
+                // + 只有真观察到新话才推进「更新时间」
+                val fresh = dao.favorite(sourceId, comicId) ?: return@runCatching false
+                val changed = ComicReadingLogic.isNewChapterObserved(
+                    fresh.latestChapterId, fresh.latestChapterTitle, top,
+                )
                 dao.insertFavorite(
-                    fav.copy(
-                        latestChapterId = top?.chapter?.id ?: fav.latestChapterId,
-                        latestChapterTitle = top?.chapter?.title ?: fav.latestChapterTitle,
+                    fresh.copy(
+                        latestChapterId = top?.chapter?.id ?: fresh.latestChapterId,
+                        latestChapterTitle = top?.chapter?.title ?: fresh.latestChapterTitle,
+                        latestChapterUpdateAt = if (changed) {
+                            System.currentTimeMillis()
+                        } else {
+                            fresh.latestChapterUpdateAt
+                        },
                         lastCheckedAt = System.currentTimeMillis(),
                         sourceAlive = true,
                     )
@@ -388,4 +499,11 @@ class FavoriteRepository(
             }.getOrDefault(false)
         }
     }
+}
+
+private fun serialStatusOf(raw: String?): String = when (raw?.trim()?.lowercase()) {
+    "completed", "finished", "已完结", "完结", "已完結", "完結" -> SerialStatus.COMPLETED.code
+    "ongoing", "连载中", "連載中", "连载", "連載" -> SerialStatus.ONGOING.code
+    "hiatus", "paused", "暂停", "暫停", "休刊" -> SerialStatus.HIATUS.code
+    else -> SerialStatus.UNKNOWN.code
 }

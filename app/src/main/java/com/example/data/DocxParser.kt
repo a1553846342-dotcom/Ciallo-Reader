@@ -1,11 +1,13 @@
 package com.example.data
 
 import android.content.Context
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
+import java.io.FileOutputStream
 import java.io.File
 import java.nio.charset.StandardCharsets
 import java.util.zip.ZipEntry
@@ -27,14 +29,16 @@ object DocxParser {
         context: Context,
         uri: Uri,
         fileName: String,
-        bookDao: BookDao
+        bookDao: BookDao,
+        targetBookId: Int? = null
     ): Result<Book> = withContext(Dispatchers.IO) {
         try {
             Log.d(TAG, "[DocxParser] Starting DOCX import for $fileName")
-            val xml = readDocumentXml(context, uri)
+            val docx = readDocxContent(context, uri, 0)
                 ?: return@withContext Result.failure(Exception("无法读取 DOCX 文件（缺少 word/document.xml）"))
+            val xml = docx.documentXml
 
-            val paragraphs = parseParagraphs(xml)
+            val paragraphs = parseParagraphsWithImages(xml, docx.relTargets)
             if (paragraphs.isEmpty()) {
                 return@withContext Result.failure(Exception("DOCX 文件中未找到有效正文内容"))
             }
@@ -50,7 +54,8 @@ object DocxParser {
                 contentType = "NOVEL",
                 totalChapters = 0
             )
-            val bookId = bookDao.insertBook(initialBook).toInt()
+            // targetBookId 非空 = 老书补图片迁移：不新建书、失败不删书（调用方事务收尾）
+            val bookId = targetBookId ?: bookDao.insertBook(initialBook).toInt()
 
             val chapters = mutableListOf<Chapter>()
             var order = 0
@@ -81,7 +86,7 @@ object DocxParser {
             if (chapters.isEmpty()) {
                 // 无标题结构：按固定长度兜底
                 val flatText = paragraphs.joinToString("\n\n") { it.text.trim() }
-                flatText.chunked(5000).forEachIndexed { index, part ->
+                flatText.let { splitChapterText(it, 5000) }.forEachIndexed { index, part ->
                     chapters.add(
                         Chapter(
                             bookId = bookId,
@@ -94,7 +99,7 @@ object DocxParser {
             }
 
             if (chapters.isEmpty()) {
-                bookDao.deleteBook(initialBook.copy(id = bookId))
+                if (targetBookId == null) bookDao.deleteBook(initialBook.copy(id = bookId))
                 return@withContext Result.failure(Exception("DOCX 文件中未找到有效正文内容"))
             }
 
@@ -107,6 +112,7 @@ object DocxParser {
             Log.d(TAG, "[DocxParser] Successfully imported '${finalBook.title}' with ${chapters.size} chapters.")
             Result.success(finalBook)
         } catch (t: Throwable) {
+            if (t is kotlinx.coroutines.CancellationException) throw t
             Log.e(TAG, "[DocxParser] Error during DOCX import", t)
             Result.failure(Exception(t.localizedMessage ?: "DOCX 解析失败"))
         }
@@ -114,23 +120,95 @@ object DocxParser {
 
     private data class DocxParagraph(val text: String, val isHeading: Boolean)
 
-    private fun readDocumentXml(context: Context, uri: Uri): String? {
+    private data class DocxContent(
+        val documentXml: String,
+        /** rId -> 已落盘的媒体文件绝对路径（正文插图的引用来源） */
+        val relTargets: Map<String, String>
+    )
+
+    private fun readDocxContent(context: Context, uri: Uri, bookId: Int): DocxContent? {
         val input = context.contentResolver.openInputStream(uri) ?: return null
+        var documentXml: String? = null
+        val rels = mutableMapOf<String, String>()
+        val imageDir = File(context.filesDir, "docx_images/$bookId")
+
+        val budget = ArchiveBudget(16L * 1024 * 1024)
         input.use { stream ->
             ZipInputStream(stream).use { zip ->
                 var entry: ZipEntry? = zip.nextEntry
                 while (entry != null) {
-                    if (entry.name == "word/document.xml") {
-                        val out = ByteArrayOutputStream()
-                        zip.copyTo(out)
-                        return String(out.toByteArray(), StandardCharsets.UTF_8)
+                    ArchiveBudget.destination(imageDir, entry.name)
+                    when {
+                        entry.name == "word/document.xml" -> {
+                            val out = ByteArrayOutputStream()
+                            budget.copyEntry(zip, out)
+                            documentXml = String(out.toByteArray(), StandardCharsets.UTF_8)
+                        }
+                        entry.name == "word/_rels/document.xml.rels" -> {
+                            val out = ByteArrayOutputStream()
+                            budget.copyEntry(zip, out)
+                            val relXml = String(out.toByteArray(), StandardCharsets.UTF_8)
+                            // 关系映射：<Relationship Id="rIdX" Target="media/image1.png"/>
+                            Regex("<Relationship\b[^>]*Id=\"([^\"]+)\"[^>]*Target=\"([^\"]+)\"[^>]*/?>")
+                                .findAll(relXml)
+                                .forEach { rm ->
+                                    val target = rm.groupValues[2]
+                                    if (target.contains("media/")) rels[rm.groupValues[1]] = target
+                                }
+                        }
+                        !entry.isDirectory && entry.name.startsWith("word/media/") -> {
+                            if (!imageDir.exists()) imageDir.mkdirs()
+                            val f = File(imageDir, entry.name.substringAfterLast('/'))
+                            FileOutputStream(f).use { budget.copyEntry(zip, it) }
+                            rels["__file__" + entry.name] = f.absolutePath
+                        }
+                        else -> budget.copyEntry(zip)
                     }
-                    zip.closeEntry()
                     entry = zip.nextEntry
                 }
             }
         }
-        return null
+
+        if (documentXml == null) return null
+        // rId -> 落盘图片路径
+        val resolved = mutableMapOf<String, String>()
+        for ((rid, target) in rels) {
+            if (rid.startsWith("__file__")) continue
+            val name = target.substringAfterLast('/')
+            val local = File(imageDir, name)
+            if (local.exists()) resolved[rid] = local.absolutePath
+        }
+        return DocxContent(documentXml, resolved)
+    }
+
+    /** 段落文本 + 内嵌插图（r:embed → 已落盘媒体）→ 文本与 [IMG:...] 占位符交错 */
+    private fun parseParagraphsWithImages(
+        xml: String,
+        relTargets: Map<String, String>
+    ): List<DocxParagraph> {
+        val result = mutableListOf<DocxParagraph>()
+        val paraRegex = Regex("""<w:p[ >].*?</w:p>""", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+        val headingRegex = Regex("""<w:pStyle w:val="(Heading[1-6][^"]*)"/""", RegexOption.IGNORE_CASE)
+        val blipRegex = Regex("""r:embed="(rId\d+)"""")
+        for (m in paraRegex.findAll(xml)) {
+            val raw = m.value
+            val isHeading = headingRegex.containsMatchIn(raw)
+            val text = extractText(raw)
+            val tokens = mutableListOf<String>()
+            blipRegex.findAll(raw).forEach { bm ->
+                val path = relTargets[bm.groupValues[1]] ?: return@forEach
+                val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeFile(path, opts)
+                val w = if (opts.outWidth > 0) opts.outWidth else 800
+                val h = if (opts.outHeight > 0) opts.outHeight else 600
+                tokens.add("[IMG:$path|$w|$h]")
+            }
+            val combined = (text.trim() + (if (tokens.isNotEmpty()) "\n" + tokens.joinToString("\n") else "")).trim()
+            if (combined.isNotBlank() || isHeading) {
+                result.add(DocxParagraph(combined, isHeading))
+            }
+        }
+        return result
     }
 
     private fun parseParagraphs(xml: String): List<DocxParagraph> {
@@ -185,7 +263,7 @@ object DocxParser {
             )
             return
         }
-        content.chunked(MAX_CHAPTER_LENGTH).forEachIndexed { index, part ->
+        content.let { splitChapterText(it) }.forEachIndexed { index, part ->
             chapters.add(
                 Chapter(
                     bookId = bookId,

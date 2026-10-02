@@ -13,10 +13,12 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -50,6 +52,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.abs
@@ -68,8 +71,8 @@ import kotlin.math.min
  *   翻页落定回调（onDrawFrame 钩子在索引变化时上报）。
  * - 索引映射：harism 页 = 我们的 spread（双页 spread 组合为单张纹理，整 spread 卷动，
  *   与旧 Canvas 引擎行为一致且规避不规则 spread 的页对映射问题）。
- *   RTL 采用倒序映射 harismIdx = N-1-ourIdx —— "前进 = CURL_LEFT"（页从左缘掀起向右翻，
- *   符合日漫右→左阅读的物理翻书方向）；LTR 恒等映射（前进 = CURL_RIGHT）。
+ *   页码保持阅读顺序；RTL 镜像 GL 书本几何与触摸坐标，纹理绘制补偿镜像。
+ *   因而前进卷起当前页的左缘、书脊在右侧，文字和双页合绘仍保持原方向。
  * - PageProvider：GL 线程同步回调，从 slotCache（Compose 侧预加载的 loader 位图）合成
  *   信箱式页纹理；正/背面语义 front = 本页，back = 翻页方向上将揭示/离开的相邻页。
  * - 自动阅读：合成事件流（边缘 DOWN → 步进 MOVE → 越中线 UP）驱动完整卷页动画。
@@ -103,6 +106,14 @@ class ComicCurlView(context: Context, translucent: Boolean = false) : CurlView(c
     /** 滑动翻页开关（false = 只响应点按，拖拽不产生卷页） */
     var swipeEnabled = true
 
+    /** GL 首末页外翻在 View 层仲裁，避免 Compose 抢走 AndroidView 的触摸流。 */
+    var isAtForwardEdge: (() -> Boolean)? = null
+    var isAtBackwardEdge: (() -> Boolean)? = null
+    var forwardSign: Float = 1f
+    var onChapterEdge: ((Boolean) -> Unit)? = null
+    private var startedAtForwardEdge = false
+    private var startedAtBackwardEdge = false
+
     /** 自动翻页合成事件流进行中：吞掉真实触摸避免互相打断 */
     @Volatile
     var autoFlipping = false
@@ -111,6 +122,7 @@ class ComicCurlView(context: Context, translucent: Boolean = false) : CurlView(c
     private var downX = 0f
     private var downY = 0f
     private var dragForwarded = false
+    private var chapterEdgeActive = false
     private var longPressFired = false
 
     /** 双击窗口内上一击（第二击 DOWN 直接进入缩放，不再走点按/拖拽） */
@@ -130,6 +142,12 @@ class ComicCurlView(context: Context, translucent: Boolean = false) : CurlView(c
     private var lastReportedIndex = -1
     private val slopPx = ViewConfiguration.get(context).scaledTouchSlop
     private val doubleTapWindowMs = 320L
+    private var pendingQuickTap: Runnable? = null
+    override fun onDetachedFromWindow() {
+        pendingQuickTap?.let { removeCallbacks(it) }
+        removeCallbacks(longPressRunnable)
+        super.onDetachedFromWindow()
+    }
     private val longPressRunnable = Runnable {
         if (!dragForwarded && !autoFlipping) {
             longPressFired = true
@@ -144,7 +162,11 @@ class ComicCurlView(context: Context, translucent: Boolean = false) : CurlView(c
         if (idx != lastReportedIndex) {
             lastReportedIndex = idx
             // 第 6 节：翻页落定轻触觉（GL 线程回调，View 方法 post 回 UI 线程执行）
-            post { performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY) }
+            post {
+                if (com.example.ui.feedback.HapticsGate.enabled) {
+                    performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY)
+                }
+            }
             onSettledIndex?.invoke(idx)
         }
     }
@@ -227,6 +249,7 @@ class ComicCurlView(context: Context, translucent: Boolean = false) : CurlView(c
         }
         when (me.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                pendingQuickTap?.let { view.removeCallbacks(it) }
                 if (com.example.BuildConfig.DEBUG) {
                     android.util.Log.d(
                         "CURLDBG",
@@ -237,13 +260,18 @@ class ComicCurlView(context: Context, translucent: Boolean = false) : CurlView(c
                 downX = me.x
                 downY = me.y
                 dragForwarded = false
+                chapterEdgeActive = false
+                startedAtForwardEdge = !isAnimating() && isAtForwardEdge?.invoke() == true
+                startedAtBackwardEdge = !isAnimating() && isAtBackwardEdge?.invoke() == true
                 longPressFired = false
                 // 双击窗口内的第二击：直接进缩放，不再走点按/拖拽
                 if (doubleTapZoomEnabled &&
+                    lastQuickTapAt > 0L &&
                     SystemClock.uptimeMillis() - lastQuickTapAt < doubleTapWindowMs &&
                     hypot(me.x - lastQuickTapX, me.y - lastQuickTapY) < slopPx * 4
                 ) {
                     doubleTapActive = true
+                    pendingQuickTap?.let { view.removeCallbacks(it) }
                     lastQuickTapAt = 0L
                     if (com.example.BuildConfig.DEBUG) android.util.Log.d("CURLDBG", "double-tap -> zoom")
                     onZoomGesture?.invoke()
@@ -269,6 +297,7 @@ class ComicCurlView(context: Context, translucent: Boolean = false) : CurlView(c
                         dispatchSynthetic(MotionEvent.ACTION_CANCEL, me.x, me.y, downTime)
                         dragForwarded = false
                     }
+                    chapterEdgeActive = false
                     multiTouch = true
                     longPressFired = false
                     onZoomGesture?.invoke()
@@ -277,12 +306,24 @@ class ComicCurlView(context: Context, translucent: Boolean = false) : CurlView(c
             }
             MotionEvent.ACTION_MOVE -> {
                 if (doubleTapActive) return true
+                if (chapterEdgeActive) {
+                    return true
+                }
                 if (!dragForwarded) {
                     // 长按已触发（放大/呼出控制层）后继续拖拽：不再启动卷页
                     if (longPressFired) return true
                     val moved = hypot(me.x - downX, me.y - downY)
-                    if (moved < slopPx * 2) return true
+                    if (moved < slopPx) return true
                     view.removeCallbacks(longPressRunnable)
+                    val dx = me.x - downX
+                    val dy = me.y - downY
+                    val forward = dx * forwardSign
+                    if (swipeEnabled && onChapterEdge != null && abs(dx) >= abs(dy) &&
+                        (startedAtForwardEdge && forward > 0f || startedAtBackwardEdge && forward < 0f)
+                    ) {
+                        chapterEdgeActive = true
+                        return true
+                    }
                     // 禁用滑动翻页只拦真实手势；自动翻页的合成拖拽是显式用户选项，放行
                     if (!swipeEnabled && !syntheticDrag) return true
                     if (com.example.BuildConfig.DEBUG) {
@@ -295,6 +336,18 @@ class ComicCurlView(context: Context, translucent: Boolean = false) : CurlView(c
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 view.removeCallbacks(longPressRunnable)
+                if (chapterEdgeActive) {
+                    chapterEdgeActive = false
+                    if (me.actionMasked == MotionEvent.ACTION_UP) {
+                        val target = comicChapterEdgeTarget(
+                            -(me.x - downX) * forwardSign,
+                            startedAtBackwardEdge, startedAtForwardEdge,
+                            48f * resources.displayMetrics.density,
+                        )
+                        if (target != 0) onChapterEdge?.invoke(target > 0)
+                    }
+                    return true
+                }
                 if (com.example.BuildConfig.DEBUG && me.actionMasked == MotionEvent.ACTION_UP) {
                     android.util.Log.d("CURLDBG", "UP dragFwd=$dragForwarded ptr=${me.pointerCount}")
                 }
@@ -309,7 +362,13 @@ class ComicCurlView(context: Context, translucent: Boolean = false) : CurlView(c
                         lastQuickTapAt = SystemClock.uptimeMillis()
                         lastQuickTapX = me.x
                         lastQuickTapY = me.y
-                        onQuickTap?.invoke(me.x, me.y)
+                        val x = me.x
+                        val y = me.y
+                        if (doubleTapZoomEnabled) {
+                            pendingQuickTap?.let { view.removeCallbacks(it) }
+                            pendingQuickTap = Runnable { onQuickTap?.invoke(x, y) }
+                            view.postDelayed(pendingQuickTap!!, doubleTapWindowMs)
+                        } else onQuickTap?.invoke(x, y)
                     }
                     return true
                 }
@@ -327,7 +386,7 @@ class ComicCurlView(context: Context, translucent: Boolean = false) : CurlView(c
     }
 
     /**
-     * 自动翻页：合成完整拖拽流。RTL 前进 = 从左缘向右拖（CURL_LEFT）；
+     * 自动翻页：合成完整拖拽流。RTL 前进 = 从左缘向右拖，镜像后的几何仍使用 CURL_RIGHT；
      * LTR 前进 = 从右缘向左拖（CURL_RIGHT）。UP 落点越过中线 → harism 自身
      * 的松手动画完成翻页并触发 onSettledIndex。
      */
@@ -377,6 +436,10 @@ internal class ComicHarismController {
     @Volatile
     var bookState: ComicBookState = ComicBookState()
     var reversed = false
+        set(value) {
+            if (field != value) lastAppliedRects = null
+            field = value
+        }
     var density = 1f
 
     /** 双页书脊模式（第 12 条）：每 harism 页 = 单张漫画页，步进 2 */
@@ -452,7 +515,8 @@ internal class ComicHarismController {
 
     @Synchronized
     fun putCache(key: String, bmp: Bitmap) {
-        if (slotCache.put(key, bmp) == null) cacheBytes += bmp.byteCount.toLong()
+        val old = slotCache.put(key, bmp)
+        cacheBytes += bmp.byteCount.toLong() - (old?.byteCount?.toLong() ?: 0L)
         trim()
     }
 
@@ -507,12 +571,12 @@ internal class ComicHarismController {
      * 后绘制；转换失败则返回 null（回退纸面占位，绝不崩溃）。
      */
     private fun softenForSoftware(bmp: Bitmap): Bitmap? {
-        if (bmp.config != Bitmap.Config.HARDWARE) return bmp
+        if (android.os.Build.VERSION.SDK_INT < 26 || bmp.config != Bitmap.Config.HARDWARE) return bmp
         return runCatching { bmp.copy(Bitmap.Config.ARGB_8888, false) }.getOrNull()
     }
 
     /** GL 线程：合成 spread 纹理（信箱式 + fit 规则 + 双页拼排）。返回的位图所有权移交 harism */
-    fun composeSpread(hIdx: Int, w: Int, h: Int): Bitmap? {
+    fun composeSpread(hIdx: Int, w: Int, h: Int, mirrorForRenderer: Boolean = true): Bitmap? {
         val lay = layout ?: return null
         val cfg = config ?: return null
         val spread = lay.spreads.getOrNull(toOur(hIdx)) ?: return null
@@ -523,7 +587,8 @@ internal class ComicHarismController {
         val bmp = Bitmap.createBitmap(bw, bh, Bitmap.Config.RGB_565)
         val canvas = Canvas(bmp)
         canvas.drawColor(fillInt(cfg))
-        val slots = spread.slots.take(2)
+        if (reversed && mirrorForRenderer) canvas.scale(-1f, 1f, bw / 2f, bh / 2f)
+        val slots = spread.slots.take(2).let { if (cfg.direction == ComicDirection.RTL) it.reversed() else it }
         val st = bookState
         // 精确键优先；未命中回退同页任意变体（防空白闪帧，页身份仍正确）
         var exactMiss = false
@@ -576,8 +641,7 @@ internal class ComicHarismController {
         if (flatCount == 0) return null
         val flat = flatUnitIndexFor(hIdx, flatCount, reversed)
         val backFlat = adjacentBackFlat(flat, flatCount) ?: return null
-        val backH = if (reversed) flatCount - 1 - backFlat else backFlat
-        val bmp = composeUnit(backH, w, h) ?: return null
+        val bmp = composeUnit(backFlat, w, h) ?: return null
         // harism 折叠几何将背面纹理水平镜像显示（v.mPosX 取负）——预镜像一次，
         // 翻页过程中背面页码/内容正向可读（"清晰看到即将出现的那一页"）
         val m = android.graphics.Matrix().apply { setScale(-1f, 1f) }
@@ -588,12 +652,9 @@ internal class ComicHarismController {
      * 双页书脊模式单页纹理（第 12 条）：一个 harism 页 = 一张漫画页，
      * 半屏画布信箱式适配（drawSpreadFit 单源路径）。
      */
-    fun composeUnit(hIdx: Int, w: Int, h: Int): Bitmap? {
+    fun composeUnit(hIdx: Int, w: Int, h: Int, mirrorForRenderer: Boolean = true): Bitmap? {
         val cfg = config ?: return null
-        // harism 索引 → 扁平单元索引：RTL（reversed）下 harism 页序整体倒排，
-        // 与单页路径 ourIndexFor 同一翻译（spreadToHarismTwo 产出的 h 是倒排
-        // 空间的右页索引）。漏译时 RTL 双页会取到补位 null → 纹理兜底深色纸
-        // → 整屏黑页（第三轮逐帧复审在 DOUBLE+CURL 录屏中实测到）。
+        // Logical indices stay in reading order; geometry reflects the physical sides.
         val slot = flatUnits.getOrNull(flatUnitIndexFor(hIdx, flatUnits.size, reversed)) ?: return null
         val scale = min(1f, min(1024f / w, 1800f / h))
         val bw = max(8, (w * scale).toInt())
@@ -601,6 +662,7 @@ internal class ComicHarismController {
         val bmp = Bitmap.createBitmap(bw, bh, Bitmap.Config.RGB_565)
         val canvas = Canvas(bmp)
         canvas.drawColor(fillInt(cfg))
+        if (reversed && mirrorForRenderer) canvas.scale(-1f, 1f, bw / 2f, bh / 2f)
         val exact = getCache(slotCacheKey(slot, cfg, bookState))
         if (exact == null) {
             // 第 4 条：当前 spread 纹理未就绪（慢网络）→ 标记待补纹理
@@ -777,13 +839,15 @@ internal fun applyCurlBackground(
     }
 }
 
-/** harism 索引映射（纯函数，可单测）：RTL 倒序 our = n-1-harism；LTR 恒等 */
+/** Logical page order is unchanged; RTL is handled by the renderer's geometry. */
+@Suppress("UNUSED_PARAMETER")
 internal fun ourIndexFor(harismIdx: Int, spreadCount: Int, reversed: Boolean): Int =
-    if (reversed) spreadCount - 1 - harismIdx else harismIdx
+    harismIdx
 
-/** 双页书脊模式：harism 索引 → 扁平单元索引（RTL 倒排翻译，纯函数可单测） */
+/** Units stay in reading order in both directions. */
+@Suppress("UNUSED_PARAMETER")
 internal fun flatUnitIndexFor(harismIdx: Int, flatCount: Int, reversed: Boolean): Int =
-    if (reversed) flatCount - 1 - harismIdx else harismIdx
+    harismIdx
 
 /**
  * 双页背面目标 flat（纯函数可单测，第六轮第 3 条修正）：
@@ -882,8 +946,8 @@ internal fun curlPageRects(
     }
 }
 
-internal fun harismIndexFor(ourIdx: Int, spreadCount: Int, reversed: Boolean): Int =
-    if (reversed) spreadCount - 1 - ourIdx else ourIdx
+@Suppress("UNUSED_PARAMETER")
+internal fun harismIndexFor(ourIdx: Int, spreadCount: Int, reversed: Boolean): Int = ourIdx
 
 /** 外部页码同步策略（纯函数，可单测） */
 enum class CurlSyncPlan { IMMEDIATE_PRELOAD, DEBOUNCE_MERGE, NOOP }
@@ -922,16 +986,18 @@ internal fun buildCurlFlatUnits(layout: ComicLayout): List<ComicSlot?> {
     return out
 }
 
-/** spread → 两页模式 harism 右页索引（纯函数）：LTR h=2k+1；RTL h=N-1-2k */
+/** The second reading slot is native PAGE_RIGHT; RTL reflects it onto the left. */
+@Suppress("UNUSED_PARAMETER")
 internal fun spreadToHarismTwo(spread: Int, flatCount: Int, reversed: Boolean): Int {
     val maxH = (flatCount - 1).coerceAtLeast(1)
-    val h = if (reversed) flatCount - 1 - spread * 2 else spread * 2 + 1
+    val h = spread * 2 + 1
     return h.coerceIn(1, maxH)
 }
 
 /** 两页模式 harism 右页索引 → spread（纯函数） */
+@Suppress("UNUSED_PARAMETER")
 internal fun harismToSpreadTwo(h: Int, flatCount: Int, reversed: Boolean): Int {
-    val k = if (reversed) (flatCount - 1 - h) / 2 else (h - 1) / 2
+    val k = (h - 1) / 2
     val lastSpread = ((flatCount + 1) / 2 - 1).coerceAtLeast(0)
     return k.coerceIn(0, lastSpread)
 }
@@ -961,6 +1027,7 @@ internal fun ComicHarismCurlReader(
     goNext: () -> Unit,
     /** 沉浸式主色（第六轮第 2 条：GL 内背景跟随，与 Compose 层同源） */
     dynamicBgColor: Color? = null,
+    goPrev: () -> Unit,
 ) {
     val rtl = config.direction == ComicDirection.RTL
     val n = layout.spreadCount
@@ -971,18 +1038,17 @@ internal fun ComicHarismCurlReader(
         if (twoPageMode) buildCurlFlatUnits(layout) else emptyList()
     }
     val controller = remember { ComicHarismController() }
-    // 纹理脏标记：首次附着 / 配置·布局变化后需要强制重载（正常翻页 harism 自更新）
-    var textureDirty by remember { mutableStateOf(true) }
-    // 上次显式重载的页码（区分"用户翻页落定"与"bookState 变化需重载"）
-    var lastReloadedSpread by remember { mutableIntStateOf(-1) }
     // 第 17 条：缩放覆盖层（双击/长按/双指触发）
     var zoomOverlay by remember { mutableStateOf(false) }
     // 当前 spread 纹理未就绪（慢网络）：GL 纸面只有静止点环（harism 无逐帧重绘通道），
     // Compose 层叠加与书库搜索同款的动画 ChasingDots —— 纹理就绪即刻撤下
     var curlPageLoading by remember { mutableStateOf(false) }
+    var curlPageFailed by remember { mutableStateOf(false) }
+    var pageRetry by remember { mutableIntStateOf(0) }
     val latestCurrent by rememberUpdatedState(currentSpread)
     val latestOnSpread by rememberUpdatedState(onSpreadChanged)
     val latestGoNext by rememberUpdatedState(goNext)
+    val latestGoPrev by rememberUpdatedState(goPrev)
     val latestCallbacks by rememberUpdatedState(gestureCallbacks)
     val latestConfig by rememberUpdatedState(config)
     val latestLayout by rememberUpdatedState(layout)
@@ -997,13 +1063,13 @@ internal fun ComicHarismCurlReader(
         controller.twoPage = twoPageMode
         controller.flatUnits = flatUnits
         controller.displayGeneration++   // 旧代预加载/重建结果全部作废
-        textureDirty = true
         if (com.example.BuildConfig.DEBUG) android.util.Log.d("CURLDBG", "ctrl-update reversed=$rtl twoPage=$twoPageMode viewIdx=${controller.view?.currentIndex}")
         controller.view?.apply {
             // 先把索引拨到新映射再 setViewMode：否则 setViewMode 内部的 updatePages
             // 会用旧映射的镜像索引查询未加载页（~135ms 深色纸暗帧）。reversed 已更新，
             // toHarism 即正确目标，且缓存键与方向无关、当前页纹理必命中
             setCurrentIndex(controller.toHarism(currentSpread))
+            setRightToLeft(rtl)
             // 书脊模式接线：双页 = 两页并排 + 步进2 + 封面封底刚体（StPageFlip hard 页）
             setSpreadStep(if (twoPageMode) 2 else 1)
             setViewMode(if (twoPageMode) CurlView.SHOW_TWO_PAGES else CurlView.SHOW_ONE_PAGE)
@@ -1105,30 +1171,53 @@ internal fun ComicHarismCurlReader(
           （第四轮终审 CURL 活切方向实测发现）。 */
     // 漫画翻译（第十五轮）：烘焙代数入键——译文位图替换后重推纹理
     val translationEpoch = LocalComicTranslationEpoch.current
-    var lastTranslationEpochSeen by remember { mutableIntStateOf(translationEpoch) }
     LaunchedEffect(
         currentSpread, layout, config.imagePipelineFingerprint(), bookState,
         config.fit, config.doubleAlign, config.doubleGapDp, config.bgType,
-        config.direction, config.mode, translationEpoch,
+        config.direction, config.mode, translationEpoch, pageRetry,
     ) {
         controller.bookState = bookState
         controller.currentSpreadHint = currentSpread
         val gen = ++controller.displayGeneration
+        curlPageFailed = false
         // 加载圈判定与 composeSpread 纹理解析同源：精确键或任意变体命中即视为已就绪
         curlPageLoading = layout.spreads.getOrNull(currentSpread)?.slots?.any { slot ->
             controller.getCache(slotCacheKey(slot, config, bookState)) == null &&
                 controller.getCacheAnyVariant(slot.ref.id) == null
         } == true
-        val targets = listOf(currentSpread, currentSpread - 1, currentSpread + 1)
+        val targets = listOf(currentSpread, currentSpread + 1, currentSpread - 1)
             .filter { it in layout.spreads.indices }
         var currentShown = false
+        // Enhancement previews are display-only and are replaced by the exact final bitmap.
+        val previews = launch {
+            loader.previewEpoch.collect {
+                if (gen != controller.displayGeneration) return@collect
+                var changed = false
+                layout.spreads.getOrNull(currentSpread)?.slots?.forEach { slot ->
+                    val key = slotCacheKey(slot, config, bookState)
+                    if (loader.peekProcessed(key) == null) loader.peekReadingPreview(key)?.let {
+                        if (controller.getCache(key) !== it) {
+                            controller.putCache(key, it)
+                            changed = true
+                        }
+                    }
+                }
+                if (changed) {
+                    controller.applyPageRects(currentSpread, config, bookState, layout)
+                    controller.view?.setCurrentIndex(controller.toHarism(currentSpread))
+                    curlPageLoading = false
+                }
+            }
+        }
+        try {
         withContext(Dispatchers.Default) {
             targets.forEach { si ->
+                var failed = false
                 layout.spreads[si].slots.forEach { slot ->
                     val key = slotCacheKey(slot, config, bookState)
                     val rotation = ((config.bookRotation + (bookState.pageRotations[slot.ref.id] ?: 0)) % 360 + 360) % 360
-                    runCatching {
-                        loader.load(
+                    try {
+                        val result = loader.loadForDisplay(
                             ref = slot.ref,
                             cacheKey = key,
                             geo = ComicImagePipeline.Geometry(
@@ -1137,63 +1226,36 @@ internal fun ComicHarismCurlReader(
                                 rotationDeg = rotation, cropMode = config.cropMode, manualCrop = config.manualCrop,
                             ),
                             tone = toneOf(config),
+                            visible = si == currentSpread,
                         )
-                    }.getOrNull()?.let { result ->
                         controller.putCache(key, result.bitmap)
                         if (si == currentSpread) currentShown = true
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (_: Exception) {
+                        failed = true
                     }
                 }
-                // 当前 spread 的槽位无论成败都已处理完：撤下加载圈
-                //（失败态由 GL 纸面占位承接，重试由下次预载/翻页触发）
-                if (si == currentSpread) curlPageLoading = false
-            }
-        }
-        // 提交前代校验：本 effect 期间若布局/页码再变（新一轮 effect 已接管），
-        // 本次结果直接丢弃，防止旧代的 setCurrentIndex 覆盖新目标（快速翻页闪回）
-        if (gen != controller.displayGeneration) return@LaunchedEffect
-        // 翻译烘焙代数变化：loader 缓存已换译文位图，强制重建纹理替换旧原文纹理
-        if (translationEpoch != lastTranslationEpochSeen) {
-            lastTranslationEpochSeen = translationEpoch
-            textureDirty = true
-        }
-        // 第 1 条：纸张矩形跟随当前 spread 的真实内禀（首次加载/裁边旋转后修正）
-        controller.applyPageRects(currentSpread, config, bookState, layout)
-        // 第 4 条：慢网络下当前 spread 曾以纸面占位（pendingRetexture）——
-        // 加载完成后强制重建纹理，占位纸面无缝替换为真实页图
-        if (controller.pendingRetexture) {
-            controller.pendingRetexture = false
-            if (com.example.BuildConfig.DEBUG) android.util.Log.d("CURLDBG", "retexture after load sp=$currentSpread")
-            controller.view?.setCurrentIndex(controller.toHarism(currentSpread))
-        }
-        if (currentShown) {
-            layout.spreads.getOrNull(currentSpread)?.slots?.firstOrNull()?.let { slot ->
-                controller.getCache(slotCacheKey(slot, config, bookState))?.let { onBitmapShown(it) }
-            }
-        }
-        if (textureDirty) {
-            if (com.example.BuildConfig.DEBUG) android.util.Log.d("CURLDBG", "textureDirty refresh -> setCurrentIndex(${controller.toHarism(currentSpread)}) viewIdx=${controller.view?.currentIndex}")
-            controller.view?.setCurrentIndex(controller.toHarism(currentSpread))
-            textureDirty = false
-        } else {
-            /* 单页旋转/bookState 变化：预加载重跑但缓存键已变（textureDirty 未置），
-               当前页纹理仍是旧旋转态——显式触发重载让旋转立即生效 */
-            val v = controller.view ?: return@LaunchedEffect
-            val target = controller.toHarism(currentSpread)
-            if (v.currentIndex == target && lastReloadedSpread != currentSpread) {
-                v.setCurrentIndex(target)
-                lastReloadedSpread = currentSpread
-            } else if (v.currentIndex != target) {
-                // 外部跳转兜底：sync effect 的提交可能被代校验竞态吞掉（跳转同时
-                // 重启本 effect，displayGeneration 在其捕获后递增）——本 effect 持有
-                // 最新代，预载完成后视图未在目标索引时直接对齐，杜绝"进度在目标页、
-                // 画面停在旧镜像索引"的脱钩（第四轮终审 CURL 滑条跳转实测发现）
-                if (com.example.BuildConfig.DEBUG) {
-                    android.util.Log.d("CURLDBG", "preload align viewIdx=${v.currentIndex} -> $target (sp=$currentSpread)")
+                // Submit the current page BEFORE waiting for any neighboring network requests.
+                if (si == currentSpread) withContext(Dispatchers.Main) {
+                    if (gen == controller.displayGeneration) {
+                        controller.applyPageRects(currentSpread, config, bookState, layout)
+                        if (currentShown) controller.view?.setCurrentIndex(controller.toHarism(currentSpread))
+                        layout.spreads.getOrNull(currentSpread)?.slots?.firstOrNull()?.let { slot ->
+                            controller.getCache(slotCacheKey(slot, config, bookState))?.let { onBitmapShown(it) }
+                        }
+                        controller.pendingRetexture = false
+                        curlPageFailed = failed
+                        curlPageLoading = false
+                    }
                 }
-                v.setCurrentIndex(target)
-                lastReloadedSpread = currentSpread
             }
         }
+        } finally {
+            previews.cancel()
+        }
+        // Neighbors only fill caches. Never rebuild the visible texture after waiting
+        // for their network requests: a user may already be dragging the next page.
     }
 
     /* ── 自动翻页（while 循环驱动：翻页成功不改 key 也能继续下一轮，避免冻结） ── */
@@ -1242,6 +1304,7 @@ internal fun ComicHarismCurlReader(
                     controller.reversed = rtl
                     controller.twoPage = twoPageMode
                     controller.flatUnits = flatUnits
+                    setRightToLeft(rtl)
                     setAllowLastPageCurl(false)
                     setViewMode(if (twoPageMode) CurlView.SHOW_TWO_PAGES else CurlView.SHOW_ONE_PAGE)
                     setSpreadStep(if (twoPageMode) 2 else 1)
@@ -1312,6 +1375,10 @@ internal fun ComicHarismCurlReader(
                 v.longPressZoomEnabled = latestConfig.longPressZoom
                 v.longPressPanelEnabled = latestConfig.gestureLongPressPanel
                 v.setSpreadStep(if (twoPageMode) 2 else 1)
+                v.forwardSign = if (rtl) 1f else -1f
+                v.isAtForwardEdge = { latestCurrent >= latestLayout.spreadCount - 1 }
+                v.isAtBackwardEdge = { latestCurrent == 0 }
+                v.onChapterEdge = { next -> if (next) latestGoNext() else latestGoPrev() }
             },
         )
 
@@ -1329,10 +1396,15 @@ internal fun ComicHarismCurlReader(
                     .graphicsLayer { alpha = 0.94f },
                 contentAlignment = Alignment.Center,
             ) {
-                com.example.ui.components.ChasingDots(
-                    size = 52.dp,
-                    color = androidx.compose.material3.MaterialTheme.colorScheme.secondary,
-                )
+                ComicLoadingFeedback(layout.spreads.getOrNull(currentSpread)?.slots?.firstOrNull()?.ref) { pageRetry++ }
+            }
+        }
+        if (curlPageFailed && !zoomOverlay) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("本页加载失败", color = Color(0xFFFF9A9A))
+                    TextButton(onClick = { pageRetry++ }) { Text("点击重试", color = Color.White) }
+                }
             }
         }
         if (zoomOverlay) {
@@ -1340,8 +1412,7 @@ internal fun ComicHarismCurlReader(
             val bmp = remember(zoomOverlay, currentSpread, layout) {
                 if (v != null && v.width > 0) {
                     val hIdx = controller.toHarism(currentSpread)
-                    if (controller.twoPage) controller.composeUnit(hIdx, v.width, v.height)
-                    else controller.composeSpread(hIdx, v.width, v.height)
+                    controller.composeSpread(hIdx, v.width, v.height, mirrorForRenderer = false)
                 } else null
             }
             ComicCurlZoomOverlay(

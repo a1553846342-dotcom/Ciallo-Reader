@@ -52,7 +52,8 @@ import com.example.ui.components.AppIconButton
 import com.example.ui.components.DialogLiquidGlass
 import com.example.ui.components.AppIconButton
 import kotlinx.coroutines.launch
-import com.example.ui.adaptive.AdaptiveSpec
+import com.example.ui.adaptive.AdaptiveSpec
+import com.example.ui.components.AppToast
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -60,14 +61,20 @@ fun ZLibraryLoginDialog(
     source: BookSource,
     onDismiss: () -> Unit,
     onSuccess: () -> Unit,
-    hazeState: HazeState? = null
+    hazeState: HazeState? = null,
+    /** 源支持站内注册时提供（如 vomic）：登录窗口下方出现「注册新账号」入口 */
+    onRegister: (suspend () -> Unit)? = null
 ) {
     val context = LocalContext.current
     val activity = androidx.compose.ui.platform.LocalContext.current as? android.app.Activity
     val blurPx = with(androidx.compose.ui.platform.LocalDensity.current) { 18.dp.toPx() }
     val scope = rememberCoroutineScope()
+    val registrationUrl by produceState<String?>(null, source) {
+        value = kotlinx.coroutines.withTimeoutOrNull(5_000) { source.getRegistrationUrl() }
+    }
     val isJsSource = source.id.startsWith("js_")
-    var loginModeTab by remember { mutableStateOf(0) } // 0: 账号密码, 1: Cookie
+    val supportsCookieLogin = !isJsSource || source.id == "js_mycomic"
+    var loginModeTab by remember(source.id) { mutableStateOf(if (source.id == "js_mycomic") 1 else 0) } // 0: 账号密码, 1: Cookie
     var username by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var cookieString by remember { mutableStateOf("") }
@@ -174,7 +181,7 @@ fun ZLibraryLoginDialog(
 
                     Spacer(modifier = Modifier.height(24.dp))
 
-                    if (!isJsSource) {
+                    if (supportsCookieLogin && source.id != "js_mycomic") {
                         TabRow(
                             selectedTabIndex = loginModeTab,
                             containerColor = Color.Transparent,
@@ -188,7 +195,7 @@ fun ZLibraryLoginDialog(
                             Tab(
                                 selected = loginModeTab == 1,
                                 onClick = { loginModeTab = 1 },
-                                text = { Text("粘贴 Cookie", fontSize = 14.sp, fontWeight = if (loginModeTab == 1) FontWeight.Bold else FontWeight.Normal) }
+                                text = { Text(if (source.id == "js_mycomic") "cf_clearance" else "粘贴 Cookie", fontSize = 14.sp, fontWeight = if (loginModeTab == 1) FontWeight.Bold else FontWeight.Normal) }
                             )
                         }
                     }
@@ -230,8 +237,8 @@ fun ZLibraryLoginDialog(
                         OutlinedTextField(
                             value = cookieString,
                             onValueChange = { cookieString = it },
-                            label = { Text("Cookie (包含 remix_userkey)") },
-                            placeholder = { Text("remix_userid=...; remix_userkey=...") },
+                            label = { Text(if (source.id == "js_mycomic") "cf_clearance 的值" else "Cookie (包含 remix_userkey)") },
+                            placeholder = { Text(if (source.id == "js_mycomic") "从浏览器复制 cf_clearance 的值" else "remix_userid=...; remix_userkey=...") },
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(130.dp),
@@ -269,12 +276,12 @@ fun ZLibraryLoginDialog(
                                 }
                                 when (val result = source.login(credential)) {
                                     is SourceResult.Success -> {
-                                        Toast.makeText(context, "登录成功", Toast.LENGTH_SHORT).show()
+                                        AppToast.makeText(context, "登录成功", Toast.LENGTH_SHORT).show()
                                         onSuccess()
                                         onDismiss()
                                     }
                                     is SourceResult.Error -> {
-                                        Toast.makeText(context, result.exception.message ?: "登录失败", Toast.LENGTH_LONG).show()
+                                        AppToast.makeText(context, result.exception.message ?: "登录失败", Toast.LENGTH_LONG).show()
                                     }
                                 }
                                 isLoading = false
@@ -285,18 +292,46 @@ fun ZLibraryLoginDialog(
 
                     Spacer(modifier = Modifier.height(10.dp))
 
-                    if (!isJsSource) {
+                    if (onRegister != null) {
                         TextButton(
                             onClick = {
-                                val url = "https://${ZLibraryNodeConfig.domain}/registration"
+                                scope.launch {
+                                    isLoading = true
+                                    runCatching { onRegister() }
+                                        .onSuccess {
+                                            AppToast.makeText(context, "注册成功，已自动登录", Toast.LENGTH_SHORT).show()
+                                            onSuccess()
+                                            onDismiss()
+                                        }
+                                        .onFailure {
+                                            AppToast.makeText(context, it.message ?: "注册失败", Toast.LENGTH_LONG).show()
+                                        }
+                                    isLoading = false
+                                }
+                            },
+                            enabled = !isLoading,
+                            modifier = Modifier.align(Alignment.CenterHorizontally)
+                        ) {
+                            Text(
+                                text = "没有账号？注册新账号",
+                                fontSize = 13.sp,
+                                color = MaterialTheme.colorScheme.secondary
+                            )
+                        }
+                    }
+
+                    registrationUrl?.let { url ->
+                        TextButton(
+                            onClick = {
                                 runCatching {
                                     context.startActivity(
                                         Intent(Intent.ACTION_VIEW, Uri.parse(url))
                                     )
                                 }.onFailure {
-                                    Toast.makeText(context, "无法打开注册页面", Toast.LENGTH_SHORT).show()
+                                    AppToast.makeText(context, "无法打开注册页面", Toast.LENGTH_SHORT).show()
                                 }
                             },
+                            enabled = !isLoading,
                             modifier = Modifier
                                 .align(Alignment.CenterHorizontally)
                         ) {

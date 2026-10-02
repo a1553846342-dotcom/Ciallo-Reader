@@ -13,6 +13,9 @@ interface BookSource {
     suspend fun logout()
     suspend fun isLoggedIn(): Boolean
 
+    /** Source-provided account registration page, when available. */
+    suspend fun getRegistrationUrl(): String? = null
+
     /**
      * 返回书籍可用的下载格式列表。默认实现返回空列表（不支持多格式选择）。
      * 调用方可凭此展示"选择格式"弹窗；空列表表示直接走 [getDownloadInfo] 默认格式。

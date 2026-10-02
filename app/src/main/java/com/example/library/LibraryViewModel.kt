@@ -23,6 +23,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -37,6 +38,8 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.util.concurrent.TimeUnit
 
+import com.example.ui.components.AppToast
+
 // 阅读器无法打开的格式（与 BookRepository.unsupportedBinaryExtensions 对齐）：
 // PDF 不拦——下载后由 ComicParser 逐页位图渲染，以翻页模式打开；
 // KFX/DJVU/DOC/RTF/CHM 无任何阅读管线，下载前拦截。
@@ -50,6 +53,10 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
 
     val sourceManager = SourceManager(SharedPreferencesSourceStorage(application))
     val downloadManager = DownloadManager(application)
+    val downloadedNovelKeys = AppDatabase.getDatabase(application).bookDao().getAllBooks().map { books ->
+        books.filter { !it.isComic && it.sourceId != null && it.comicId != null }
+            .map { DownloadManager.taskId(it.sourceId.orEmpty(), it.comicId.orEmpty()) }.toSet()
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptySet())
     private val database = AppDatabase.getDatabase(application)
     private val repository = BookRepository(application, database.bookDao())
 
@@ -61,7 +68,7 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     val hasConfiguredSource = MutableStateFlow(prefs.hasConfiguredSource)
     val hasImportedLocalBook = MutableStateFlow(prefs.hasImportedLocalBook)
 
-    // 阅读统计：为已删除书籍补抓封面与书信息（按书名在所有漫画源搜索一次，缓存到本地，删除历史时清除）
+    // 阅读统计先复用原阅读入口/本地元数据，旧记录才限量并发查找。
     private val _recordCovers = MutableStateFlow<Map<Int, String>>(emptyMap())
     val recordCovers: StateFlow<Map<Int, String>> = _recordCovers.asStateFlow()
     private val _recordBooks = MutableStateFlow<Map<Int, SearchBook>>(emptyMap())
@@ -75,87 +82,55 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     private val _formatLoading = MutableStateFlow(false)
     val formatLoading: StateFlow<Boolean> = _formatLoading.asStateFlow()
 
+    private val sourceSearches = SourceSearchCoordinator()
+    private val recordResolver = ReadingRecordResolver(sourceSearches)
+    private var recordResolveJob: Job? = null
+    private val _recordCoverHeaders = MutableStateFlow<Map<Int, Map<String, String>>>(emptyMap())
+    val recordCoverHeaders: StateFlow<Map<Int, Map<String, String>>> = _recordCoverHeaders.asStateFlow()
+
     fun resolveMissingRecordCovers(records: List<com.example.data.ReadingRecord>) {
-        viewModelScope.launch {
-            val missing = records.filter { _recordBooks.value[it.id] == null }
+        recordResolveJob?.cancel()
+        recordResolveJob = viewModelScope.launch(Dispatchers.IO) {
+            val context = getApplication<Application>()
+            val legacy = context.getSharedPreferences("record_cover_cache", android.content.Context.MODE_PRIVATE)
+            val activeIds = records.map { it.id }.toSet()
+            _recordBooks.update { it.filterKeys(activeIds::contains) }
+            _recordCovers.update { it.filterKeys(activeIds::contains) }
+            _recordCoverHeaders.update { it.filterKeys(activeIds::contains) }
+            val missing = records.filter { it.id !in _recordBooks.value }
             if (missing.isEmpty()) return@launch
-            val prefs = getApplication<Application>().getSharedPreferences(
-                "record_cover_cache",
-                android.content.Context.MODE_PRIVATE
-            )
-            val cached = missing.mapNotNull { r ->
-                val json = prefs.getString(r.id.toString(), null) ?: return@mapNotNull null
-                val book = runCatching {
-                    val obj = org.json.JSONObject(json)
-                    SearchBook(
-                        id = obj.optString("comicId").ifBlank { "record_${r.id}" },
-                        sourceId = obj.optString("sourceId", ""),
-                        title = obj.optString("title", r.bookTitle),
-                        cover = obj.optString("cover").ifBlank { null },
-                        author = ""
-                    )
-                }.getOrNull() ?: return@mapNotNull null
-                r.id to book
-            }.toMap()
-            if (cached.isNotEmpty()) {
-                _recordBooks.update { it + cached }
-                _recordCovers.update {
-                    it + cached.mapValues { entry -> entry.value.cover ?: "" }.filterValues { v -> v.isNotBlank() }
-                }
-            }
-            val toResolve = missing.filter { it.id !in cached }.take(5)
-            val resolved = toResolve.map { r ->
-                r.id to fetchRecordBook(r.bookTitle)
-            }.filter { it.second != null }.map { it.first to it.second!! }
-            resolved.forEach { (id, book) ->
-                val json = org.json.JSONObject().apply {
-                    put("title", book.title)
-                    put("sourceId", book.sourceId)
-                    put("comicId", book.id)
-                    put("cover", book.cover ?: "")
-                }.toString()
-                prefs.edit().putString(id.toString(), json).apply()
-            }
-            if (resolved.isNotEmpty()) {
-                _recordBooks.update { it + resolved.toMap() }
-                _recordCovers.update {
-                    it + resolved.toMap().mapValues { entry -> entry.value.cover ?: "" }.filterValues { v -> v.isNotBlank() }
-                }
-            }
+            val sources = sourceManager.availableSources.value
+            recordResolver.resolve(missing, database.bookDao().getAllBooksSync(),
+                database.favoriteDao().allFavoritesSync(), sources,
+                cached = { record ->
+                    ReadingRecordMetadata.find(context, record)
+                        ?: ReadingRecordMetadata.decode(legacy.getString(record.id.toString(), null), record.bookTitle)
+                },
+                publish = { record, book ->
+                    ReadingRecordMetadata.remember(context, book.copy(title = record.bookTitle), record.bookId, record.id)
+                    _recordBooks.update { it + (record.id to book) }
+                    book.cover?.takeIf { it.isNotBlank() }?.let { cover ->
+                        _recordCovers.update { it + (record.id to cover) }
+                    }
+                })
         }
     }
 
-    private suspend fun fetchRecordBook(title: String): SearchBook? = withContext(Dispatchers.IO) {
-        if (title.isBlank()) return@withContext null
-        // 阅读统计修复（封面串书）：按书名反查时必须校验标题相关性——
-        // 旧实现取第一个源的第一条有封面结果，垃圾源/热门书充数时会出现
-        // "记录是 A 书、封面和点进去是 B 书"的串书。归一化（小写/去标点/繁简折叠）
-        // 后要求完全相等或一方包含另一方（不同源书名常有副标题前后缀差异）；
-        // 无命中宁可不补封面，也不拿无关书充数。
-        fun norm(s: String): String = com.example.source.anilist.TitleNormalizer.normalize(
-            s.lowercase().replace(Regex("""[\s\p{Punct}]+"""), "")
-        )
-        val want = norm(title)
-        if (want.isBlank()) return@withContext null
-        val sources = sourceManager.allSources.value.filterIsInstance<ComicSource>()
-        for (source in sources) {
-            val result = withTimeoutOrNull(8000) { source.search(title) }
-            val books = (result as? SourceResult.Success)?.data ?: continue
-            val match = books.firstOrNull { b ->
-                val n = norm(b.title)
-                n.isNotEmpty() && (n == want || n.contains(want) || want.contains(n))
-            }
-            if (match != null) {
-                return@withContext SearchBook(
-                    id = match.comicId?.takeIf { c -> c.isNotBlank() } ?: match.id,
-                    sourceId = match.sourceId,
-                    title = match.title,
-                    cover = match.cover,
-                    author = ""
-                )
+    fun resolveRecordCoverHeaders(records: List<com.example.data.ReadingRecord>) {
+        records.forEach { record ->
+            val book = _recordBooks.value[record.id] ?: return@forEach
+            val cover = book.cover ?: return@forEach
+            if (!cover.startsWith("http") || record.id in _recordCoverHeaders.value) return@forEach
+            // Mark pending first, so recomposition cannot enqueue the same JS call again.
+            _recordCoverHeaders.update { it + (record.id to emptyMap()) }
+            viewModelScope.launch(Dispatchers.IO) {
+                val source = sourceManager.getSource(book.sourceId) as? ComicSource
+                val headers = withTimeoutOrNull(3_000) { source?.getCoverHeaders(cover) }.orEmpty()
+                if (_recordBooks.value[record.id] == book) {
+                    _recordCoverHeaders.update { it + (record.id to headers) }
+                }
             }
         }
-        null
     }
 
     private val _isCurrentSourceLoggedIn = MutableStateFlow(false)
@@ -163,6 +138,11 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
 
     private val _comicBook = MutableStateFlow<SearchBook?>(null)
     val comicBook: StateFlow<SearchBook?> = _comicBook.asStateFlow()
+    private var chaptersRequestSeq = 0L
+    private var imagesRequestSeq = 0L
+    private var novelRequestSeq = 0L
+    private var novelLoadJob: Job? = null
+    private var novelPrefetchJob: Job? = null
 
     /** 章节页是否为文本小说模式（Legado 网文源：点击章节进入文字阅读而非图片阅读） */
     private val _comicIsTextMode = MutableStateFlow(false)
@@ -208,15 +188,15 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     val comicDownloadTasks: StateFlow<Map<String, ComicDownloadTask>> = ComicDownloadManager.tasks
 
     val comicDownloading: StateFlow<Set<String>> = ComicDownloadManager.tasks
-        .map { tasks -> tasks.filterValues { it.status == ComicDownloadStatus.DOWNLOADING }.keys }
+        .combine(comicBook) { tasks, book -> tasks.values.filter { it.book.sourceId == book?.sourceId && it.book.id == book?.id && it.status == ComicDownloadStatus.DOWNLOADING }.map { it.chapterId }.toSet() }
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptySet())
 
     val comicDownloadProgress: StateFlow<Map<String, Float>> = ComicDownloadManager.tasks
-        .map { tasks -> tasks.mapValues { (_, t) -> t.progress } }
+        .combine(comicBook) { tasks, book -> tasks.values.filter { it.book.sourceId == book?.sourceId && it.book.id == book?.id }.associate { it.chapterId to it.progress } }
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
 
     val comicPaused: StateFlow<Set<String>> = ComicDownloadManager.tasks
-        .map { tasks -> tasks.filterValues { it.status == ComicDownloadStatus.PAUSED }.keys }
+        .combine(comicBook) { tasks, book -> tasks.values.filter { it.book.sourceId == book?.sourceId && it.book.id == book?.id && it.status == ComicDownloadStatus.PAUSED }.map { it.chapterId }.toSet() }
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptySet())
 
     val comicMessage: StateFlow<String?> = ComicDownloadManager.message
@@ -225,6 +205,7 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     val searchHistory: StateFlow<List<String>> = _searchHistory.asStateFlow()
 
     init {
+        ComicDownloadManager.initialize(application)
         _searchHistory.value = prefs.searchHistory
         // 漫画下载完成后刷新“已导入本地书”状态
         val notifiedSuccess = mutableSetOf<String>()
@@ -243,7 +224,10 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
             com.example.data.AppDatabase.ensureBundledTitlesImported(application)
             sourceManager.initialize()
             sourceManager.registerSource(ZLibrarySource(application))
-            sourceManager.registerSource(MangaDexSource())
+            sourceManager.registerSource(com.example.source.impl.AutoNovelSource(application))
+            sourceManager.registerSource(com.example.source.impl.Wenku8LibrarySource(application))
+            sourceManager.registerSource(com.example.source.impl.IxdzsSource(application))
+            sourceManager.registerSource(MangaDexSource(context = application))
 
             // 一次性清理上一版内置的社区漫画源（comic_* 自定义书源）
             if (prefs.hasImportedCommunityComics) {
@@ -254,10 +238,14 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
             }
 
             // Venera 兼容 JS 源：优先本地缓存，无缓存时从远程仓库安装
-            val jsSources = JsSourceRepo.loadCached(application, prefs.showAdultSources)
-                .ifEmpty {
-                    JsSourceRepo.install(application, prefs.jsSourceRepoUrl, prefs.showAdultSources)
-                }
+            val cachedJsSources = JsSourceRepo.loadCached(application, prefs.showAdultSources)
+            val refreshedJsSources = if (cachedJsSources.isEmpty() ||
+                JsSourceRepo.needsRepair(application, prefs.showAdultSources)
+            ) {
+                JsSourceRepo.install(application, prefs.jsSourceRepoUrl, prefs.showAdultSources)
+            } else emptyList()
+            val jsSources = (cachedJsSources + refreshedJsSources)
+                .associateBy { it.sourceKey }.values.toList()
             jsSources.forEach { source ->
                 sourceManager.registerSource(source, defaultEnabled = true)
             }
@@ -273,6 +261,14 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun openComic(book: SearchBook) {
+        novelRequestSeq++
+        novelLoadJob?.cancel()
+        novelPrefetchJob?.cancel()
+        _novelChapterLoading.value = false
+        imagesRequestSeq++
+        comicPrefetchJobs.values.forEach { it.cancel() }
+        comicPrefetchJobs.clear()
+        comicPrefetchCache.clear()
         _comicBook.value = book
         _comicIsTextMode.value = sourceManager.availableSources.value
             .firstOrNull { it.id == book.sourceId }?.capabilities?.supportOnlineText == true
@@ -289,22 +285,47 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
 
     /** 文本小说源：加载章节正文 */
     fun loadChapterText(chapter: ComicChapter) {
+        val request = ++novelRequestSeq
+        novelLoadJob?.cancel()
+        novelPrefetchJob?.cancel()
+        val book = _comicBook.value
         val source = sourceManager.availableSources.value
-            .firstOrNull { it.id == _comicBook.value?.sourceId } as? ComicSource
+            .firstOrNull { it.id == book?.sourceId } as? ComicSource
         if (source == null) {
             _novelChapterError.value = "当前书源不可用"
+            _novelChapterLoading.value = false
             return
         }
-        viewModelScope.launch {
-            _activeNovelChapter.value = chapter
-            _novelChapterLoading.value = true
-            _novelChapterError.value = null
-            _novelChapterText.value = ""
-            when (val result = source.getChapterText(chapter.id)) {
-                is SourceResult.Success -> _novelChapterText.value = result.data
-                is SourceResult.Error -> _novelChapterError.value = result.exception.message ?: "章节加载失败"
+        _activeNovelChapter.value = chapter
+        _novelChapterLoading.value = true
+        _novelChapterError.value = null
+        _novelChapterText.value = ""
+        novelLoadJob = viewModelScope.launch {
+            try {
+                val result = source.getChapterText(chapter.id)
+                if (request != novelRequestSeq || _comicBook.value != book) return@launch
+                when (result) {
+                    is SourceResult.Success -> {
+                        _novelChapterText.value = result.data
+                        // The source owns a bounded text cache. Cancel this one next-chapter
+                        // request on navigation so prefetch never blocks the selected chapter.
+                        if (source is com.example.source.impl.AutoNovelSource) {
+                            val index = _comicChapters.value.indexOfFirst { it.id == chapter.id }
+                            val next = if (index >= 0) _comicChapters.value.getOrNull(index + 1) else null
+                            if (next != null) novelPrefetchJob = viewModelScope.launch(Dispatchers.IO) {
+                                source.getChapterText(next.id)
+                            }
+                        }
+                    }
+                    is SourceResult.Error -> _novelChapterError.value = result.exception.message ?: "章节加载失败"
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (request == novelRequestSeq) _novelChapterError.value = e.message ?: "章节加载失败"
+            } finally {
+                if (request == novelRequestSeq) _novelChapterLoading.value = false
             }
-            _novelChapterLoading.value = false
         }
     }
 
@@ -315,12 +336,48 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     private val _aggregateKind = MutableStateFlow("comic")
     val aggregateKind: StateFlow<String> = _aggregateKind.asStateFlow()
 
+    data class DetailSearchRequest(val keyword: String, val token: Long)
+    private val _detailSearchRequest = MutableStateFlow<DetailSearchRequest?>(null)
+    val detailSearchRequest = _detailSearchRequest.asStateFlow()
+    private var detailSearchToken = 0L
+
+    fun requestAggregateSearch(keyword: String, textMode: Boolean = false) {
+        if (keyword.isBlank()) return
+        setAggregateMode(true)
+        setAggregateKind(if (textMode) "novel" else "comic")
+        _detailSearchRequest.value = DetailSearchRequest(keyword.trim(), ++detailSearchToken)
+    }
+
+    fun consumeDetailSearch(token: Long) {
+        if (_detailSearchRequest.value?.token == token) _detailSearchRequest.value = null
+    }
+
     fun setAggregateMode(enabled: Boolean) {
+        searchRequestSeq++
+        if (_aggregateMode.value != enabled) resetSearchResults()
         _aggregateMode.value = enabled
     }
 
     fun setAggregateKind(kind: String) {
+        require(kind == "comic" || kind == "novel") { "未知的聚合搜索类型" }
+        if (_aggregateKind.value == kind) return
+        searchRequestSeq++
+        resetSearchResults()
         _aggregateKind.value = kind
+    }
+
+    private fun cancelAggregateSearch() {
+        aggregateSearchSeq++
+        aggregateSearchJob?.cancel()
+        aggregateSearchJob = null
+        singleSearchJob?.cancel()
+        singleSearchJob = null
+    }
+
+    private fun resetSearchResults() {
+        cancelAggregateSearch()
+        _uiState.value = LibraryUiState.Empty
+        errorMessage.value = null
     }
 
     /* ── 多语言搜索开关（第十一轮第 6 条）：UI 可见可控，驱动 expandVariants ── */
@@ -333,6 +390,11 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private var aggregateSearchSeq = 0L
+    private var aggregateSearchJob: Job? = null
+    private var singleSearchJob: Job? = null
+    private val aggregateSearchSlots = Semaphore(4)
+    private val comicAggregateSearch = ComicAggregateSearch(searches = sourceSearches)
+    private var searchRequestSeq = 0L
 
     /* ── 多语言标题变体扩展（第七轮第 7 条；第十一轮第 6 条修复）──
      * 用户输入 → 归一化（含繁→简折叠）→ 查本地 AniList 标题库 → 命中作品的其它
@@ -344,12 +406,15 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
      * 短名（"无职转生"）、库内存的是完整标题（"無職転生 ～異世界行ったら本気だす～"），
      * 等值永远落空 → 多语言扩展从未真正生效。现改为：精确 → 前缀/子串包含匹配；
      * 并叠加繁简折叠（"無職転生" ↔ "无职转生" 同一作品两种书写互匹配）。 */
+    private val titleVariantCache=java.util.concurrent.ConcurrentHashMap<String, Pair<Long,List<String>>>()
     private suspend fun expandVariants(keyword: String): List<String> {
         val fallback = listOf(keyword)
         if (keyword.isBlank()) return fallback
         // 第十一轮第 6 条：多语言搜索开关（UI 可控；关闭后只用原始关键词）
         if (!prefs.multiLanguageSearch) return fallback
-        return runCatching {
+        val now=android.os.SystemClock.elapsedRealtime()
+        titleVariantCache[keyword]?.takeIf { now-it.first<60_000 }?.let { return it.second }
+        val result = runCatching {
             val normalized = com.example.source.anilist.TitleNormalizer.normalize(keyword)
             val compact = com.example.source.anilist.TitleNormalizer.compact(keyword)
             if (normalized.isEmpty()) return fallback
@@ -365,10 +430,16 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
                     mediaIds = dao.findMediaIdsContaining(escNorm, escComp, 8)
                 }
             }
-            if (mediaIds.isEmpty()) return fallback
+            if (mediaIds.isEmpty()) return@runCatching fallback
             val rawTitles = dao.getRawTitlesFor(mediaIds)
             com.example.source.anilist.SearchVariantBuilder.build(keyword, rawTitles)
-        }.getOrDefault(fallback)
+        }.getOrElse { error ->
+            if (error is CancellationException) throw error
+            fallback
+        }
+        if (titleVariantCache.size>=128) titleVariantCache.clear()
+        titleVariantCache[keyword]=now to result
+        return result
     }
 
     /** SQLite LIKE 通配符转义（配套 DAO 里的 ESCAPE '\'） */
@@ -376,18 +447,21 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
         s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
     fun aggregateSearch(keyword: String) {
+        searchRequestSeq++
+        cancelAggregateSearch()
+        val seq = aggregateSearchSeq
         // 聚合类别互斥过滤：novel=小说源（Z-Library/Legado 文字源）；comic=漫画源（且排除文字源）
         val novel = _aggregateKind.value == "novel"
         val sources = sourceManager.availableSources.value.filter {
-            if (novel) it.isNovelSource else it.capabilities.supportComic && !it.isNovelSource
+            it.capabilities.supportSearch && !it.capabilities.environmentOnly &&
+                if (novel) it.isNovelSource else it.isComicSource
         }
         Log.i("Aggregate", "aggregateSearch '$keyword' sources=${sources.map { it.name }}")
         if (sources.isEmpty()) {
             _uiState.value = LibraryUiState.Error(LibraryError.SourceUnavailable)
             return
         }
-        val seq = ++aggregateSearchSeq
-        viewModelScope.launch {
+        aggregateSearchJob = viewModelScope.launch {
             errorMessage.value = null
             // 先展示所有源的“加载中”分组，哪个源先完成就先把哪个源的结果推给 UI
             val initialGroups = sources.map { source ->
@@ -400,6 +474,17 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
                 )
             }
             _uiState.value = LibraryUiState.AggregateResults(initialGroups, running = true)
+            if (!novel) {
+                comicAggregateSearch.search(sources, keyword, ::expandVariants) { group ->
+                    if (seq == aggregateSearchSeq) {
+                        _uiState.update { current ->
+                            if (current is LibraryUiState.AggregateResults) current.withComicSearchGroup(group)
+                            else current
+                        }
+                    }
+                }
+                return@launch
+            }
             // 第七轮第 7 条：多语言变体（本地 AniList 标题库扩展；离线安全退化）
             val variants = expandVariants(keyword)
             Log.i("Aggregate", "search variants: $variants")
@@ -416,12 +501,20 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
                         // 20s 超时会中途砍掉 WebView 导致"搜索超时"假错误；
                         // 过挑战后验证 Cookie 同步进 OkHttp，后续搜索恢复秒级。
                         val perSourceTimeoutMs = if (source.id == "zlibrary") 55000L else 20000L
-                        val result = withTimeoutOrNull(perSourceTimeoutMs) { source.search(variant) }
+                        val result = aggregateSearchSlots.withPermit {
+                            try {
+                                withTimeoutOrNull(perSourceTimeoutMs) { sourceSearches.search(source, variant) }
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                SourceResult.Error(SourceException.NetworkError(e.message ?: "搜索失败", e))
+                            }
+                        }
                         if (seq != aggregateSearchSeq) return@launch
                         when (result) {
                             is SourceResult.Success -> {
                                 anySuccess = true
-                                collected.addAll(result.data)
+                                collected.addAll(result.data.map { it.copy(sourceId = source.id) })
                                 // 变体粒度流式更新：先到的语言结果先展示
                                 _uiState.update { current ->
                                     if (current !is LibraryUiState.AggregateResults) current
@@ -481,49 +574,101 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun loadChapters(book: SearchBook) {
+        val requestSeq = ++chaptersRequestSeq
         val source = sourceManager.availableSources.value.firstOrNull { it.id == book.sourceId } as? ComicSource
-            ?: sourceManager.activeSource.value as? ComicSource
         if (source == null) {
-            _comicChaptersError.value = "当前书源不支持漫画"
+            _comicChaptersError.value = "该漫画的书源已停用或不支持漫画"
+            _comicChaptersLoading.value = false
             return
         }
         viewModelScope.launch {
+            if (requestSeq != chaptersRequestSeq) return@launch
             _comicChaptersLoading.value = true
             _comicChaptersError.value = null
-            when (val result = source.getChapters(book.id)) {
-                is SourceResult.Success -> {
-                    _comicChapters.value = result.data
-                    if (result.data.isEmpty()) {
-                        _comicChaptersError.value = "暂无可用章节"
+            try {
+                val result = source.getChapters(book.id)
+                if (requestSeq != chaptersRequestSeq) return@launch
+                when (result) {
+                    is SourceResult.Success -> {
+                        _comicChapters.value = result.data
+                        if (result.data.isEmpty()) _comicChaptersError.value = "暂无可用章节"
+                    }
+                    is SourceResult.Error -> {
+                        _comicChaptersError.value = result.exception.message ?: "章节加载失败"
                     }
                 }
-                is SourceResult.Error -> {
-                    _comicChaptersError.value = result.exception.message ?: "章节加载失败"
+                // Enrich every comic source's search snapshot. JS reuses the loadInfo request above.
+                _comicChaptersLoading.value = false
+                if (!_comicIsTextMode.value) {
+                    val detail = try {
+                        withTimeoutOrNull(15_000) { source.getDetail(book.id) }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.w("ComicDetail", "Metadata unavailable for ${book.sourceId}", e)
+                        null
+                    }
+                    if (requestSeq != chaptersRequestSeq) return@launch
+                    if (detail is SourceResult.Success) {
+                        _comicBook.value = book.withComicDetail(detail.data)
+                    }
                 }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (requestSeq == chaptersRequestSeq) _comicChaptersError.value = e.message ?: "章节加载失败"
+            } finally {
+                if (requestSeq == chaptersRequestSeq) _comicChaptersLoading.value = false
             }
-            _comicChaptersLoading.value = false
         }
     }
 
     fun loadChapterImages(chapter: ComicChapter) {
+        val requestSeq = ++imagesRequestSeq
         val source = sourceManager.availableSources.value
             .firstOrNull { it.id == _comicBook.value?.sourceId } as? ComicSource
-        if (source == null) return
+        if (source == null) {
+            _comicChapterError.value = "该漫画的书源已停用"
+            _comicChapterLoading.value = false
+            return
+        }
         viewModelScope.launch {
+            if (requestSeq != imagesRequestSeq) return@launch
             _activeComicChapter.value = chapter
             _comicChapterLoading.value = true
             _comicChapterError.value = null
             _comicChapterImages.value = emptyList()
-            when (val result = source.getChapterImages(chapter.id)) {
-                is SourceResult.Success -> {
-                    _comicChapterImages.value = result.data
-                    _comicChapterHeaders.value = source.getChapterImageHeaders(chapter.id, result.data)
+            try {
+                // 下一章预取命中：图片列表零网络直接上屏（对齐 Mihon/Kotatsu 预载策略）
+                val prefetched = comicPrefetchCache[chapter.id]
+                if (prefetched != null) {
+                    if (requestSeq != imagesRequestSeq) return@launch
+                    _comicChapterImages.value = prefetched
+                    _comicChapterHeaders.value = runCatching {
+                        source.getChapterImageHeaders(chapter.id, prefetched)
+                    }.getOrDefault(emptyMap())
+                    return@launch
                 }
-                is SourceResult.Error -> {
-                    _comicChapterError.value = result.exception.message ?: "图片加载失败"
+                val result = source.getChapterImages(chapter.id)
+                if (requestSeq != imagesRequestSeq) return@launch
+                when (result) {
+                    is SourceResult.Success -> {
+                        val headers = source.getChapterImageHeaders(chapter.id, result.data)
+                        if (requestSeq != imagesRequestSeq) return@launch
+                        _comicChapterImages.value = result.data
+                        _comicChapterHeaders.value = headers
+                    }
+                    is SourceResult.Error -> {
+                        _comicChapterError.value = result.exception.message ?: "图片加载失败"
+                    }
                 }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (requestSeq == imagesRequestSeq) _comicChapterError.value = e.message ?: "图片加载失败"
+            } finally {
+                if (requestSeq == imagesRequestSeq) _comicChapterLoading.value = false
             }
-            _comicChapterLoading.value = false
         }
     }
 
@@ -542,9 +687,53 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
             source?.getResolvedHeaders(url) ?: emptyMap()
         }
 
+    /* ── 下一章预取（对齐 Mihon/Kotatsu：读到章尾自动预载下一章） ── */
+
+    // 插入序缓存（近 6 章）；预取命中后切章零网络
+    private val comicPrefetchCache = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
+    private val comicPrefetchJobs = java.util.concurrent.ConcurrentHashMap<String, Job>()
+    private val comicPrefetchInFlight =
+        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+
+    /** 读到章尾时预取下一章：图片列表进内存缓存，前两页图片进阅读器磁盘缓存。 */
+    fun prefetchNextComicChapter(chapter: ComicChapter?) {
+        val ch = chapter ?: return
+        if (comicPrefetchCache.containsKey(ch.id)) return
+        if (!comicPrefetchInFlight.add(ch.id)) return
+        val selected = _comicBook.value ?: return
+        val source = sourceManager.availableSources.value.firstOrNull { it.id == selected.sourceId } as? ComicSource ?: return
+        comicPrefetchJobs[ch.id] = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val result = kotlinx.coroutines.withTimeoutOrNull(20_000L) {
+                    source.getChapterImages(ch.id)
+                }
+                if (result is SourceResult.Success && result.data.isNotEmpty() && _comicBook.value == selected) {
+                    // 近 6 章上限：超出时挤掉最早的
+                    if (comicPrefetchCache.size >= 6) {
+                        comicPrefetchCache.remove(comicPrefetchCache.keys.first())
+                    }
+                    comicPrefetchCache[ch.id] = result.data
+                    val headers = runCatching {
+                        source.getChapterImageHeaders(ch.id, result.data)
+                    }.getOrDefault(emptyMap())
+                    // 前两页直接进阅读器加载器（磁盘缓存 512MB）：切章首屏零网络
+                    result.data.take(2).forEach { url ->
+                        com.example.ui.warmComicPage(url, headers[url].orEmpty())
+                    }
+                }
+            } catch (e: Exception) {
+                if(e is CancellationException) throw e
+                // 预取失败静默：切章时按正常流程加载
+            } finally {
+                comicPrefetchInFlight.remove(ch.id)
+                comicPrefetchJobs.remove(ch.id)
+            }
+        }
+    }
+
     fun downloadComicChapter(book: SearchBook, chapter: ComicChapter) {
         if (chapter.external) {
-            android.widget.Toast.makeText(
+            AppToast.makeText(
                 getApplication(),
                 "站外链接章节暂不支持下载",
                 android.widget.Toast.LENGTH_SHORT
@@ -554,7 +743,7 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
         val source = sourceManager.availableSources.value
             .firstOrNull { it.id == book.sourceId } as? ComicSource
         if (source == null) {
-            android.widget.Toast.makeText(
+            AppToast.makeText(
                 getApplication(),
                 "当前书源不支持漫画",
                 android.widget.Toast.LENGTH_SHORT
@@ -569,11 +758,11 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun pauseComicChapter(chapterId: String) {
-        ComicDownloadManager.pause(chapterId)
+        ComicDownloadManager.pause(chapterId, _comicBook.value)
     }
 
     fun cancelComicChapter(chapterId: String) {
-        ComicDownloadManager.cancel(chapterId)
+        ComicDownloadManager.cancel(chapterId, _comicBook.value)
     }
 
     fun clearComicMessage() {
@@ -617,18 +806,19 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     ) {
         viewModelScope.launch(Dispatchers.IO) {
             Log.i("SmokeTest", "=== smoke test start ===")
-            val client = OkHttpClient.Builder()
+            val client = com.example.source.SharedHttpTransport.builder()
                 .connectTimeout(15, TimeUnit.SECONDS)
                 .readTimeout(25, TimeUnit.SECONDS)
                 .followRedirects(true)
                 .protocols(listOf(okhttp3.Protocol.HTTP_1_1))
+                .dns(com.example.source.js.SourceDns.dns())
                 .build()
             val prefs = com.example.data.PreferencesManager(getApplication())
             var jsSources = JsSourceRepo.loadCached(getApplication(), includeAdult = true)
             if (jsSources.isEmpty()) {
                 jsSources = JsSourceRepo.install(getApplication(), prefs.jsSourceRepoUrl, includeAdult = true)
             }
-            val all = jsSources + listOf(MangaDexSource())
+            val all = jsSources + listOf(MangaDexSource(context = getApplication()))
             all.forEach { source ->
                 val name = (source as? com.example.source.js.JsComicSource)?.name ?: source.id
                 if (filter.isNotBlank() && !source.id.contains(filter, ignoreCase = true) &&
@@ -652,14 +842,14 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
                     var second: SourceResult<List<SearchBook>>? = null
                     val searchTimeout = if (name.contains("ehentai", ignoreCase = true)) 50000L else 15000L
                     val first = if (keyword.isNotBlank()) {
-                        withTimeoutOrNull(searchTimeout) { source.search(keyword) }
+                        withTimeoutOrNull(searchTimeout) { sourceSearches.search(source, keyword) }
                     } else {
-                        withTimeoutOrNull(searchTimeout) { source.search("海贼王") }
+                        withTimeoutOrNull(searchTimeout) { sourceSearches.search(source, "海贼王") }
                     }
                     if (first is SourceResult.Success && first.data.isNotEmpty()) {
                         books = first.data
                     } else if (keyword.isBlank()) {
-                        second = withTimeoutOrNull(searchTimeout) { source.search("one piece") }
+                        second = withTimeoutOrNull(searchTimeout) { sourceSearches.search(source, "one piece") }
                         if (second is SourceResult.Success) books = second.data
                     }
                     if (books.isEmpty()) {
@@ -819,6 +1009,11 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun clearComicState() {
+        chaptersRequestSeq++
+        imagesRequestSeq++
+        comicPrefetchJobs.values.forEach { it.cancel() }
+        comicPrefetchJobs.clear()
+        comicPrefetchCache.clear()
         _comicBook.value = null
         _comicChapters.value = emptyList()
         _comicChaptersError.value = null
@@ -857,13 +1052,30 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     private val _uiState = MutableStateFlow<LibraryUiState>(LibraryUiState.Empty)
     val uiState: StateFlow<LibraryUiState> = _uiState
 
-    val downloadStates: StateFlow<Map<String, DownloadState>> = downloadManager.downloadStates
+    val downloadStates: StateFlow<Map<String, DownloadState>> = kotlinx.coroutines.flow.combine(
+        downloadManager.downloadStates, downloadManager.allTasksFlow
+    ) { states, tasks ->
+        tasks.associate { task ->
+            DownloadManager.taskId(task.sourceId, DownloadManager.originalBookId(task.id, task.sourceId)) to
+                (states[task.id] ?: when (task.status) {
+                    com.example.download.DownloadStatus.COMPLETED -> DownloadState.Success(task.filePath)
+                    com.example.download.DownloadStatus.DOWNLOADING -> DownloadState.Downloading(task.downloadedBytes, task.totalBytes,
+                        if (task.totalBytes > 0) (task.downloadedBytes.toFloat() / task.totalBytes).coerceIn(0f, 1f) else 0f)
+                    com.example.download.DownloadStatus.PAUSED -> DownloadState.Paused(task.downloadedBytes, task.totalBytes)
+                    com.example.download.DownloadStatus.FAILED -> DownloadState.Error(task.errorMessage ?: "下载失败")
+                    else -> DownloadState.Pending
+                })
+        }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyMap())
     val allDownloadTasks: Flow<List<DownloadTaskEntity>> = downloadManager.allTasksFlow
     val errorMessage = MutableStateFlow<String?>(null)
 
     fun search(keyword: String) {
+        cancelAggregateSearch()
         val source = sourceManager.activeSource.value ?: return
-        viewModelScope.launch {
+        val requestSeq = ++searchRequestSeq
+        singleSearchJob = viewModelScope.launch {
+            if (requestSeq != searchRequestSeq) return@launch
             _uiState.value = LibraryUiState.Searching
             errorMessage.value = null
             // 第七轮第 7 条：单源搜索同样走多语言变体（本地 AniList 标题库扩展）；
@@ -872,16 +1084,25 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
             val collected = ArrayList<SearchBook>(32)
             var firstError: SourceException? = null
             variants.forEach { variant ->
-                when (val result = source.search(variant)) {
-                    is SourceResult.Success -> collected.addAll(result.data)
+                if (requestSeq != searchRequestSeq) return@launch
+                val result = try {
+                    sourceSearches.search(source, variant)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    SourceResult.Error(SourceException.NetworkError(e.message ?: "搜索失败", e))
+                }
+                when (result) {
+                    is SourceResult.Success -> collected.addAll(result.data.map { it.copy(sourceId = source.id) })
                     is SourceResult.Error -> if (firstError == null) firstError = result.exception
                 }
             }
+            if (requestSeq != searchRequestSeq) return@launch
             if (collected.isNotEmpty()) {
                 val merged = collected.distinctBy { it.id }
                 _uiState.value = LibraryUiState.SearchResults(merged)
                 if (source.id == "mangadex" && merged.isNotEmpty()) {
-                    enrichMangaDexAuthors(merged, source)
+                    enrichMangaDexAuthors(merged, source, requestSeq)
                 }
             } else {
                 val e = firstError
@@ -907,7 +1128,7 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private suspend fun enrichMangaDexAuthors(books: List<SearchBook>, source: BookSource) {
+    private suspend fun enrichMangaDexAuthors(books: List<SearchBook>, source: BookSource, requestSeq: Long) {
         val semaphore = Semaphore(5)
         val enriched = books.map { book ->
             semaphore.withPermit {
@@ -924,13 +1145,15 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
             }
         }
         withContext(kotlinx.coroutines.Dispatchers.Main) {
-            if (enriched.isNotEmpty()) {
+            if (requestSeq == searchRequestSeq && enriched.isNotEmpty()) {
                 _uiState.value = LibraryUiState.SearchResults(enriched)
             }
         }
     }
 
     fun selectSource(sourceId: String) {
+        searchRequestSeq++
+        resetSearchResults()
         _aggregateMode.value = false
         viewModelScope.launch {
             sourceManager.setActiveSource(sourceId)
@@ -998,8 +1221,11 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
         _pendingFormats.value = emptyList()
     }
 
-    private fun downloadBook(book: SearchBook, source: BookSource, format: String?) {
+    private fun downloadBook(book: SearchBook, source: BookSource, format: String?, replaceNovel: Boolean = false) {
         viewModelScope.launch {
+            val snapshot = if (WholeBookNovelSources.contains(book.sourceId) && !replaceNovel) {
+                (source.getDetail(book.id) as? SourceResult.Success)?.data ?: book
+            } else book
             when (val result = source.getDownloadInfo(book.id, preferredFormat = format)) {
                 is SourceResult.Success -> {
                     val finalFormat = result.data.format.ifBlank { book.format }
@@ -1010,20 +1236,79 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
                     }
                     val request = DownloadRequest(
                         bookId = book.id,
-                        title = book.title,
-                        author = book.author,
+                        title = snapshot.title,
+                        author = snapshot.author,
                         sourceId = book.sourceId,
                         downloadUrl = result.data.url,
                         format = finalFormat,
-                        coverUrl = book.cover
+                        coverUrl = snapshot.cover,
+                        novelSnapshot = snapshot.takeIf { WholeBookNovelSources.contains(it.sourceId) },
+                        replaceExistingNovel = replaceNovel
                     )
                     downloadManager.enqueueDownload(request, result.data.referer, result.data.headers)
                 }
                 is SourceResult.Error -> {
                     errorMessage.value = result.exception.message ?: "获取下载信息失败"
+                    if (replaceNovel) _novelUpdate.value?.takeIf {
+                        it.local.sourceId == book.sourceId && it.local.comicId == book.id
+                    }?.let { _novelUpdate.value = it.copy(error = errorMessage.value) }
                 }
             }
         }
+    }
+
+    suspend fun novelDetail(book: SearchBook): SourceResult<SearchBook> {
+        val source = sourceManager.availableSources.value.firstOrNull { it.id == book.sourceId && it.isNovelSource }
+            ?: return SourceResult.Error(SourceException.ParseError("此小说源已停用"))
+        return when (val result = source.getDetail(book.id)) {
+            is SourceResult.Error -> result
+            is SourceResult.Success -> SourceResult.Success(result.data.copy(
+                id = book.id, sourceId = book.sourceId,
+                title = result.data.title.ifBlank { book.title }, author = result.data.author.ifBlank { book.author },
+                cover = result.data.cover ?: book.cover, language = result.data.language ?: book.language,
+                size = result.data.size ?: book.size, description = result.data.description ?: book.description,
+                eapiId = result.data.eapiId ?: book.eapiId, eapiHash = result.data.eapiHash ?: book.eapiHash,
+                novelInfo = result.data.novelInfo ?: book.novelInfo))
+        }
+    }
+
+    suspend fun localNovel(book: SearchBook): com.example.data.Book? = withContext(Dispatchers.IO) {
+        AppDatabase.getDatabase(getApplication()).bookDao().getBookBySourceResource(book.sourceId, book.id)
+    }
+
+    data class NovelUpdate(val local: com.example.data.Book, val sourceName: String, val loading: Boolean = true,
+        val remote: SearchBook? = null, val changed: Boolean? = null, val error: String? = null)
+    private val _novelUpdate = MutableStateFlow<NovelUpdate?>(null)
+    val novelUpdate = _novelUpdate.asStateFlow()
+    private var novelUpdateJob: Job? = null
+
+    fun dismissNovelUpdate() { novelUpdateJob?.cancel(); _novelUpdate.value = null }
+
+    fun checkNovelUpdate(local: com.example.data.Book) {
+        if (!WholeBookNovelSources.contains(local.sourceId) || local.isComic || local.comicId.isNullOrBlank()) return
+        novelUpdateJob?.cancel()
+        val source = sourceManager.availableSources.value.firstOrNull { it.id == local.sourceId } as? UpdatableNovelSource
+        _novelUpdate.value = NovelUpdate(local, source?.name ?: "小说源")
+        novelUpdateJob = viewModelScope.launch {
+            if (source == null) { _novelUpdate.value = NovelUpdate(local, "小说源", loading = false, error = "此小说源已停用"); return@launch }
+            try {
+                when (val result = source.refreshNovelDetail(local.comicId)) {
+                    is SourceResult.Success -> {
+                        val baseline = com.example.download.NovelDownloadStore(getApplication()).baseline(source.id, local.comicId)?.novelInfo
+                        val remote = result.data.novelInfo
+                        val changed = if (baseline?.hasRevision == true && remote?.hasRevision == true) baseline.revision != remote.revision else null
+                        _novelUpdate.value = NovelUpdate(local, source.name, loading = false, remote = result.data, changed = changed)
+                    }
+                    is SourceResult.Error -> _novelUpdate.value = NovelUpdate(local, source.name, loading = false, error = result.exception.message ?: "检查失败，请重试")
+                }
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) { _novelUpdate.value = NovelUpdate(local, source.name, loading = false, error = e.message ?: "检查失败，请重试") }
+        }
+    }
+
+    fun downloadNovelUpdate(book: SearchBook) {
+        val source = sourceManager.availableSources.value.firstOrNull { it.id == book.sourceId && WholeBookNovelSources.contains(it.id) } ?: return
+        downloadBook(book, source, book.format, replaceNovel = true)
     }
 
     /**

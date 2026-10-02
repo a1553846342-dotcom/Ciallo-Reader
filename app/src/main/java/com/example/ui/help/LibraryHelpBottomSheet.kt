@@ -31,6 +31,7 @@ import java.io.File
 import com.example.ui.components.AppIconButton
 import androidx.compose.foundation.layout.widthIn
 import com.example.ui.adaptive.AdaptiveSpec
+import com.example.ui.components.AppToast
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -131,12 +132,12 @@ Column(modifier = Modifier.widthIn(max = AdaptiveSpec.sheetMaxWidth).fillMaxSize
                     FlowStepItem(
                         stepNumber = "1",
                         title = "选择书源",
-                        desc = "顶部书源选择器可切换 Z-Library、MangaDex、Venera 漫画源；选“聚合漫画（全部）”可一次搜索所有漫画源。"
+                        desc = "顶部书源选择器可切换小说源或漫画源；选择“聚合漫画（全部）”可并行搜索已启用的漫画源。Venera 源可在书源管理中更新。"
                     )
                     FlowStepItem(
                         stepNumber = "2",
                         title = "搜索图书",
-                        desc = "输入书名或作者后点击搜索 / 回车。点击搜索框会显示搜索历史，点历史词可直接再次搜索，也可一键清空。"
+                        desc = "输入书名或作者后点击搜索 / 回车；可按小说或漫画查看分类结果。点击搜索框会显示搜索历史，点历史词可直接再次搜索，也可一键清空。"
                     )
                     FlowStepItem(
                         stepNumber = "3",
@@ -154,7 +155,7 @@ Column(modifier = Modifier.widthIn(max = AdaptiveSpec.sheetMaxWidth).fillMaxSize
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     HelpSectionHeader(title = "2. 搜索与搜索历史")
                     TextDetailCard(
-                        text = "点击搜索框且输入为空时，会显示最近 10 条搜索历史；点历史词直接搜索，点“清空”删除全部历史。搜索有 15 秒超时兜底，超时后会自动提示失败，不会无限转圈。"
+                        text = "点击搜索框且输入为空时，会显示最近 10 条搜索历史；点历史词直接搜索，点“清空”删除全部历史。漫画聚合搜索会优先显示先返回的结果，再补齐其他源和标题变体；个别源失败不会阻塞其他源。"
                     )
                 }
 
@@ -162,7 +163,7 @@ Column(modifier = Modifier.widthIn(max = AdaptiveSpec.sheetMaxWidth).fillMaxSize
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     HelpSectionHeader(title = "3. 下载与进度")
                     TextDetailCard(
-                        text = "书库右上角下载按钮可打开悬浮下载面板，实时显示进度、速度与剩余大小；下载中的书籍会在按钮上显示进度圈。漫画章节页支持单章下载，下载后可离线阅读。Z-Library 下载前可能需要登录，按提示进入登录窗口即可。"
+                        text = "书库右上角下载按钮可打开下载面板查看任务进度、速度与剩余大小；支持小说整本下载和漫画章节下载，完成后可离线阅读。漫画下载支持暂停后续传；Z-Library 下载前可能需要登录，按提示进入登录窗口即可。"
                     )
                 }
 
@@ -170,7 +171,7 @@ Column(modifier = Modifier.widthIn(max = AdaptiveSpec.sheetMaxWidth).fillMaxSize
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     HelpSectionHeader(title = "4. 书源管理")
                     TextDetailCard(
-                        text = "管理书源：可开关 Z-Library / MangaDex，导入或粘贴自定义 JSON 书源，删除失效源。Venera 漫画源点“更新”即可拉取社区最新源；成人源默认隐藏，在 设置 → 高级内容 开启“带你登大郎~~~”后自动更新并显示。自定义源兼容 Legado 规则与 JSON API。"
+                        text = "管理书源：可启用或停用来源、导入自定义 JSON 书源、更新 Venera 漫画源，也可删除失效源。开启成人漫画源：进入“设置”标签页，找到“高级内容”，打开“带你登大郎~~~”；等待 Venera 源列表更新后，返回书库并在漫画书源选择器中选择对应来源。关闭开关会隐藏成人源。自定义源兼容 Legado 规则与 JSON API。"
                     )
                 }
 
@@ -178,7 +179,7 @@ Column(modifier = Modifier.widthIn(max = AdaptiveSpec.sheetMaxWidth).fillMaxSize
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     HelpSectionHeader(title = "5. 漫画阅读")
                     TextDetailCard(
-                        text = "在线阅读会自动加载章节图片，支持单页 / 滚动模式。部分站点图片加载较慢属正常，可换其他源；站外链接章节一般只能在线阅读，推荐优先选择站内章节下载。"
+                        text = "在线阅读优先加载当前页并渐进显示后续图片，支持单页、滚动和仿真翻页等模式。章节可添加书签；作品详情可查看标签、神回入口及神回排行榜。站外链接章节一般只能在线阅读，推荐优先选择站内章节下载。"
                     )
                 }
 
@@ -198,7 +199,7 @@ Column(modifier = Modifier.widthIn(max = AdaptiveSpec.sheetMaxWidth).fillMaxSize
 
                     FaqExpandableItem(
                         question = "成人漫画源不显示？",
-                        answer = "打开 设置 → 高级内容 中的“带你登大郎~~~”开关，开启后会自动更新 Venera 源列表并显示成人源。"
+                        answer = "进入“设置”标签页 → “高级内容”，打开“带你登大郎~~~”，等待 Venera 更新源列表；再回到书库，在漫画书源选择器中切换到需要的来源。此开关关闭时成人源会隐藏。"
                     )
 
                     FaqExpandableItem(
@@ -249,7 +250,7 @@ Column(modifier = Modifier.widthIn(max = AdaptiveSpec.sheetMaxWidth).fillMaxSize
                         modifier = Modifier
                             .weight(1f)
                             .clickableWithFeedback {
-                                Toast.makeText(context, "已复制 JSON 示例模板到剪贴板", Toast.LENGTH_SHORT).show()
+                                AppToast.makeText(context, "已复制 JSON 示例模板到剪贴板", Toast.LENGTH_SHORT).show()
                                 val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
                                 val clip = android.content.ClipData.newPlainText("JSON_Template", """{
   "id": "example_comic",
@@ -307,7 +308,7 @@ Column(modifier = Modifier.widthIn(max = AdaptiveSpec.sheetMaxWidth).fillMaxSize
                                     stale.forEach { runCatching { it.delete() } }
                                     if (stale.isNotEmpty()) "已清除 ${stale.size} 个下载临时文件" else "没有可清理的下载临时文件"
                                 }
-                                Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                AppToast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                             }
                         }
                         .testTag("shortcut_clear_cache"),

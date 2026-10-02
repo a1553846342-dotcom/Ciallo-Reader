@@ -23,7 +23,7 @@ class ZLibraryDomainResolverTest {
     @Before
     fun setUp() {
         context = ApplicationProvider.getApplicationContext()
-        credentialStorage = ZLibraryCredentialStorage(context)
+        credentialStorage = ZLibraryCredentialStorage(context.getSharedPreferences("credential-test", android.content.Context.MODE_PRIVATE))
         endpointProvider = ZLibraryEndpointProvider(context, credentialStorage)
         endpointProvider.invalidateCache()
     }
