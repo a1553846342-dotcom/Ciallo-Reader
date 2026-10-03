@@ -1370,7 +1370,7 @@ LazyColumn(
                             ) {
                                 Row(
                                     modifier = Modifier.clickable {
-                                        runCatching { githubUriHandler.openUri("https://github.com/a1553846342-dotcom/EASYREADER") }
+                                        runCatching { githubUriHandler.openUri("https://github.com/roxycon-dev/Ciallo-Reader") }
                                             .onFailure { AppToast.makeText(context, "暂时打不开 GitHub，稍后再来喵～", Toast.LENGTH_SHORT).show() }
                                     }.padding(horizontal = 16.dp, vertical = 11.dp),
                                     verticalAlignment = Alignment.CenterVertically,

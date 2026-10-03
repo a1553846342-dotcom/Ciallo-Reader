@@ -10,12 +10,12 @@ Kotlin · Jetpack Compose (Material 3) · MVVM · 单 Activity
 
 <img src="./promo/output/Ciallo-promo-cover-v2.png" width="820" alt="Ciallo阅读 1.2.0 品牌封面"/>
 
-[下载 1.2.0 APK](https://github.com/a1553846342-dotcom/Ciallo-Reader/releases/download/v1.2.0/Ciallo-Reader-v1.2.0.apk) ·
+[下载 1.2.0 APK](https://github.com/roxycon-dev/Ciallo-Reader/releases/download/v1.2.0/Ciallo-Reader-v1.2.0.apk) ·
 [功能](#功能) ·
 [安装](#安装) ·
 [使用说明](#使用说明) ·
 [FAQ](#faq) ·
-[提交 Issue](https://github.com/a1553846342-dotcom/Ciallo-Reader/issues)
+[提交 Issue](https://github.com/roxycon-dev/Ciallo-Reader/issues)
 
 ![Android](https://img.shields.io/badge/Android-API%2024%2B-green)
 ![Release](https://img.shields.io/badge/Release-v1.2.0-orange)
@@ -150,18 +150,18 @@ Android 端小说 / 漫画阅读器，内置多书源在线聚合搜索与下载
 
 ## 安装
 
-**直接安装**：前往 [Releases](https://github.com/a1553846342-dotcom/Ciallo-Reader/releases) 下载 APK（arm64-v8a），允许「安装未知来源应用」后安装。
+**直接安装**：前往 [Releases](https://github.com/roxycon-dev/Ciallo-Reader/releases) 下载 APK（arm64-v8a），允许「安装未知来源应用」后安装。
 
 **源码编译**：需要 JDK 17+ 与 Android SDK（compileSdk 35），网络可访问 Google Maven。
 
 ```bash
-git clone https://github.com/a1553846342-dotcom/Ciallo-Reader.git
+git clone https://github.com/roxycon-dev/Ciallo-Reader.git
 cd Ciallo-Reader
 echo "sdk.dir=/你的/Android/Sdk/路径" > local.properties
 ./gradlew :app:assembleRelease
 ```
 
-1.2.0 Release APK 可从 [GitHub Release](https://github.com/a1553846342-dotcom/Ciallo-Reader/releases/download/v1.2.0/Ciallo-Reader-v1.2.0.apk) 下载；Gradle 原始输出在 `app/build/outputs/apk/release/app-release.apk`。本次构建环境未配置发布 keystore，因此 APK 使用仓库调试证书签名；它只能覆盖同一调试证书签名的安装，正式分发请配置发布签名后重新构建。
+1.2.0 Release APK 可从 [GitHub Release](https://github.com/roxycon-dev/Ciallo-Reader/releases/download/v1.2.0/Ciallo-Reader-v1.2.0.apk) 下载；Gradle 原始输出在 `app/build/outputs/apk/release/app-release.apk`。本次构建环境未配置发布 keystore，因此 APK 使用仓库调试证书签名；它只能覆盖同一调试证书签名的安装，正式分发请配置发布签名后重新构建。
 
 ***
 
